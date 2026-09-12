@@ -668,7 +668,10 @@ async fn forward_request(
 
         let mut response = Response::new(Body::from_stream(sse_stream));
         *response.status_mut() = StatusCode::OK;
-        response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
         return response;
     }
 
