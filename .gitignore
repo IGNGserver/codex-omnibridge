@@ -1,0 +1,7 @@
+/target
+/apps/panel/src-tauri/target
+/dist
+.env
+*.tmp
+*.json.tmp
+*.toml.tmp

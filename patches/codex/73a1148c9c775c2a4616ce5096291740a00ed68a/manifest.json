@@ -1,0 +1,17 @@
+{
+  "patch_id": "codex-core-per-turn-local-router",
+  "upstream_repository": "openai/codex",
+  "upstream_commit": "73a1148c9c775c2a4616ce5096291740a00ed68a",
+  "patch_file": "0001-per-turn-local-router.patch",
+  "sha256_file": "SHA256SUMS",
+  "changed_files": [
+    "core/src/client.rs",
+    "core/src/lib.rs",
+    "core/src/logical_routing.rs"
+  ],
+  "router_endpoint_environment": "CODEX_MP_ROUTER_ENDPOINT_FILE",
+  "model_provider_invariant": "openai",
+  "oauth_invariant": true,
+  "thread_provider_invariant": true,
+  "scope": "Linux patched Codex Core per-turn logical routing; Desktop, Remote and real Provider E2E remain separate acceptance gates"
+}

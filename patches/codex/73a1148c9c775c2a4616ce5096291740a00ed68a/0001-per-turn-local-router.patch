@@ -1,0 +1,395 @@
+diff --git a/core/src/client.rs b/core/src/client.rs
+index a813022548c9e714d6ccf07c99513367f8bc78f2..119b13c374a4da6b148c72a72584a723402a8145 100644
+--- a/core/src/client.rs
++++ b/core/src/client.rs
+@@ -102,6 +102,7 @@ use futures::StreamExt;
+ use http::HeaderMap as ApiHeaderMap;
+ use http::HeaderValue;
+ use http::StatusCode;
++use http::header::AUTHORIZATION;
+ use std::time::Duration;
+ use std::time::Instant;
+ use tokio::sync::mpsc;
+@@ -125,6 +126,9 @@ use crate::context::BaseInstructionsFragment;
+ use crate::context::ContextualUserFragment;
+ use crate::cyber_access_program;
+ use crate::feedback_tags;
++use crate::logical_routing::LocalRouterEndpoint;
++use crate::logical_routing::LogicalRoute;
++use crate::logical_routing::route_for_model;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::subagent_header_value;
+ use crate::util::emit_feedback_auth_recovery_tags;
+@@ -204,6 +208,7 @@ fn session_telemetry_for_request(
+ struct ModelClientState {
+     thread_id: ThreadId,
+     provider: SharedModelProvider,
++    local_router: Option<LocalRouterEndpoint>,
+     auth_env_telemetry: AuthEnvTelemetry,
+     session_source: SessionSource,
+     originator: String,
+@@ -242,6 +247,24 @@ impl RequestRouteTelemetry {
+     }
+ }
+ 
++struct LocalRouterCapabilityAuth {
++    token: String,
++}
++
++impl std::fmt::Debug for LocalRouterCapabilityAuth {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("LocalRouterCapabilityAuth(<redacted>)")
++    }
++}
++
++impl AuthProvider for LocalRouterCapabilityAuth {
++    fn add_auth_headers(&self, headers: &mut ApiHeaderMap) {
++        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
++            headers.insert(AUTHORIZATION, value);
++        }
++    }
++}
++
+ /// A session-scoped client for model-provider API calls.
+ ///
+ /// This holds configuration and state that should be shared across turns within a Codex session
+@@ -463,6 +486,7 @@ impl ModelClient {
+             state: Arc::new(ModelClientState {
+                 thread_id,
+                 provider: model_provider,
++                local_router: LocalRouterEndpoint::from_environment(),
+                 auth_env_telemetry,
+                 session_source,
+                 originator,
+@@ -590,6 +614,11 @@ impl ModelClient {
+         if prompt.input.is_empty() {
+             return Ok(Vec::new());
+         }
++        if route_for_model(&model_info.slug) == LogicalRoute::LocalRouter {
++            return Err(CodexErr::InvalidRequest(
++                "context compaction is not available for custom models; the turn was not sent to the official backend".into(),
++            ));
++        }
+         let client_setup = self.current_client_setup().await?;
+         let transport =
+             self.build_api_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
+@@ -898,7 +927,8 @@ impl ModelClient {
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<ResponsesApiRequest> {
+         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+-        let is_openai = self.state.provider.info().is_openai();
++        let is_openai = self.state.provider.info().is_openai()
++            && route_for_model(&model_info.slug) == LogicalRoute::Official;
+         let (instructions, tools) = if model_info.use_responses_lite {
+             // These prompt-only items are rebuilt on every request. Hash their visible payloads
+             // within the thread so retries and resumed sessions preserve their identity.
+@@ -956,7 +986,11 @@ impl ModelClient {
+         .then_some(StreamOptions {
+             reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+         });
+-        let include = vec!["reasoning.encrypted_content".to_string()];
++        let include = if is_openai {
++            vec!["reasoning.encrypted_content".to_string()]
++        } else {
++            Vec::new()
++        };
+         let verbosity = if model_info.support_verbosity {
+             self.state.model_verbosity.or(model_info.default_verbosity)
+         } else {
+@@ -1973,6 +2007,9 @@ impl ModelClientSession {
+         service_tier: Option<String>,
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<()> {
++        if route_for_model(&model_info.slug) == LogicalRoute::LocalRouter {
++            return Ok(());
++        }
+         if !self.client.responses_websocket_enabled() {
+             return Ok(());
+         }
+@@ -2035,6 +2072,20 @@ impl ModelClientSession {
+         responses_metadata: &CodexResponsesMetadata,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
++        if route_for_model(&model_info.slug) == LogicalRoute::LocalRouter {
++            return self
++                .stream_local_router(
++                    prompt,
++                    model_info,
++                    session_telemetry,
++                    effort,
++                    summary,
++                    service_tier,
++                    responses_metadata,
++                    inference_trace,
++                )
++                .await;
++        }
+         let wire_api = self.client.state.provider.info().wire_api;
+         match wire_api {
+             WireApi::Responses => {
+@@ -2077,6 +2128,90 @@ impl ModelClientSession {
+         }
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
++    async fn stream_local_router(
++        &mut self,
++        prompt: &Prompt,
++        model_info: &ModelInfo,
++        session_telemetry: &SessionTelemetry,
++        effort: Option<ReasoningEffortConfig>,
++        summary: ReasoningSummaryConfig,
++        service_tier: Option<String>,
++        responses_metadata: &CodexResponsesMetadata,
++        inference_trace: &InferenceTraceContext,
++    ) -> Result<ResponseStream> {
++        let endpoint = self.client.state.local_router.as_ref().ok_or_else(|| {
++            CodexErr::InvalidRequest(
++                "custom model selected but the local Router endpoint is unavailable".into(),
++            )
++        })?;
++        let mut api_provider = self
++            .client
++            .state
++            .provider
++            .info()
++            .to_api_provider(/*auth_mode*/ None)?;
++        api_provider.name = "codex-mp-local-router".into();
++        api_provider.base_url = endpoint.base_url.clone();
++        api_provider.headers = ApiHeaderMap::new();
++        let transport = self
++            .client
++            .build_api_transport(&api_provider, ResponsesEndpoint::Responses.path())?;
++        let mut options = ApiResponsesOptions {
++            session_id: Some(responses_metadata.session_id.to_string()),
++            thread_id: Some(responses_metadata.thread_id.to_string()),
++            session_source: Some(self.client.state.session_source.clone()),
++            extra_headers: {
++                let mut headers = build_responses_headers(
++                    self.client.state.beta_features_header.as_deref(),
++                    /*turn_state*/ None,
++                );
++                add_originator_header(&mut headers, self.client.state.originator.as_str());
++                headers.extend(
++                    self.client
++                        .build_responses_compatibility_headers(responses_metadata),
++                );
++                headers
++            },
++            compression: Compression::None,
++            turn_state: None,
++        };
++        let mut request = self.client.build_responses_request(
++            prompt,
++            model_info,
++            effort,
++            summary,
++            service_tier,
++            responses_metadata,
++        )?;
++        self.client
++            .prepare_response_items_for_request(&mut request.input);
++        let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request);
++        let inference_trace_attempt = inference_trace.start_attempt();
++        inference_trace_attempt.record_started(&request);
++        options
++            .extra_headers
++            .insert("x-codex-mp-route", HeaderValue::from_static("custom"));
++        let client = ApiResponsesClient::new(
++            transport,
++            api_provider,
++            Arc::new(LocalRouterCapabilityAuth {
++                token: endpoint.capability_token.clone(),
++            }),
++        );
++        let stream = client
++            .stream_request(request, options)
++            .await
++            .map_err(|error| self.client.state.provider.map_api_error(error))?;
++        let (stream, _) = map_response_stream(
++            stream,
++            request_session_telemetry,
++            inference_trace_attempt,
++            Arc::clone(&self.client.state.provider),
++        );
++        Ok(stream)
++    }
++
+     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+     ///
+     /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index 68baeb5b41bd894ba741013c3dd3086af89004b9..8f6ac9476732ccf1d3222f3cfa9dda267085a54f 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -9,6 +9,7 @@ mod apply_patch;
+ mod apps;
+ mod client;
+ mod client_common;
++mod logical_routing;
+ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_history;
+diff --git a/core/src/logical_routing.rs b/core/src/logical_routing.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..333fe596ab7bb9f5eff0a09ab118214a721087c8
+--- /dev/null
++++ b/core/src/logical_routing.rs
+@@ -0,0 +1,157 @@
++//! Per-turn logical model routing for the Codex MultiProvider integration.
++//!
++//! The Codex provider and thread remain `openai`. Only namespaced logical model
++//! ids are dispatched to the local Router. The Router endpoint is discovered
++//! through a private, mode-0600 endpoint file supplied by the integration
++//! launcher; no ChatGPT credential is read or forwarded on this path.
++
++use std::fmt;
++use std::fs;
++use std::net::IpAddr;
++use std::path::Path;
++
++use serde::Deserialize;
++use url::Url;
++
++const ENDPOINT_FILE_ENV: &str = "CODEX_MP_ROUTER_ENDPOINT_FILE";
++const ENDPOINT_SCHEMA_VERSION: u32 = 1;
++
++#[derive(Clone)]
++pub(crate) struct LocalRouterEndpoint {
++    pub(crate) base_url: String,
++    pub(crate) capability_token: String,
++}
++
++impl fmt::Debug for LocalRouterEndpoint {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("LocalRouterEndpoint")
++            .field("base_url", &self.base_url)
++            .field("capability_token", &"<redacted>")
++            .finish()
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum LogicalRoute {
++    Official,
++    LocalRouter,
++}
++
++#[derive(Debug, Deserialize)]
++struct EndpointFile {
++    schema_version: u32,
++    base_url: String,
++    capability_token: String,
++}
++
++impl LocalRouterEndpoint {
++    pub(crate) fn from_environment() -> Option<Self> {
++        let path = std::env::var_os(ENDPOINT_FILE_ENV)?;
++        match Self::load(Path::new(&path)) {
++            Ok(endpoint) => Some(endpoint),
++            Err(error) => {
++                tracing::warn!(path = %Path::new(&path).display(), %error, "ignoring invalid local Router endpoint");
++                None
++            }
++        }
++    }
++
++    fn load(path: &Path) -> Result<Self, String> {
++        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            if metadata.permissions().mode() & 0o077 != 0 {
++                return Err("endpoint file must not be accessible by other users".into());
++            }
++        }
++        let endpoint: EndpointFile =
++            serde_json::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
++                .map_err(|error| error.to_string())?;
++        if endpoint.schema_version != ENDPOINT_SCHEMA_VERSION
++            || endpoint.capability_token.trim().is_empty()
++        {
++            return Err("unsupported or incomplete endpoint file".into());
++        }
++        let parsed = Url::parse(&endpoint.base_url).map_err(|error| error.to_string())?;
++        if parsed.scheme() != "http"
++            || (parsed.path() != "" && parsed.path() != "/")
++            || !parsed
++                .host_str()
++                .is_some_and(|host| host == "localhost" || is_loopback(host))
++        {
++            return Err("endpoint must be an http loopback URL".into());
++        }
++        Ok(Self {
++            base_url: endpoint.base_url,
++            capability_token: endpoint.capability_token,
++        })
++    }
++}
++
++fn is_loopback(host: &str) -> bool {
++    host.parse::<IpAddr>()
++        .map(|address| address.is_loopback())
++        .unwrap_or(false)
++}
++
++pub(crate) fn route_for_model(model_id: &str) -> LogicalRoute {
++    if model_id.contains('/') {
++        LogicalRoute::LocalRouter
++    } else {
++        LogicalRoute::Official
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_namespaced_models_use_local_router() {
++        assert_eq!(route_for_model("gpt-5.6-sol"), LogicalRoute::Official);
++        assert_eq!(route_for_model("newapi/qwen3.8"), LogicalRoute::LocalRouter);
++    }
++
++    #[test]
++    fn loads_private_loopback_endpoint() {
++        let file = tempfile::NamedTempFile::new().expect("temporary endpoint file");
++        fs::write(
++            file.path(),
++            r#"{"schema_version":1,"base_url":"http://127.0.0.1:8787","capability_token":"test-token"}"#,
++        )
++        .expect("write endpoint file");
++        let endpoint = LocalRouterEndpoint::load(file.path()).expect("valid endpoint");
++        assert_eq!(endpoint.base_url, "http://127.0.0.1:8787");
++        assert_eq!(endpoint.capability_token, "test-token");
++        assert!(!format!("{endpoint:?}").contains("test-token"));
++    }
++
++    #[test]
++    fn rejects_non_loopback_endpoint() {
++        let file = tempfile::NamedTempFile::new().expect("temporary endpoint file");
++        fs::write(
++            file.path(),
++            r#"{"schema_version":1,"base_url":"https://provider.example/v1","capability_token":"test-token"}"#,
++        )
++        .expect("write endpoint file");
++        assert!(LocalRouterEndpoint::load(file.path()).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn rejects_endpoint_file_readable_by_other_users() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let file = tempfile::NamedTempFile::new().expect("temporary endpoint file");
++        fs::write(
++            file.path(),
++            r#"{"schema_version":1,"base_url":"http://127.0.0.1:8787","capability_token":"test-token"}"#,
++        )
++        .expect("write endpoint file");
++        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o644))
++            .expect("set endpoint permissions");
++        assert!(LocalRouterEndpoint::load(file.path()).is_err());
++    }
++}
