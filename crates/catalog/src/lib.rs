@@ -5,12 +5,12 @@
 //! JSON values instead of deserializing into a local approximation of Codex's
 //! fast-moving schema.
 
+use codex_mp_core::{
+    CustomModel, ProviderRegistry, atomic_replace, command_for_executable, set_private_permissions,
+};
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use codex_mp_core::{CustomModel, ProviderRegistry};
-use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,17 +30,18 @@ pub enum CatalogError {
 }
 
 pub fn discover_official_catalog(codex_bin: impl AsRef<Path>) -> Result<Value, CatalogError> {
-    let codex_bin = codex_bin.as_ref();
-    let output = Command::new(codex_bin)
+    let requested_binary = codex_bin.as_ref();
+    let mut command = command_for_executable(requested_binary);
+    let output = command
         .args(["debug", "models", "--bundled"])
         .output()
         .map_err(|error| {
-            CatalogError::CodexCommand(codex_bin.display().to_string(), error.to_string())
+            CatalogError::CodexCommand(requested_binary.display().to_string(), error.to_string())
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CatalogError::CodexCommand(
-            codex_bin.display().to_string(),
+            requested_binary.display().to_string(),
             format!("exit status {}; {}", output.status, stderr.trim()),
         ));
     }
@@ -94,6 +95,7 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
     let object = entry
         .as_object_mut()
         .expect("validated Codex model entries are objects");
+
     set_string(object, "slug", &model.logical_model_id);
     let display_name = if model.display_name.is_empty() {
         format!("{provider_name} / {}", model.upstream_model_id)
@@ -148,6 +150,12 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
             "default_reasoning_level".into(),
             Value::String(model.reasoning_levels[0].clone()),
         );
+    } else {
+        object.remove("supported_reasoning_levels");
+        object.remove("default_reasoning_level");
+    }
+    if !model.capabilities.reasoning {
+        object.remove("supports_reasoning_summaries");
     }
     entry
 }
@@ -164,7 +172,7 @@ pub fn write_catalog_atomic(catalog: &Value, path: impl AsRef<Path>) -> Result<(
     }
     let temp = path.with_extension("json.tmp");
     fs::write(&temp, serde_json::to_vec_pretty(catalog)?)?;
-    fs::rename(temp, path)?;
+    atomic_replace(temp, path)?;
     set_private_permissions(path)?;
     Ok(())
 }
@@ -174,15 +182,6 @@ pub fn default_catalog_path() -> PathBuf {
         .parent()
         .map(|path| path.join("models.json"))
         .unwrap_or_else(|| PathBuf::from("models.json"))
-}
-
-fn set_private_permissions(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -226,11 +225,19 @@ mod tests {
         assert_eq!(merged["models"][0]["unknown_future_field"]["keep"], true);
         assert_eq!(merged["models"][1]["slug"], "newapi/qwen3.8");
         assert_eq!(merged["models"][1]["display_name"], "NewAPI / Qwen3.8");
+        assert!(merged["models"][1].get("unknown_future_field").is_none());
+        assert!(merged["models"][1].get("shell_type").is_none());
     }
 
     #[test]
     fn command_output_is_current_installation_source() {
-        let catalog = discover_official_catalog("/home/lvziw/.local/bin/codex").unwrap();
+        let Some(codex_bin) = std::env::var_os("CODEX_MP_TEST_CODEX_BIN").map(PathBuf::from) else {
+            return;
+        };
+        if !codex_bin.is_file() {
+            return;
+        }
+        let catalog = discover_official_catalog(codex_bin).unwrap();
         validate_catalog(&catalog).unwrap();
         assert!(
             catalog["models"]
