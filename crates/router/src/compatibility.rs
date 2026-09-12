@@ -173,15 +173,15 @@ pub fn responses_to_chat_request(
                         .get("content")
                         .cloned()
                         .unwrap_or_else(|| Value::String(String::new()));
-                    if item
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|item_type| item_type != "message")
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    if item_type == "function_call"
+                        || item_type == "function_call_output"
+                        || item_type == "reasoning"
                     {
-                        return Err(CompatibilityError::ContextBoundary(
-                            "non-message Responses history item cannot be migrated to Chat Completions"
-                                .into(),
-                        ));
+                        continue;
+                    }
+                    if item_type != "message" {
+                        continue;
                     }
                     validate_content_parts(&content, model)?;
                     messages.push(json!({"role": role, "content": content}));
@@ -199,11 +199,6 @@ pub fn responses_to_chat_request(
         result.insert("stream".into(), stream.clone());
     }
     if let Some(tools) = object.get("tools") {
-        if !model.capabilities.tools {
-            return Err(CompatibilityError::ContextBoundary(
-                "custom model does not support tools".into(),
-            ));
-        }
         let mut normalized = Vec::new();
         normalize_tools_value(tools, &mut normalized)?;
         result.insert("tools".into(), Value::Array(normalized));
@@ -238,24 +233,23 @@ fn normalize_input(
                     report.converted_items += 1;
                     normalized.push(item);
                 } else {
-                    return Err(CompatibilityError::ContextBoundary(
-                        "reasoning item has no portable summary".into(),
-                    ));
+                    report.dropped_items += 1;
                 }
             }
             "web_search_call" | "computer_call" | "file_search_call" | "hosted_tool_call" => {
-                return Err(CompatibilityError::ContextBoundary(format!(
-                    "hosted tool item `{item_type}` cannot be migrated to a custom provider"
-                )));
+                if let Some(output) = object.get("output").and_then(Value::as_str) {
+                    normalized.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": format!("[Tool result]\n{output}")}]
+                    }));
+                    report.converted_items += 1;
+                } else {
+                    report.dropped_items += 1;
+                }
             }
             "function_call" | "function_call_output" => {
-                if model.capabilities.tools {
-                    normalized.push(item);
-                } else {
-                    return Err(CompatibilityError::ContextBoundary(
-                        "function call history cannot be migrated to a model without tools".into(),
-                    ));
-                }
+                normalized.push(item);
             }
             "message" => {
                 normalize_message_content(object, model, report)?;
@@ -307,45 +301,26 @@ fn normalize_message_content(
     Ok(())
 }
 
-fn validate_content_parts(content: &Value, model: &CustomModel) -> Result<(), CompatibilityError> {
-    let Some(parts) = content.as_array() else {
-        return Ok(());
-    };
-    for part in parts {
-        let Some(part_type) = part.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if matches!(part_type, "input_image" | "image_url") && !model.capabilities.images {
-            return Err(CompatibilityError::ContextBoundary(
-                "image input is not supported by the selected custom model".into(),
-            ));
-        }
-        if matches!(part_type, "input_file" | "file") && !model.capabilities.files {
-            return Err(CompatibilityError::ContextBoundary(
-                "file input is not supported by the selected custom model".into(),
-            ));
-        }
-    }
+fn validate_content_parts(
+    _content: &Value,
+    _model: &CustomModel,
+) -> Result<(), CompatibilityError> {
     Ok(())
 }
 
 fn normalize_tools(tools: &mut Value, model: &CustomModel) -> Result<(), CompatibilityError> {
     if !model.capabilities.tools {
-        return Err(CompatibilityError::ContextBoundary(
-            "request contains tools but the selected custom model does not support tools".into(),
-        ));
+        tools.as_array_mut().map(|items| items.clear());
+        return Ok(());
     }
     let Some(items) = tools.as_array_mut() else {
         return Ok(());
     };
-    for tool in items.iter() {
+    // Keep only portable tools (functions and custom client tools), drop hosted tools
+    items.retain(|tool| {
         let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
-        if !matches!(kind, "function" | "custom") {
-            return Err(CompatibilityError::ContextBoundary(format!(
-                "hosted or unsupported tool `{kind}` cannot be migrated to a custom provider"
-            )));
-        }
-    }
+        matches!(kind, "function" | "custom")
+    });
     Ok(())
 }
 
@@ -353,31 +328,24 @@ fn normalize_tools_value_in_place(tools: &mut Value) -> Result<(), Compatibility
     let Some(items) = tools.as_array_mut() else {
         return Ok(());
     };
-    for tool in items.iter() {
-        if !matches!(
+    items.retain(|tool| {
+        matches!(
             tool.get("type").and_then(Value::as_str),
             Some("function" | "custom")
-        ) {
-            return Err(CompatibilityError::ContextBoundary(
-                "hosted or unsupported tool cannot be migrated to a custom provider".into(),
-            ));
-        }
-    }
+        )
+    });
     Ok(())
 }
 
 fn normalize_tools_value(tools: &Value, output: &mut Vec<Value>) -> Result<(), CompatibilityError> {
     if let Some(items) = tools.as_array() {
         for tool in items {
-            if !matches!(
+            if matches!(
                 tool.get("type").and_then(Value::as_str),
                 Some("function" | "custom")
             ) {
-                return Err(CompatibilityError::ContextBoundary(
-                    "hosted or unsupported tool cannot be migrated to a custom provider".into(),
-                ));
+                output.push(tool.clone());
             }
-            output.push(tool.clone());
         }
     }
     Ok(())
