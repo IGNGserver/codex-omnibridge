@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex MultiProvider</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">CODEX MULTIPROVIDER</p>
+          <h1>Provider 面板</h1>
+          <p class="subtitle">管理第三方模型；聊天中的日常切换仍使用 Codex 原生模型菜单。</p>
+        </div>
+        <div class="topbar-actions"><div class="router-state" id="router-state">Router 检查中…</div><button class="secondary" id="sync-catalog">同步到 Codex</button></div>
+      </header>
+
+      <section class="grid">
+        <article class="card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">PROVIDERS</p>
+              <h2>添加 Provider</h2>
+            </div>
+          </div>
+          <form id="provider-form" class="form-grid">
+            <label>名称<input name="name" required placeholder="NewAPI" /></label>
+            <label>Base URL<input name="base_url" required placeholder="https://api.example/v1" /></label>
+            <label>协议<select name="protocol"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></label>
+            <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="仅写入系统 Keyring" /></label>
+            <button type="submit">保存 Provider</button>
+          </form>
+        </article>
+
+        <article class="card">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">MANUAL MODEL</p>
+              <h2>手动添加模型</h2>
+            </div>
+          </div>
+          <form id="model-form" class="form-grid">
+            <label>Provider ID<input name="provider_id" required placeholder="newapi" /></label>
+            <label>上游模型 ID<input name="upstream_model_id" required placeholder="gemini3.8flash" /></label>
+            <label>显示名称<input name="display_name" required placeholder="NewAPI / Gemini 3.8 Flash" /></label>
+            <label>上下文窗口<input name="context_window" type="number" min="1" placeholder="131072" /></label>
+            <div class="checks"><label><input name="images" type="checkbox" /> 图片输入</label><label><input name="tools" type="checkbox" checked /> Tools</label></div>
+            <button type="submit">添加模型</button>
+          </form>
+        </article>
+      </section>
+
+      <section class="card">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">CONFIGURED</p>
+            <h2>已配置 Provider</h2>
+          </div>
+          <button class="secondary" id="refresh">刷新</button>
+        </div>
+        <div id="providers" class="provider-list"></div>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="main.js"></script>
+  </body>
+</html>

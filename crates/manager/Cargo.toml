@@ -1,0 +1,19 @@
+[package]
+name = "codex-mp-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codex-mp-core = { path = "../core" }
+codex-mp-credentials = { path = "../credentials" }
+codex-mp-router = { path = "../router" }
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
