@@ -1,9 +1,9 @@
 //! Third-party-only Responses compatibility transformations.
 //!
 //! Official requests must not call this module. The transformation preserves
-//! visible messages, tool call/output semantics, summaries, and text parts,
-//! while removing encrypted/provider-hosted artifacts that a third-party API
-//! cannot interpret.
+//! visible messages, portable tool call/output semantics, summaries, and text
+//! parts. Context that cannot be represented safely is rejected with an
+//! explicit boundary error rather than silently dropped.
 
 use codex_mp_core::CustomModel;
 use serde_json::{Map, Value, json};
@@ -13,6 +13,12 @@ use thiserror::Error;
 pub enum CompatibilityError {
     #[error("request must be a JSON object")]
     NotObject,
+    #[error("context boundary: {0}")]
+    ContextBoundary(String),
+    #[error(
+        "streaming protocol conversion is not supported between Responses and Chat Completions"
+    )]
+    StreamingProtocolConversion,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -46,10 +52,10 @@ pub fn prepare_responses_request(
         }
     }
     if let Some(input) = object.get_mut("input") {
-        normalize_input(input, model, &mut report);
+        normalize_input(input, model, &mut report)?;
     }
     if let Some(tools) = object.get_mut("tools") {
-        normalize_tools(tools, model, &mut report);
+        normalize_tools(tools, model)?;
     }
     if !model.capabilities.reasoning && object.remove("reasoning").is_some() {
         report.removed_fields.push("reasoning".into());
@@ -78,11 +84,22 @@ pub fn prepare_chat_request(
     ] {
         result.remove(field);
     }
-    if !model.capabilities.tools {
-        result.remove("tools");
+    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content") {
+                validate_content_parts(content, model)?;
+            }
+        }
+    }
+    if let Some(tools) = result.get_mut("tools") {
+        if !model.capabilities.tools {
+            return Err(CompatibilityError::ContextBoundary(
+                "custom model does not support tools".into(),
+            ));
+        }
+        normalize_tools_value_in_place(tools)?;
+    } else if !model.capabilities.tools {
         result.remove("tool_choice");
-    } else if let Some(tools) = result.get_mut("tools") {
-        normalize_tools_value_in_place(tools);
     }
     if !model.capabilities.reasoning {
         result.remove("reasoning_effort");
@@ -127,6 +144,9 @@ pub fn chat_to_responses_request(
             result.insert(key.into(), value.clone());
         }
     }
+    if object.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(CompatibilityError::StreamingProtocolConversion);
+    }
     prepare_responses_request(&mut Value::Object(result), model)
 }
 
@@ -153,6 +173,17 @@ pub fn responses_to_chat_request(
                         .get("content")
                         .cloned()
                         .unwrap_or_else(|| Value::String(String::new()));
+                    if item
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|item_type| item_type != "message")
+                    {
+                        return Err(CompatibilityError::ContextBoundary(
+                            "non-message Responses history item cannot be migrated to Chat Completions"
+                                .into(),
+                        ));
+                    }
+                    validate_content_parts(&content, model)?;
                     messages.push(json!({"role": role, "content": content}));
                 }
             }
@@ -167,19 +198,26 @@ pub fn responses_to_chat_request(
     if let Some(stream) = object.get("stream") {
         result.insert("stream".into(), stream.clone());
     }
-    if model.capabilities.tools
-        && let Some(tools) = object.get("tools")
-    {
+    if let Some(tools) = object.get("tools") {
+        if !model.capabilities.tools {
+            return Err(CompatibilityError::ContextBoundary(
+                "custom model does not support tools".into(),
+            ));
+        }
         let mut normalized = Vec::new();
-        normalize_tools_value(tools, &mut normalized);
+        normalize_tools_value(tools, &mut normalized)?;
         result.insert("tools".into(), Value::Array(normalized));
     }
     Ok(Value::Object(result))
 }
 
-fn normalize_input(input: &mut Value, model: &CustomModel, report: &mut CompatibilityReport) {
+fn normalize_input(
+    input: &mut Value,
+    model: &CustomModel,
+    report: &mut CompatibilityReport,
+) -> Result<(), CompatibilityError> {
     let Some(items) = input.as_array_mut() else {
-        return;
+        return Ok(());
     };
     let mut normalized = Vec::with_capacity(items.len());
     for mut item in std::mem::take(items) {
@@ -200,48 +238,46 @@ fn normalize_input(input: &mut Value, model: &CustomModel, report: &mut Compatib
                     report.converted_items += 1;
                     normalized.push(item);
                 } else {
-                    report.dropped_items += 1;
+                    return Err(CompatibilityError::ContextBoundary(
+                        "reasoning item has no portable summary".into(),
+                    ));
                 }
             }
             "web_search_call" | "computer_call" | "file_search_call" | "hosted_tool_call" => {
-                if let Some(output) = object.get("output").and_then(Value::as_str) {
-                    normalized.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": format!("[Hosted tool output]\n{output}")}]
-                    }));
-                    report.converted_items += 1;
-                } else {
-                    report.dropped_items += 1;
-                }
+                return Err(CompatibilityError::ContextBoundary(format!(
+                    "hosted tool item `{item_type}` cannot be migrated to a custom provider"
+                )));
             }
             "function_call" | "function_call_output" => {
                 if model.capabilities.tools {
                     normalized.push(item);
                 } else {
-                    report.dropped_items += 1;
+                    return Err(CompatibilityError::ContextBoundary(
+                        "function call history cannot be migrated to a model without tools".into(),
+                    ));
                 }
             }
             "message" => {
-                normalize_message_content(object, model, report);
+                normalize_message_content(object, model, report)?;
                 normalized.push(item);
             }
             _ => normalized.push(item),
         }
     }
     *items = normalized;
+    Ok(())
 }
 
 fn normalize_message_content(
     object: &mut Map<String, Value>,
     model: &CustomModel,
-    report: &mut CompatibilityReport,
-) {
+    _report: &mut CompatibilityReport,
+) -> Result<(), CompatibilityError> {
     let Some(content) = object.get_mut("content") else {
-        return;
+        return Ok(());
     };
     let Some(parts) = content.as_array_mut() else {
-        return;
+        return Ok(());
     };
     let mut normalized = Vec::with_capacity(parts.len());
     for part in std::mem::take(parts) {
@@ -258,63 +294,93 @@ fn normalize_message_content(
         let unsupported_file =
             matches!(part_type, "input_file" | "file") && !model.capabilities.files;
         if unsupported_image || unsupported_file {
-            normalized.push(json!({
-                "type": "input_text",
-                "text": if unsupported_image { "[image input omitted by custom provider]" } else { "[file input omitted by custom provider]" }
+            return Err(CompatibilityError::ContextBoundary(if unsupported_image {
+                "image input is not supported by the selected custom model".into()
+            } else {
+                "file input is not supported by the selected custom model".into()
             }));
-            report.converted_items += 1;
         } else {
             normalized.push(part);
         }
     }
     *parts = normalized;
+    Ok(())
 }
 
-fn normalize_tools(tools: &mut Value, model: &CustomModel, report: &mut CompatibilityReport) {
+fn validate_content_parts(content: &Value, model: &CustomModel) -> Result<(), CompatibilityError> {
+    let Some(parts) = content.as_array() else {
+        return Ok(());
+    };
+    for part in parts {
+        let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if matches!(part_type, "input_image" | "image_url") && !model.capabilities.images {
+            return Err(CompatibilityError::ContextBoundary(
+                "image input is not supported by the selected custom model".into(),
+            ));
+        }
+        if matches!(part_type, "input_file" | "file") && !model.capabilities.files {
+            return Err(CompatibilityError::ContextBoundary(
+                "file input is not supported by the selected custom model".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_tools(tools: &mut Value, model: &CustomModel) -> Result<(), CompatibilityError> {
     if !model.capabilities.tools {
-        *tools = Value::Array(Vec::new());
-        report.removed_fields.push("tools".into());
-        return;
+        return Err(CompatibilityError::ContextBoundary(
+            "request contains tools but the selected custom model does not support tools".into(),
+        ));
     }
     let Some(items) = tools.as_array_mut() else {
-        return;
+        return Ok(());
     };
-    items.retain(|tool| {
+    for tool in items.iter() {
         let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
-        let keep = matches!(kind, "function" | "custom");
-        if !keep {
-            report.dropped_items += 1;
+        if !matches!(kind, "function" | "custom") {
+            return Err(CompatibilityError::ContextBoundary(format!(
+                "hosted or unsupported tool `{kind}` cannot be migrated to a custom provider"
+            )));
         }
-        keep
-    });
+    }
+    Ok(())
 }
 
-fn normalize_tools_value_in_place(tools: &mut Value) {
+fn normalize_tools_value_in_place(tools: &mut Value) -> Result<(), CompatibilityError> {
     let Some(items) = tools.as_array_mut() else {
-        return;
+        return Ok(());
     };
-    items.retain(|tool| {
-        matches!(
+    for tool in items.iter() {
+        if !matches!(
             tool.get("type").and_then(Value::as_str),
             Some("function" | "custom")
-        )
-    });
+        ) {
+            return Err(CompatibilityError::ContextBoundary(
+                "hosted or unsupported tool cannot be migrated to a custom provider".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn normalize_tools_value(tools: &Value, output: &mut Vec<Value>) {
+fn normalize_tools_value(tools: &Value, output: &mut Vec<Value>) -> Result<(), CompatibilityError> {
     if let Some(items) = tools.as_array() {
-        output.extend(
-            items
-                .iter()
-                .filter(|tool| {
-                    matches!(
-                        tool.get("type").and_then(Value::as_str),
-                        Some("function" | "custom")
-                    )
-                })
-                .cloned(),
-        );
+        for tool in items {
+            if !matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) {
+                return Err(CompatibilityError::ContextBoundary(
+                    "hosted or unsupported tool cannot be migrated to a custom provider".into(),
+                ));
+            }
+            output.push(tool.clone());
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,17 +398,15 @@ mod tests {
             "previous_response_id": "resp_official",
             "input": [
                 {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
-                {"type": "reasoning", "id": "rs_1", "encrypted_content": "secret", "summary": [{"type": "summary_text", "text": "looked at files"}]},
-                {"type": "reasoning", "id": "rs_2", "encrypted_content": "secret", "summary": []},
-                {"type": "web_search_call", "output": "search result"}
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "secret", "summary": [{"type": "summary_text", "text": "looked at files"}]}
             ],
-            "tools": [{"type": "function", "name": "shell"}, {"type": "web_search_preview"}]
+            "tools": [{"type": "function", "name": "shell"}]
         });
         let output = prepare_responses_request(&mut request, &model()).unwrap();
         assert_eq!(output["model"], "qwen3.8");
         assert!(output.get("previous_response_id").is_none());
         let items = output["input"].as_array().unwrap();
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 2);
         assert!(
             items
                 .iter()
@@ -352,14 +416,24 @@ mod tests {
     }
 
     #[test]
-    fn images_are_represented_without_sending_unsupported_payload() {
+    fn hosted_tool_history_is_rejected_instead_of_silently_dropped() {
+        let mut request = json!({
+            "model": "qwen/qwen3.8",
+            "input": [{"type": "web_search_call", "output": "search result"}]
+        });
+        let error = prepare_responses_request(&mut request, &model()).unwrap_err();
+        assert!(error.to_string().contains("hosted tool"));
+    }
+
+    #[test]
+    fn unsupported_images_are_rejected_at_the_context_boundary() {
         let mut request = json!({
             "model": "qwen/qwen3.8",
             "input": [{"type": "message", "role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,secret"}]}]
         });
-        let output = prepare_responses_request(&mut request, &model()).unwrap();
-        assert_eq!(output["input"][0]["content"][0]["type"], "input_text");
-        assert!(!output.to_string().contains("secret"));
+        let error = prepare_responses_request(&mut request, &model()).unwrap_err();
+        assert!(error.to_string().contains("image input"));
+        assert!(!error.to_string().contains("secret"));
     }
 
     #[test]
@@ -368,7 +442,7 @@ mod tests {
             "model": "qwen/qwen3.8",
             "messages": [{"role": "user", "content": "hello"}],
             "previous_response_id": "resp_official",
-            "tools": [{"type": "function", "name": "shell"}, {"type": "web_search_preview"}]
+            "tools": [{"type": "function", "name": "shell"}]
         });
         let output = prepare_chat_request(&request, &model()).unwrap();
         assert_eq!(output["model"], "qwen3.8");
@@ -381,13 +455,26 @@ mod tests {
         let request = json!({
             "model": "qwen/qwen3.8",
             "messages": [{"role": "user", "content": "hello"}],
-            "stream": true
+            "stream": false
         });
         let output = chat_to_responses_request(&request, &model()).unwrap();
         assert_eq!(output["model"], "qwen3.8");
         assert_eq!(output["input"][0]["type"], "message");
         assert_eq!(output["input"][0]["content"], "hello");
-        assert_eq!(output["stream"], true);
+        assert_eq!(output["stream"], false);
+    }
+
+    #[test]
+    fn chat_to_responses_rejects_streaming_protocol_conversion() {
+        let request = json!({
+            "model": "qwen/qwen3.8",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        });
+        assert!(matches!(
+            chat_to_responses_request(&request, &model()),
+            Err(CompatibilityError::StreamingProtocolConversion)
+        ));
     }
 
     #[test]
@@ -397,5 +484,15 @@ mod tests {
         assert_eq!(output["model"], "qwen3.8");
         assert_eq!(output["messages"][0]["role"], "system");
         assert_eq!(output["messages"][1]["content"], "hello");
+    }
+
+    #[test]
+    fn responses_to_chat_rejects_non_message_history() {
+        let request = json!({
+            "model": "qwen/qwen3.8",
+            "input": [{"type": "function_call", "call_id": "call_1"}]
+        });
+        let error = responses_to_chat_request(&request, &model()).unwrap_err();
+        assert!(error.to_string().contains("non-message"));
     }
 }

@@ -6,6 +6,7 @@ members = [
     "crates/router",
     "crates/integration",
     "crates/manager",
+    "crates/desktop",
     "crates/cli",
 ]
 resolver = "2"
@@ -28,6 +29,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 toml = "0.9"

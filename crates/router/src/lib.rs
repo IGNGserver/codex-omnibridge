@@ -18,7 +18,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codex_mp_core::{LogicalModelRoute, ProviderProtocol, ProviderRegistry, default_registry_path};
+use codex_mp_core::{
+    LogicalModelRoute, ProviderProtocol, ProviderRegistry, atomic_replace, default_registry_path,
+    set_private_permissions,
+};
 use codex_mp_credentials::CredentialStore;
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
@@ -140,6 +143,8 @@ pub enum RouterError {
     EndpointFile(String),
     #[error("router request is not authorized")]
     Unauthorized,
+    #[error("router request must use a loopback Host and Origin")]
+    InvalidRequestOrigin,
     #[error("router requests must use Content-Type: application/json")]
     UnsupportedContentType,
     #[error("registry reload failed: {0}")]
@@ -174,6 +179,14 @@ pub fn new_capability_token() -> SecretString {
 
 pub fn load_router_endpoint(path: impl AsRef<Path>) -> Result<RouterEndpoint, RouterError> {
     let path = path.as_ref();
+    let link_metadata =
+        fs::symlink_metadata(path).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(RouterError::EndpointFile(format!(
+            "endpoint file `{}` must not be a symlink",
+            path.display()
+        )));
+    }
     let metadata =
         fs::metadata(path).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
     #[cfg(unix)]
@@ -221,13 +234,8 @@ fn write_router_endpoint(
     };
     fs::write(&temp, serde_json::to_vec_pretty(&file).unwrap())
         .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
-    }
-    fs::rename(temp, path).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    set_private_permissions(&temp).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    atomic_replace(temp, path).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
     Ok(())
 }
 
@@ -332,8 +340,11 @@ pub async fn serve(config: RouterConfig, state: RouterState) -> Result<(), Route
     result
 }
 
-async fn healthz() -> impl IntoResponse {
-    Json(json!({"status": "ok", "bind": "127.0.0.1-only"}))
+async fn healthz(headers: HeaderMap) -> Response {
+    if let Some(response) = validate_request_origin(&headers) {
+        return response;
+    }
+    Json(json!({"status": "ok", "bind": "127.0.0.1-only"})).into_response()
 }
 
 async fn admin_reload(State(state): State<RouterState>, headers: HeaderMap) -> Response {
@@ -403,7 +414,7 @@ async fn chat_completions(
     forward_request(state, headers, body, Endpoint::ChatCompletions).await
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Endpoint {
     Responses,
     ChatCompletions,
@@ -536,6 +547,131 @@ async fn forward_request(
     };
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let is_chat_to_responses_stream = endpoint == Endpoint::Responses
+        && provider.protocol == ProviderProtocol::ChatCompletions
+        && transformed.get("stream").and_then(Value::as_bool) == Some(true);
+
+    if is_chat_to_responses_stream && status.is_success() {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tokio_util::codec::{FramedRead, LinesCodec};
+        use tokio_util::io::StreamReader;
+
+        let byte_stream = upstream
+            .bytes_stream()
+            .map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        let reader = StreamReader::new(byte_stream);
+        let lines = FramedRead::new(reader, LinesCodec::new());
+
+        struct StreamState {
+            response_id: String,
+            item_id: String,
+            started: bool,
+            accumulated: String,
+        }
+        let mut stream_state = StreamState {
+            response_id: "resp_custom".into(),
+            item_id: "msg_custom".into(),
+            started: false,
+            accumulated: String::new(),
+        };
+
+        let sse_stream = async_stream::stream! {
+            let mut lines = lines;
+            while let Some(line_res) = lines.next().await {
+                let Ok(line) = line_res else { break; };
+                let trimmed = line.trim();
+                if trimmed.is_empty() || !trimmed.starts_with("data:") {
+                    continue;
+                }
+                let data = trimmed[5..].trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    if stream_state.started {
+                        let item_done = json!({
+                            "type": "response.output_item.done",
+                            "item": {
+                                "id": stream_state.item_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": stream_state.accumulated}]
+                            }
+                        });
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.output_item.done\ndata: {item_done}\n\n")));
+                    }
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": stream_state.response_id,
+                            "status": "completed"
+                        }
+                    });
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.completed\ndata: {completed}\n\n")));
+                    break;
+                }
+
+                let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue; };
+                if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+                    stream_state.response_id = id.to_owned();
+                    stream_state.item_id = format!("msg_{id}");
+                }
+
+                let Some(choices) = chunk.get("choices").and_then(Value::as_array) else { continue; };
+                if choices.is_empty() { continue; };
+                let delta = choices[0].get("delta").and_then(Value::as_object);
+                let Some(delta) = delta else { continue; };
+
+                if !stream_state.started {
+                    stream_state.started = true;
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": stream_state.response_id}
+                    });
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.created\ndata: {created}\n\n")));
+                    let added = json!({
+                        "type": "response.output_item.added",
+                        "item": {
+                            "id": stream_state.item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": []
+                        }
+                    });
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.output_item.added\ndata: {added}\n\n")));
+                }
+
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                    if !reasoning.is_empty() {
+                        let reasoning_ev = json!({
+                            "type": "response.reasoning_summary_text.delta",
+                            "delta": reasoning,
+                            "summary_index": 0
+                        });
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.reasoning_summary_text.delta\ndata: {reasoning_ev}\n\n")));
+                    }
+                }
+
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        stream_state.accumulated.push_str(content);
+                        let text_delta = json!({
+                            "type": "response.output_text.delta",
+                            "delta": content
+                        });
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.output_text.delta\ndata: {text_delta}\n\n")));
+                    }
+                }
+            }
+        };
+
+        let mut response = Response::new(Body::from_stream(sse_stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        return response;
+    }
+
     let stream = upstream.bytes_stream();
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -571,6 +707,9 @@ fn require_json_content_type(headers: &HeaderMap) -> Option<Response> {
 }
 
 fn authorize(state: &RouterState, headers: &HeaderMap) -> Option<Response> {
+    if let Some(response) = validate_request_origin(headers) {
+        return Some(response);
+    }
     let expected = state.capability_token.as_deref()?;
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return Some(error_response(
@@ -592,6 +731,71 @@ fn authorize(state: &RouterState, headers: &HeaderMap) -> Option<Response> {
         ));
     }
     None
+}
+
+fn validate_request_origin(headers: &HeaderMap) -> Option<Response> {
+    let Some(host_header) = headers.get(header::HOST) else {
+        return Some(error_response(
+            StatusCode::BAD_REQUEST,
+            RouterError::InvalidRequestOrigin.to_string(),
+        ));
+    };
+    let Ok(host) = host_header.to_str() else {
+        return Some(error_response(
+            StatusCode::BAD_REQUEST,
+            RouterError::InvalidRequestOrigin.to_string(),
+        ));
+    };
+    if !is_loopback_authority(host) {
+        return Some(error_response(
+            StatusCode::BAD_REQUEST,
+            RouterError::InvalidRequestOrigin.to_string(),
+        ));
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let Ok(origin) = origin.to_str() else {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                RouterError::InvalidRequestOrigin.to_string(),
+            ));
+        };
+        let Ok(parsed) = Url::parse(origin) else {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                RouterError::InvalidRequestOrigin.to_string(),
+            ));
+        };
+        let allowed_scheme = matches!(parsed.scheme(), "http" | "https" | "tauri");
+        let allowed_host = parsed.host_str().is_some_and(is_loopback_host);
+        if !allowed_scheme || !allowed_host {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                RouterError::InvalidRequestOrigin.to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn is_loopback_authority(value: &str) -> bool {
+    let Ok(parsed) = Url::parse(&format!("http://{value}")) else {
+        return false;
+    };
+    let valid_path = parsed.path().is_empty() || parsed.path() == "/";
+    parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && valid_path
+        && parsed.host_str().is_some_and(is_loopback_host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 fn join_url(base: &str, path: &str) -> Result<Url, RouterError> {
@@ -871,7 +1075,7 @@ mod tests {
             .json(&json!({
                 "model": "chatapi/model-x",
                 "input": "hello",
-                "stream": true
+                "stream": false
             }))
             .send()
             .await
@@ -900,6 +1104,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/responses")
+            .header("host", "127.0.0.1")
             .header("authorization", "Bearer capability-secret")
             .header("content-type", "text/plain")
             .body(Body::from("{}"))
@@ -908,6 +1113,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn router_rejects_external_host_and_origin_headers() {
+        let state = RouterState::with_capability_token(
+            ProviderRegistry::empty("/tmp/providers.json"),
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("capability-secret"),
+        );
+        let app = app(state);
+
+        let external_host = axum::http::Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("host", "attacker.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), external_host)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let external_origin = axum::http::Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("host", "127.0.0.1")
+            .header("origin", "https://attacker.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app.clone(), external_origin)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let loopback_origin = axum::http::Request::builder()
+            .method("GET")
+            .uri("/healthz")
+            .header("host", "127.0.0.1")
+            .header("origin", "tauri://localhost")
+            .body(Body::empty())
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app, loopback_origin)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -922,6 +1172,7 @@ mod tests {
         let missing = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/responses")
+            .header("host", "127.0.0.1")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"model":"newapi/qwen3.8"}"#))
             .unwrap();
@@ -933,6 +1184,7 @@ mod tests {
         let wrong = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/responses")
+            .header("host", "127.0.0.1")
             .header("authorization", "Bearer wrong")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"model":"newapi/qwen3.8"}"#))
@@ -952,6 +1204,7 @@ mod tests {
         let missing = axum::http::Request::builder()
             .method("POST")
             .uri("/admin/shutdown")
+            .header("host", "127.0.0.1")
             .body(Body::empty())
             .unwrap();
         let response = tower::ServiceExt::oneshot(app.clone(), missing)
@@ -962,6 +1215,7 @@ mod tests {
         let authorized = axum::http::Request::builder()
             .method("POST")
             .uri("/admin/shutdown")
+            .header("host", "127.0.0.1")
             .header("authorization", "Bearer capability-secret")
             .body(Body::empty())
             .unwrap();
