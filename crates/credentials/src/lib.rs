@@ -14,6 +14,50 @@ use thiserror::Error;
 
 const DEFAULT_SERVICE: &str = "dev.codex-multiprovider";
 
+fn set_private_file_permissions(path: &std::path::Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    {
+        let system_dir = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "SystemRoot is not set; cannot secure the credential fallback",
+                )
+            })?
+            .join("System32");
+        let principal = std::process::Command::new(system_dir.join("whoami.exe"))
+            .output()?
+            .stdout;
+        let principal = String::from_utf8_lossy(&principal).trim().to_owned();
+        if principal.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "whoami.exe returned no Windows principal",
+            ));
+        }
+        let output = std::process::Command::new(system_dir.join("icacls.exe"))
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{principal}:F"))
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum CredentialStoreError {
     #[error("credential backend error: {0}")]
@@ -59,6 +103,35 @@ impl NativeCredentialStore {
 
 impl CredentialStore for NativeCredentialStore {
     fn get(&self, reference: &str) -> Result<SecretString, CredentialStoreError> {
+        let env_var = format!(
+            "CODEX_MP_KEY_{}",
+            reference
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        );
+        if let Ok(val) = std::env::var(&env_var)
+            && !val.trim().is_empty()
+        {
+            return Ok(SecretString::from(val));
+        }
+
+        // Try file fallback first if present
+        let config_dir = directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
+            .map(|d| d.config_dir().to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let fallback_file = config_dir.join(".credentials");
+        if let Ok(s) = std::fs::read_to_string(&fallback_file)
+            && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
+            && let Some(val) = map.get(reference)
+        {
+            return Ok(SecretString::from(val.clone()));
+        }
+
         let entry = self.entry(reference)?;
         entry
             .get_password()
@@ -73,15 +146,68 @@ impl CredentialStore for NativeCredentialStore {
     }
 
     fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
-        self.entry(reference)?
-            .set_password(value.expose_secret())
-            .map_err(|error| CredentialStoreError::Backend(error.to_string()))
+        match self.entry(reference)?.set_password(value.expose_secret()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // In headless/container environments where Secret Service prompt is dismissed,
+                // store in a secure 0600 file in user config as graceful fallback.
+                let config_dir =
+                    directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
+                        .map(|d| d.config_dir().to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let _ = std::fs::create_dir_all(&config_dir);
+                let fallback_file = config_dir.join(".credentials");
+                let mut map: HashMap<String, String> = std::fs::read_to_string(&fallback_file)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                map.insert(reference.to_owned(), value.expose_secret().to_owned());
+                if let Ok(json_str) = serde_json::to_string(&map) {
+                    let write_result = {
+                        #[cfg(unix)]
+                        use std::os::unix::fs::OpenOptionsExt;
+                        #[cfg(unix)]
+                        let result = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o600)
+                            .open(&fallback_file)
+                            .and_then(|mut f| {
+                                std::io::Write::write_all(&mut f, json_str.as_bytes())
+                            });
+                        #[cfg(not(unix))]
+                        let result = std::fs::write(&fallback_file, json_str);
+                        result
+                    };
+                    if let Err(error) = write_result {
+                        return Err(CredentialStoreError::Backend(error.to_string()));
+                    }
+                    if let Err(error) = set_private_file_permissions(&fallback_file) {
+                        return Err(CredentialStoreError::Backend(error.to_string()));
+                    }
+                    return Ok(());
+                }
+                Err(CredentialStoreError::Backend(e.to_string()))
+            }
+        }
     }
 
     fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
-        self.entry(reference)?
-            .delete_credential()
-            .map_err(|error| CredentialStoreError::Backend(error.to_string()))
+        let _ = self.entry(reference)?.delete_credential();
+        let config_dir = directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
+            .map(|d| d.config_dir().to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let fallback_file = config_dir.join(".credentials");
+        if let Ok(s) = std::fs::read_to_string(&fallback_file)
+            && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
+        {
+            map.remove(reference);
+            if let Ok(json_str) = serde_json::to_string(&map) {
+                let _ = std::fs::write(&fallback_file, json_str);
+            }
+        }
+        Ok(())
     }
 }
 
