@@ -236,10 +236,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
           $env:CODEX_MP_REGISTRY = $registry
           & .\dist\package\install-windows.ps1 -PackageDir (Resolve-Path dist/package) -InstallDir $smokeDir
-          if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
+          if (-not $?) { throw "Windows installer smoke failed" }
           if (-not (Test-Path (Join-Path $smokeDir "codex-mp.exe"))) { throw "codex-mp.exe was not installed" }
           & (Join-Path $smokeDir "codex-mp-uninstall.ps1") -InstallDir $smokeDir
-          if ($LASTEXITCODE -ne 0) { throw "Windows uninstaller smoke failed with exit code $LASTEXITCODE" }
+          if (-not $?) { throw "Windows uninstaller smoke failed" }
           if (Test-Path (Join-Path $smokeDir "codex-mp.exe")) { throw "codex-mp.exe was not removed" }
 
       - name: 打包 macOS 安装包 (DMG + portable)
