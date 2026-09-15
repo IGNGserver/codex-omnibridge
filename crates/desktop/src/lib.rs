@@ -613,6 +613,12 @@ fn candidates_display(codex_home: &Path) -> PathBuf {
 fn release_dir_for_entrypoint(bin_dir: &Path) -> Result<PathBuf, DesktopError> {
     #[cfg(target_os = "windows")]
     {
+        if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+            return bin_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| DesktopError::InvalidPath(bin_dir.display().to_string()));
+        }
         return Ok(bin_dir.to_path_buf());
     }
     #[cfg(target_os = "macos")]
