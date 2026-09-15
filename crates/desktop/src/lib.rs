@@ -620,6 +620,9 @@ fn release_dir_for_entrypoint(bin_dir: &Path) -> Result<PathBuf, DesktopError> {
         let contents = bin_dir
             .parent()
             .ok_or_else(|| DesktopError::InvalidPath(bin_dir.display().to_string()))?;
+        if contents.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+            return Ok(contents.to_path_buf());
+        }
         return contents
             .parent()
             .map(Path::to_path_buf)
