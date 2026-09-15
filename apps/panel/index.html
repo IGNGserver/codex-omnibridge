@@ -1,70 +1,491 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Codex MultiProvider</title>
+    <title>Codex OmniBridge - 控制中心</title>
+    <!-- 引入 Google Fonts 的 Material Symbols Outlined 图标库 -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">CODEX MULTIPROVIDER</p>
-          <h1>Provider 面板</h1>
-          <p class="subtitle">管理第三方模型；聊天中的日常切换仍使用 Codex 原生模型菜单。</p>
+    <div class="m3-layout-root">
+      <!-- 顶部应用栏 (Top App Bar) -->
+      <header class="m3-top-app-bar">
+        <div class="m3-app-brand">
+          <div class="m3-brand-icon">
+            <span class="material-symbols-outlined">hub</span>
+          </div>
+          <span class="m3-brand-title">Codex OmniBridge</span>
+          <span class="m3-brand-badge">Material 3</span>
         </div>
-        <div class="topbar-actions"><div class="router-state" id="router-state">Router 检查中…</div><button class="secondary" id="sync-catalog">同步到 Codex</button></div>
+
+        <div class="m3-topbar-actions">
+          <div class="m3-badge m3-badge-success" id="router-state-badge">
+            <span class="material-symbols-outlined" style="font-size: 16px;">dns</span>
+            <span id="router-state-text">Router 检查中…</span>
+          </div>
+
+          <button class="m3-btn m3-btn-tonal" id="topbar-sync-btn" title="将当前配置全量同步至 Codex catalog">
+            <span class="material-symbols-outlined">sync</span>
+            <span>同步到 Codex</span>
+          </button>
+
+          <button class="m3-icon-btn" id="theme-toggle-btn" title="切换深色/浅色主题">
+            <span class="material-symbols-outlined" id="theme-icon">light_mode</span>
+          </button>
+
+          <button class="m3-icon-btn" id="logout-btn" title="退出管理登录" style="display: none;">
+            <span class="material-symbols-outlined">logout</span>
+          </button>
+        </div>
       </header>
 
-      <section class="grid">
-        <article class="card">
-          <div class="card-heading">
-            <div>
-              <p class="eyebrow">PROVIDERS</p>
-              <h2>添加 Provider</h2>
+      <div class="m3-app-body">
+        <!-- 侧边导航栏 (Navigation Drawer) -->
+        <nav class="m3-navigation-drawer">
+          <button class="m3-nav-item active" data-target="view-overview">
+            <span class="material-symbols-outlined">dashboard</span>
+            <span>总览看板</span>
+          </button>
+          <button class="m3-nav-item" data-target="view-accounts">
+            <span class="material-symbols-outlined">manage_accounts</span>
+            <span>官方账号管理</span>
+          </button>
+          <button class="m3-nav-item" data-target="view-providers">
+            <span class="material-symbols-outlined">neurology</span>
+            <span>模型与服务商</span>
+          </button>
+          <button class="m3-nav-item" data-target="view-settings">
+            <span class="material-symbols-outlined">tune</span>
+            <span>安全与系统设置</span>
+          </button>
+
+          <div class="m3-drawer-footer">
+            <div style="padding: 0 12px; display: flex; flex-direction: column; gap: 4px;">
+              <span class="m3-label-small" style="color: var(--md-sys-color-outline);">OmniBridge Core v0.1.0</span>
+              <span class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant); font-size: 11px;">无头多模型桥接路由器</span>
             </div>
           </div>
-          <form id="provider-form" class="form-grid">
-            <label>名称<input name="name" required placeholder="NewAPI" /></label>
-            <label>Base URL<input name="base_url" required placeholder="https://api.example/v1" /></label>
-            <label>协议<select name="protocol"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option></select></label>
-            <label>API Key<input name="api_key" type="password" autocomplete="off" placeholder="仅写入系统 Keyring" /></label>
-            <button type="submit">保存 Provider</button>
-          </form>
-        </article>
+        </nav>
 
-        <article class="card">
-          <div class="card-heading">
-            <div>
-              <p class="eyebrow">MANUAL MODEL</p>
-              <h2>手动添加模型</h2>
+        <!-- 主内容视口 (Main Content Surface) -->
+        <main class="m3-main-content">
+
+          <!-- ================= 页面 1：总览看板 (Overview) ================= -->
+          <section id="view-overview" class="m3-view-section active">
+            <div class="m3-section-header">
+              <div class="m3-section-title-group">
+                <h2 class="m3-headline-small">总览看板</h2>
+                <p class="m3-body-medium">实时监控 Codex OmniBridge 路由器、活动账号与模型接入状态</p>
+              </div>
+              <button class="m3-btn m3-btn-outlined" id="overview-refresh-btn">
+                <span class="material-symbols-outlined">refresh</span>
+                <span>刷新全量数据</span>
+              </button>
             </div>
-          </div>
-          <form id="model-form" class="form-grid">
-            <label>Provider ID<input name="provider_id" required placeholder="newapi" /></label>
-            <label>上游模型 ID<input name="upstream_model_id" required placeholder="gemini3.8flash" /></label>
-            <label>显示名称<input name="display_name" required placeholder="NewAPI / Gemini 3.8 Flash" /></label>
-            <label>上下文窗口<input name="context_window" type="number" min="1" placeholder="131072" /></label>
-            <div class="checks"><label><input name="images" type="checkbox" /> 图片输入</label><label><input name="tools" type="checkbox" checked /> Tools</label></div>
-            <button type="submit">添加模型</button>
-          </form>
-        </article>
-      </section>
 
-      <section class="card">
-        <div class="card-heading">
-          <div>
-            <p class="eyebrow">CONFIGURED</p>
-            <h2>已配置 Provider</h2>
-          </div>
-          <button class="secondary" id="refresh">刷新</button>
+            <!-- 核心状态指标卡片网格 -->
+            <div class="m3-metric-grid">
+              <div class="m3-card m3-card-elevated m3-metric-card">
+                <div class="m3-metric-top">
+                  <span class="m3-label-medium" style="color: var(--md-sys-color-on-surface-variant);">ROUTER 状态</span>
+                  <div class="m3-metric-icon">
+                    <span class="material-symbols-outlined">router</span>
+                  </div>
+                </div>
+                <div class="m3-metric-val" id="metric-router-val">检测中…</div>
+                <span class="m3-body-small" id="metric-router-desc" style="color: var(--md-sys-color-outline);">本地端口分流透传正常</span>
+              </div>
+
+              <div class="m3-card m3-card-elevated m3-metric-card">
+                <div class="m3-metric-top">
+                  <span class="m3-label-medium" style="color: var(--md-sys-color-on-surface-variant);">当前生效账号</span>
+                  <div class="m3-metric-icon">
+                    <span class="material-symbols-outlined">badge</span>
+                  </div>
+                </div>
+                <div class="m3-metric-val" id="metric-account-val" style="font-size: 18px; line-height: 28px; word-break: break-all;">未登录</div>
+                <span class="m3-body-small" id="metric-account-plan" style="color: var(--md-sys-color-primary);">--</span>
+              </div>
+
+              <div class="m3-card m3-card-elevated m3-metric-card">
+                <div class="m3-metric-top">
+                  <span class="m3-label-medium" style="color: var(--md-sys-color-on-surface-variant);">已连接服务商</span>
+                  <div class="m3-metric-icon">
+                    <span class="material-symbols-outlined">hub</span>
+                  </div>
+                </div>
+                <div class="m3-metric-val" id="metric-providers-val">0</div>
+                <span class="m3-body-small" id="metric-models-val" style="color: var(--md-sys-color-outline);">共包含 0 个模型</span>
+              </div>
+
+              <div class="m3-card m3-card-elevated m3-metric-card">
+                <div class="m3-metric-top">
+                  <span class="m3-label-medium" style="color: var(--md-sys-color-on-surface-variant);">DESKTOP 适配</span>
+                  <div class="m3-metric-icon">
+                    <span class="material-symbols-outlined">desktop_windows</span>
+                  </div>
+                </div>
+                <div class="m3-metric-val" id="metric-desktop-val">检测中…</div>
+                <span class="m3-body-small" id="metric-desktop-desc" style="color: var(--md-sys-color-outline);">独立二进制运行时</span>
+              </div>
+            </div>
+
+            <!-- 当前生效账号与额度看板 (聚焦卡片) -->
+            <div class="m3-card m3-card-filled" style="margin-bottom: 24px;">
+              <div class="m3-section-header" style="margin-bottom: 16px;">
+                <div>
+                  <h3 class="m3-title-large">官方账号即时额度</h3>
+                  <p class="m3-body-medium">无需进入 Codex 客户端即可快速查看当前生效账号的剩余用量</p>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                  <button class="m3-btn m3-btn-tonal" id="overview-check-account-btn">
+                    <span class="material-symbols-outlined">verified_user</span>
+                    <span>检查当前账号</span>
+                  </button>
+                  <button class="m3-btn m3-btn-outlined" id="overview-restart-codex-btn">
+                    <span class="material-symbols-outlined">restart_alt</span>
+                    <span>重启 Codex</span>
+                  </button>
+                </div>
+              </div>
+              <div id="overview-active-usage-container">
+                <div class="m3-body-medium" style="color: var(--md-sys-color-outline); padding: 12px 0;">正在加载当前账号实时额度…</div>
+              </div>
+            </div>
+
+            <!-- 快捷管理指引卡片 -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 18px;">
+              <div class="m3-card m3-card-outlined">
+                <h4 class="m3-title-medium" style="margin-bottom: 8px;">快捷添加 AI 供应商</h4>
+                <p class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant); margin-bottom: 16px;">支持快速添加 NewAPI、OneAPI、OpenRouter 等供应商并自动扫描模型</p>
+                <button class="m3-btn m3-btn-filled" id="overview-open-add-provider-btn">
+                  <span class="material-symbols-outlined">add</span>
+                  <span>新建 Provider</span>
+                </button>
+              </div>
+
+              <div class="m3-card m3-card-outlined">
+                <h4 class="m3-title-medium" style="margin-bottom: 8px;">导入已有官方登录态</h4>
+                <p class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant); margin-bottom: 16px;">一键将本地已登录的 ChatGPT/Codex 账号凭据保存到安全托管库</p>
+                <button class="m3-btn m3-btn-tonal" id="overview-capture-account-btn">
+                  <span class="material-symbols-outlined">save</span>
+                  <span>保存当前登录态</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ================= 页面 2：官方账号管理 (Official Accounts) ================= -->
+          <section id="view-accounts" class="m3-view-section">
+            <div class="m3-section-header">
+              <div class="m3-section-title-group">
+                <h2 class="m3-headline-small">官方账号与额度中心</h2>
+                <p class="m3-body-medium">托管多套 Codex 官方账号凭据，一键秒级切换，实时掌握 5小时 / 周 / Reserve 额度</p>
+              </div>
+              <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button class="m3-btn m3-btn-filled" id="capture-account-action-btn">
+                  <span class="material-symbols-outlined">bookmark_add</span>
+                  <span>保存当前登录态为账号</span>
+                </button>
+                <button class="m3-btn m3-btn-tonal" id="open-import-modal-action-btn">
+                  <span class="material-symbols-outlined">file_upload</span>
+                  <span>导入账号凭据</span>
+                </button>
+                <button class="m3-btn m3-btn-outlined" id="refresh-all-accounts-usage-btn">
+                  <span class="material-symbols-outlined">autorenew</span>
+                  <span>批量刷新所有额度</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 托管账号卡片网格 -->
+            <div class="m3-accounts-grid" id="accounts-card-container">
+              <div class="m3-card m3-card-filled" style="grid-column: 1 / -1; text-align: center; padding: 48px 20px;">
+                <span class="material-symbols-outlined" style="font-size: 48px; color: var(--md-sys-color-outline); margin-bottom: 12px;">account_circle</span>
+                <p class="m3-title-medium" style="color: var(--md-sys-color-on-surface-variant);">正在加载托管账号列表…</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ================= 页面 3：模型与服务商 (Providers & Models) ================= -->
+          <section id="view-providers" class="m3-view-section">
+            <div class="m3-section-header">
+              <div class="m3-section-title-group">
+                <h2 class="m3-headline-small">模型与提供商管理</h2>
+                <p class="m3-body-medium">配置第三方 AI 服务商（NewAPI/OneAPI/OpenRouter 等），一键发现并同步至 Codex</p>
+              </div>
+              <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button class="m3-btn m3-btn-filled" id="open-add-provider-dialog-btn">
+                  <span class="material-symbols-outlined">add</span>
+                  <span>添加 Provider</span>
+                </button>
+                <button class="m3-btn m3-btn-tonal" id="open-add-model-dialog-btn">
+                  <span class="material-symbols-outlined">playlist_add</span>
+                  <span>手动添加模型</span>
+                </button>
+                <button class="m3-btn m3-btn-outlined" id="providers-refresh-btn">
+                  <span class="material-symbols-outlined">refresh</span>
+                  <span>刷新服务商</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="providers-container">
+              <div class="m3-card m3-card-filled" style="text-align: center; padding: 48px 20px;">
+                <span class="material-symbols-outlined" style="font-size: 48px; color: var(--md-sys-color-outline); margin-bottom: 12px;">neurology</span>
+                <p class="m3-title-medium" style="color: var(--md-sys-color-on-surface-variant);">正在加载已配置的 Provider 列表…</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- ================= 页面 4：安全与系统设置 (Settings & Security) ================= -->
+          <section id="view-settings" class="m3-view-section">
+            <div class="m3-section-header">
+              <div class="m3-section-title-group">
+                <h2 class="m3-headline-small">安全与系统设置</h2>
+                <p class="m3-body-medium">控制控制台访问权限、外网局域网监听，管理 Codex Desktop 独立运行时适配</p>
+              </div>
+            </div>
+
+            <div class="m3-settings-container">
+              <!-- Web 面板访问安全与外网设置 -->
+              <div class="m3-card m3-card-elevated">
+                <div class="m3-section-header" style="margin-bottom: 16px;">
+                  <div>
+                    <h3 class="m3-title-large">面板网络与访问控制</h3>
+                    <p class="m3-body-medium">设置安全访问密码以开启局域网/外网访问 (0.0.0.0)</p>
+                  </div>
+                  <div class="m3-badge m3-badge-success" id="settings-access-state-badge">检测中…</div>
+                </div>
+
+                <form id="settings-security-form" style="display: flex; flex-direction: column; gap: 20px;">
+                  <div class="m3-text-field">
+                    <label for="settings-web-password">面板访问密码</label>
+                    <input class="m3-input" id="settings-web-password" type="password" autocomplete="new-password" placeholder="留空则保持现状，输入新密码进行修改或设置" />
+                  </div>
+
+                  <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0;">
+                    <div>
+                      <div class="m3-label-large">允许外网 / 局域网访问</div>
+                      <div class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant);">开启后将服务绑定到 0.0.0.0（必须设置访问密码方可生效）</div>
+                    </div>
+                    <label class="m3-switch">
+                      <input type="checkbox" id="settings-allow-remote" />
+                      <span class="m3-switch-slider"></span>
+                    </label>
+                  </div>
+
+                  <p id="settings-security-tip" class="m3-body-small" style="color: var(--md-sys-color-outline);"></p>
+
+                  <div style="display: flex; justify-content: flex-end;">
+                    <button type="submit" class="m3-btn m3-btn-filled">
+                      <span class="material-symbols-outlined">security</span>
+                      <span>更新访问安全配置</span>
+                    </button>
+                  </div>
+                </form>
+              </div>
+
+              <!-- Desktop Runtime Adapter 设置 -->
+              <div class="m3-card m3-card-elevated">
+                <div class="m3-section-header" style="margin-bottom: 16px;">
+                  <div>
+                    <h3 class="m3-title-large">Codex Desktop 独立适配</h3>
+                    <p class="m3-body-medium">管理用户目录下的 standalone Codex 入口，不影响 ChatGPT 官方环境</p>
+                  </div>
+                  <div class="m3-badge" id="settings-desktop-badge">检测中…</div>
+                </div>
+
+                <p id="settings-desktop-detail" class="m3-body-medium" style="color: var(--md-sys-color-on-surface-variant); margin-bottom: 20px;">
+                  正在检测 Desktop 运行时状态…
+                </p>
+
+                <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                  <button class="m3-btn m3-btn-tonal" id="settings-desktop-install-btn">
+                    <span class="material-symbols-outlined">install_desktop</span>
+                    <span>安装适配</span>
+                  </button>
+                  <button class="m3-btn m3-btn-outlined" id="settings-desktop-restore-btn">
+                    <span class="material-symbols-outlined">restore</span>
+                    <span>恢复官方原版</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+        </main>
+      </div>
+    </div>
+
+    <!-- ==========================================================================
+         Material 3 对话框系统 (Dialog Modals)
+         ========================================================================== -->
+
+    <!-- 1. 登录认证对话框 -->
+    <div id="login-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small">面板访问认证</h3>
+          <p class="m3-body-medium" style="color: var(--md-sys-color-on-surface-variant);">该 OmniBridge 面板已启用密码保护，请输入密码继续。</p>
         </div>
-        <div id="providers" class="provider-list"></div>
-      </section>
+        <form id="m3-login-form">
+          <div class="m3-text-field" style="margin-bottom: 20px;">
+            <label for="m3-login-password">访问密码</label>
+            <input class="m3-input" id="m3-login-password" type="password" required placeholder="请输入您的访问密码" autofocus />
+          </div>
+          <p id="login-dialog-error" class="m3-body-small" style="color: var(--md-sys-color-error); margin-bottom: 12px; min-height: 18px;"></p>
+          <div class="m3-dialog-actions">
+            <button type="submit" class="m3-btn m3-btn-filled" style="width: 100%;">
+              <span class="material-symbols-outlined">login</span>
+              <span>登录控制台</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
 
-      <p id="message" class="message" role="status"></p>
-    </main>
+    <!-- 2. 添加 Provider 对话框 -->
+    <div id="add-provider-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog" style="max-width: 560px;">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small">添加 Provider</h3>
+          <p class="m3-body-medium" style="color: var(--md-sys-color-on-surface-variant);">接入第三方兼容模型提供商</p>
+        </div>
+        <form id="m3-provider-form" style="display: flex; flex-direction: column; gap: 14px;">
+          <div class="m3-text-field">
+            <label>供应商名称</label>
+            <input class="m3-input" name="name" required placeholder="例如：NewAPI、OneAPI 或 OpenRouter" />
+          </div>
+          <div class="m3-text-field">
+            <label>API Base URL</label>
+            <input class="m3-input" name="base_url" required placeholder="https://api.example.com/v1" />
+          </div>
+          <div class="m3-text-field">
+            <label>协议类型</label>
+            <select class="m3-select" name="protocol">
+              <option value="responses">Responses (OpenAI Responses / Codex 增强协议)</option>
+              <option value="chat_completions">Chat Completions (标准 /v1/chat/completions)</option>
+            </select>
+          </div>
+          <div class="m3-text-field">
+            <label>API Key (密钥)</label>
+            <input class="m3-input" name="api_key" type="password" autocomplete="off" placeholder="将安全加密写入本地凭证存储" />
+          </div>
+          <div class="m3-dialog-actions">
+            <button type="button" class="m3-btn m3-btn-text" id="close-add-provider-btn">取消</button>
+            <button type="submit" class="m3-btn m3-btn-filled">保存 Provider</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 3. 手动添加模型对话框 -->
+    <div id="add-model-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog" style="max-width: 560px;">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small">手动添加模型</h3>
+          <p class="m3-body-medium" style="color: var(--md-sys-color-on-surface-variant);">将指定的上游模型注册到某个已存在的 Provider 下</p>
+        </div>
+        <form id="m3-model-form" style="display: flex; flex-direction: column; gap: 14px;">
+          <div class="m3-text-field">
+            <label>Provider ID</label>
+            <input class="m3-input" name="provider_id" id="add-model-provider-id" required placeholder="例如：newapi" />
+          </div>
+          <div class="m3-text-field">
+            <label>上游模型 ID (Upstream Model ID)</label>
+            <input class="m3-input" name="upstream_model_id" required placeholder="例如：gemini-3.8-flash" />
+          </div>
+          <div class="m3-text-field">
+            <label>在 Codex 中显示的名称</label>
+            <input class="m3-input" name="display_name" required placeholder="例如：NewAPI / Gemini 3.8 Flash" />
+          </div>
+          <div class="m3-text-field">
+            <label>上下文窗口 (Context Window, 可留空)</label>
+            <input class="m3-input" name="context_window" type="number" min="1" placeholder="例如：131072" />
+          </div>
+          <div style="display: flex; gap: 24px; padding: 4px 0;">
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer;">
+              <input type="checkbox" name="images" /> 图片与视觉输入
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer;">
+              <input type="checkbox" name="tools" checked /> 工具调用 (Tools)
+            </label>
+          </div>
+          <div class="m3-dialog-actions">
+            <button type="button" class="m3-btn m3-btn-text" id="close-add-model-btn">取消</button>
+            <button type="submit" class="m3-btn m3-btn-filled">添加模型</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 4. 导入官方账号凭据对话框 -->
+    <div id="import-account-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog" style="max-width: 580px;">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small">导入官方账号凭据</h3>
+          <p class="m3-body-medium" style="color: var(--md-sys-color-on-surface-variant);">粘贴官方 ~/.codex/auth.json 全文或提取的 tokens JSON</p>
+        </div>
+        <form id="m3-import-account-form" style="display: flex; flex-direction: column; gap: 14px;">
+          <div class="m3-text-field">
+            <label>账号备注名称</label>
+            <input class="m3-input" name="name" placeholder="例如：Plus 主号 / 备用工作号" />
+          </div>
+          <div class="m3-text-field">
+            <label>凭据 JSON 内容</label>
+            <textarea class="m3-textarea" name="json_content" required rows="8" style="font-family: monospace; font-size: 12px;" placeholder='{"auth_mode": "chatgpt", "tokens": { "access_token": "...", "id_token": "..." }}'></textarea>
+          </div>
+          <p id="import-dialog-error" class="m3-body-small" style="color: var(--md-sys-color-error); min-height: 18px;"></p>
+          <div class="m3-dialog-actions">
+            <button type="button" class="m3-btn m3-btn-text" id="close-import-account-dialog-btn">取消</button>
+            <button type="submit" class="m3-btn m3-btn-filled">确认导入</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 5. 通用输入确认对话框 (替代 window.prompt) -->
+    <div id="prompt-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small" id="prompt-dialog-title">请输入</h3>
+          <p class="m3-body-medium" id="prompt-dialog-desc" style="color: var(--md-sys-color-on-surface-variant);"></p>
+        </div>
+        <form id="prompt-dialog-form">
+          <div class="m3-text-field" style="margin-bottom: 20px;">
+            <input class="m3-input" id="prompt-dialog-input" autofocus />
+          </div>
+          <div class="m3-dialog-actions">
+            <button type="button" class="m3-btn m3-btn-text" id="prompt-dialog-cancel">取消</button>
+            <button type="submit" class="m3-btn m3-btn-filled" id="prompt-dialog-confirm">确定</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- 6. 通用二次确认对话框 (替代 window.confirm) -->
+    <div id="confirm-dialog-backdrop" class="m3-dialog-backdrop" style="display: none;">
+      <div class="m3-dialog">
+        <div class="m3-dialog-head">
+          <h3 class="m3-headline-small" id="confirm-dialog-title">操作确认</h3>
+          <p class="m3-body-medium" id="confirm-dialog-desc" style="color: var(--md-sys-color-on-surface-variant);"></p>
+        </div>
+        <div class="m3-dialog-actions">
+          <button type="button" class="m3-btn m3-btn-text" id="confirm-dialog-cancel">取消</button>
+          <button type="button" class="m3-btn m3-btn-filled" id="confirm-dialog-confirm">确认操作</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 浮动通知 Snackbar (替代底部杂乱文本) -->
+    <div id="m3-snackbar" class="m3-snackbar" role="status">
+      <span class="material-symbols-outlined" id="snackbar-icon">info</span>
+      <span id="snackbar-message">通知内容</span>
+    </div>
+
     <script src="main.js"></script>
   </body>
 </html>

@@ -1,10 +1,14 @@
 # Codex MultiProvider 后续整改与实施路线
 
+> 规范说明：本文件保留为历史整改记录，不是当前机制合同。若与
+> [`CCSWITCH_MECHANISM_AUDIT_AND_REBUILD_PLAN.md`](./CCSWITCH_MECHANISM_AUDIT_AND_REBUILD_PLAN.md)
+> 冲突，以后者为唯一规范；其中旧 patched/openai 路径仅代表历史状态或 legacy/experimental 资料。
+
 > 文档状态：审计后续实施基线
 >
 > 审计日期：2026-09-09
 >
-> 当前结论：`FAIL`（P0 patched Core per-turn 路由代码已落地，但真实 CLI/app-server、Desktop、Remote 和 Provider E2E 仍未证明）
+> 当前结论：`NOT PROVEN`（P0 patched Core、Linux 真实 caller 数据面和三平台 ChatGPT Desktop runtime adapter 已落地；真实第三方 Provider、Desktop picker、Remote、Windows/macOS 原生 patched artifact 仍未证明）
 >
 > 本文档不是功能愿望清单，而是后续实现必须遵守的架构约束、实施顺序、验收门槛和交接说明。
 
@@ -80,22 +84,23 @@ Official → Custom → Official
 
 | 阻塞 | 状态 | 结论 |
 |---|---|---|
-| Codex Core/app-server → Router 的 per-turn 数据路径 | P0 实现 / NOT PROVEN | patched Core 已在真实 `ModelClientSession::stream()` 分流；尚未通过真实 Codex caller + Router + Provider turn E2E |
-| 同一 Thread Official → Custom → Official | NOT PROVEN | patched Core 路由分支已存在，但尚无真实 Thread 三轮证据 |
-| Chat Completions → Responses 响应归一化 | P1 未完成 | 当前只转换请求，响应原样透传 |
-| 跨模型 Context Boundary | P1 未完成 | 当前转换会丢弃或降级多个 Codex-specific item |
+| Codex Core/app-server → Router 的 per-turn 数据路径 | PASS（隔离 Provider fixture） | pinned patched `codex-app-server` 和 `codex exec` 真实 turn 已通过 Router；错误 capability 401、custom model rewrite、Custom 无官方 Authorization 均已核验 |
+| 同一 Thread Official → Custom → Official | PASS（受控 fixture） | 同一 app-server thread 的三轮均 `completed`；官方与 Custom mock 的请求隔离和跨 route history boundary 均通过 |
+| Chat Completions → Responses 响应归一化 | P1 受限交付 | 非流式请求有显式转换；跨协议流式请求拒绝，响应事件完整归一化仍未交付 |
+| 跨模型 Context Boundary | P1 受限交付 | 不支持的图片、文件、hosted tool、函数历史和 reasoning summary 显式拒绝；真实 Provider 验收仍未完成 |
 | Router 客户端认证 | PASS（loopback token V1） | 随机 capability token + 0600 endpoint file；仍不是 Unix socket / named pipe |
-| 真实 Desktop / Bridge | 未实现或未验收 | 无真实 Desktop caller 证据 |
+| ChatGPT Desktop runtime adapter | PASS（实现与目标机分层验收） | 三平台发现、manifest/backup/launcher/restore 已落地；macOS VM 完成原生 install/status/restore/launcher/installer 回归，Windows VM 完成 AppX/runtime、PowerShell installer 和真实 ChatGPT.exe 启动；本项目 Windows CLI launcher turn 仍未证明 |
+| 真实 Desktop / Bridge | NOT PROVEN | 需要真实 Desktop picker、app-server 与 Router turn 证据 |
 | Remote Desktop → Remote Host | 未验收 | 无远程 app-server / Router E2E 证据 |
 | Upgrade / repair / fail-safe | P2 未完成 | `repair` 只是再次执行安装流程 |
-| Windows `Setup.exe` 与完整 Linux 生命周期 | P2 未完成 | Linux installer 当前只复制 CLI binary |
+| Windows `Setup.exe` 与完整 Linux 生命周期 | P2 未完成 | 当前交付用户级 PowerShell installer（不是 Setup.exe）；Windows/macOS 目标机已有阶段性 smoke，Linux 真实目标机生命周期仍未执行 |
 
 ### 2.3 当前仓库的准确定位
 
 当前仓库应被描述为：
 
 ```text
-Codex MultiProvider Linux CLI / Catalog / Router 技术基础 V1
+Codex MultiProvider 跨平台 CLI / Catalog / Router / Desktop runtime adapter 技术基础 V1
 ```
 
 不能描述为：
@@ -322,8 +327,9 @@ turn model = newapi/qwen3.8
 1. 安装时生成随机 capability token；
 2. Router 强制校验：
    ```http
-   Authorization: Bearer <local-router-token>
+   x-codex-omnibridge-token: <raw local-router-token>
    ```
+   Official route 还要求上游 `Authorization: Bearer ...`；该 header 不得进入 Custom Provider 请求。
 3. 校验 loopback Host；
 4. 校验 Origin 或使用更安全的 IPC；
 5. 强制 JSON Content-Type；
@@ -344,7 +350,7 @@ Windows named pipe
 
 如果必须使用 TCP loopback，则至少使用随机 token，并让 Core/Bridge 自动发现端口和 token，而不是固定公开端口。
 
-本轮已实现其中的 Linux V1 子集：loopback-only、动态端口、随机 capability token、0600 endpoint file、JSON body 限制和未授权拒绝。Host/Origin 强化、Unix socket、Windows named pipe、完整生命周期仍未完成，不能把此子集描述成完整 IPC 安全方案。
+本轮已实现其中的 Linux V1 子集：loopback-only、动态端口、随机 capability token、0600 endpoint file、JSON body 限制、未授权拒绝和 Host/Origin loopback 校验。Unix socket、Windows named pipe、跨进程生命周期恢复仍未完成，不能把此子集描述成完整 IPC 安全方案。
 
 ---
 
@@ -352,7 +358,7 @@ Windows named pipe
 
 ### 当前问题
 
-`crates/router/src/lib.rs` 当前只把请求转发给 upstream，响应 body 和 SSE 原样透传。
+`crates/router/src/lib.rs` 对 Responses-compatible Provider 仍把响应 body 和 SSE 原样透传；跨协议非流式请求可以转换，跨协议流式请求会显式拒绝。响应事件、tool call、错误和取消的完整双向归一化仍待后续版本。
 
 ### 必须完成
 
@@ -483,7 +489,7 @@ Official → Custom → Official
 
 ## Phase 7：安装、升级、Repair、卸载
 
-本轮已落地 Linux CLI/面板安装脚本、用户级 desktop/autostart 项、可回滚 Codex integration、先停 Router 再清理状态的卸载流程，以及 Provider registry/keyring 清理失败时的恢复保护。真实目标机安装包、升级和卸载验收仍未执行。
+本轮已落地跨平台 CLI/面板安装脚本、用户级 desktop/autostart 项、可回滚 Codex integration、Linux/Windows/macOS Desktop runtime adapter、先停 Router 再清理状态的卸载流程，以及 Provider registry/keyring 清理失败时的恢复保护。Windows 交付用户级 PowerShell installer，macOS 交付 POSIX installer；两者都支持可选 patched artifacts 和 Desktop adapter。Windows 11 VM 已通过最新三份 PowerShell 脚本的真实解析、交叉构建的 PE CLI `--help`、安装/卸载往返及外部 artifact 目录回归（经 PVE Guest Agent）；外部 artifact 回归使用受控 fixture，尚未运行真实 patched Codex CLI/app-server。真实 Desktop picker、patched Windows CLI launcher turn、升级与 Linux 目标机生命周期仍未执行。
 
 ### 安装
 
@@ -678,11 +684,19 @@ NOT PROVEN
 ```text
 cargo fmt --all -- --check                         PASS
 cargo fmt --manifest-path apps/panel/src-tauri/Cargo.toml -- --check PASS
-cargo test --workspace --all-targets               PASS (36 tests passed)
-cargo clippy --workspace --all-targets --all-features -- -D warnings PASS
+cargo test --workspace --locked                   PASS (220 tests; doc-tests pass)
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings PASS
 cargo build --release --locked --package codex-mp-cli PASS
 node --check apps/panel/main.js                   PASS
-bash -n installer/install-linux.sh installer/uninstall-linux.sh PASS
+bash -n installer/install-linux.sh installer/uninstall-linux.sh installer/install-macos.sh installer/uninstall-macos.sh PASS
+PowerShell parser (latest Windows installer/build scripts)                    PASS (Windows 11 VM via PVE Guest Agent; QGA exitcode=0)
+Windows AppX/runtime discovery + installer smoke                             PASS (Stage 2 baseline；最新脚本 parser 已重跑)
+macOS native adapter install/status/restore/launcher/installer smoke          PASS (x86_64 Tahoe VM)
+cargo check core/desktop/catalog --target x86_64-pc-windows-gnu              PASS
+cargo check core/desktop/catalog --target x86_64-apple-darwin                PASS
+cargo check core/desktop/catalog --target aarch64-apple-darwin                PASS
+full workspace cross-target check                                              NOT PROVEN (主机缺 Windows GNU C toolchain 与 macOS SDK；CI 原生 runner 负责完整构建)
+Windows CLI cross-build (`x86_64-pc-windows-gnu`)                                PASS (临时 MinGW toolchain；PE 在 Windows 11 VM `--help` 通过)
 python3 -m json.tool apps/panel/src-tauri/tauri.conf.json PASS
 CLI help/uninstall temp-dir smoke                 PASS
 Tauri panel cargo check                           NOT PROVEN (已尝试，缺少 pkg-config/GTK/WebKit 宿主依赖)
@@ -711,7 +725,7 @@ sha256sum -c patches/codex/73a1148c9c775c2a4616ce5096291740a00ed68a/SHA256SUMS P
 git apply --check（临时 clean worktree）       PASS
 apply.sh 二次执行（already applied）             PASS
 git diff --check（patched upstream）             PASS
-release codex-mp Router smoke                   PASS（healthz、401、0600、token 不入日志）
+release codex-mp Router process HTTP smoke      PASS（healthz、模型列表、model rewrite、provider path/auth、mock response）
 ```
 
 已有或仍未证明的产品级项目：
@@ -719,9 +733,15 @@ release codex-mp Router smoke                   PASS（healthz、401、0600、to
 ```text
 本地 route 判定与 Router mock                   PASS
 Router capability token / 0600 endpoint          PASS
-真实 Codex CLI/app-server custom turn            NOT PROVEN
-Core/app-server → Router 实际 HTTP 数据面        NOT PROVEN
-同 Thread Official → Custom → Official           NOT PROVEN
+真实 Codex CLI/app-server custom turn            PASS（隔离 Provider fixture）
+stock `codex exec` custom turn                   PASS（隔离 Provider fixture；model rewrite、第三方 Bearer、无 capability 外传、CLI exit 0）
+Core/app-server → Router 实际 HTTP 数据面        PASS（Router + custom/official mock）
+同 Thread Official → Custom → Official           PASS（受控 fixture）
+Desktop runtime adapter source                   PASS
+macOS native adapter target smoke                PASS
+Windows AppX/runtime/installer smoke             PASS (Stage 2 baseline；最新脚本 parser、PE CLI 和 external-artifact fixture roundtrip PASS)
+Windows native `codex-mp.exe --help`             PASS (Windows 11 VM；交叉构建 PE)
+Windows native CLI adapter / launcher turn       NOT PROVEN
 Desktop UI / Bridge                              NOT RUN
 Remote Desktop → Remote Host                     NOT RUN
 真实 NewAPI/OpenRouter Provider E2E              NOT RUN
@@ -731,7 +751,11 @@ F3                                               NOT PROVEN
 F4                                               NOT PROVEN
 F5                                               NOT PROVEN
 Linux source-level Upgrade / Repair / Uninstall  PASS
-真实目标机安装/升级/卸载                         NOT RUN
+Windows/macOS installer smoke                    PASS
+Linux 真实目标机安装/升级/卸载                   NOT RUN
+patched upstream codex-cli/app-server release    PASS（Linux pinned release；CLI/app-server --help + SHA256；Windows/macOS native artifact NOT RUN）
+Windows 最新 installer 外部 artifact 路径 parser 回归  PASS（Windows 11 VM；PVE Guest Agent；build/installer/uninstaller parser）
+Windows 最新 installer 外部 artifact 二进制 roundtrip  PASS（Windows 11 VM；受控 fixture + 真实交叉构建 codex-mp.exe；真实 patched Codex artifact 未运行）
 ```
 
 ---
@@ -772,7 +796,7 @@ Linux source-level Upgrade / Repair / Uninstall  PASS
 在此之前，正确结论仍然是：
 
 ```text
-总体架构判定：FAIL
+总体架构判定：NOT PROVEN
 ```
 
 ---

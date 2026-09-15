@@ -9,9 +9,12 @@ use codex_mp_core::{
     CustomModel, ProviderRegistry, atomic_replace, command_for_executable, set_private_permissions,
 };
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -27,6 +30,8 @@ pub enum CatalogError {
     OfficialConflict(String),
     #[error("custom model `{0}` has no usable catalog template")]
     NoTemplate(String),
+    #[error("catalog model `{0}` does not match the stock Codex compatibility profile: {1}")]
+    UnsupportedSchema(String, String),
 }
 
 pub fn discover_official_catalog(codex_bin: impl AsRef<Path>) -> Result<Value, CatalogError> {
@@ -54,10 +59,73 @@ pub fn validate_catalog(catalog: &Value) -> Result<(), CatalogError> {
         .get("models")
         .and_then(Value::as_array)
         .ok_or(CatalogError::InvalidShape)?;
-    if models.iter().any(|model| !model.is_object()) {
-        return Err(CatalogError::InvalidShape);
+    for model in models {
+        let Some(model_object) = model.as_object() else {
+            return Err(CatalogError::InvalidShape);
+        };
+        for required in ["slug", "shell_type", "model_messages"] {
+            if model_object.get(required).is_none() {
+                let slug = model_object
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+                    .to_owned();
+                return Err(CatalogError::UnsupportedSchema(
+                    slug,
+                    format!("missing `{required}`"),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+pub fn official_model_ids(catalog: &Value) -> Result<Vec<String>, CatalogError> {
+    validate_catalog(catalog)?;
+    Ok(catalog["models"]
+        .as_array()
+        .expect("validated catalog has models")
+        .iter()
+        .filter_map(|model| model.get("slug").and_then(Value::as_str).map(str::to_owned))
+        .collect())
+}
+
+/// Return a stable fingerprint of the catalog's structural schema rather than
+/// its volatile model values.  Integration stores this alongside the
+/// generated catalog so a future Codex binary cannot silently consume an
+/// unreviewed shape.
+pub fn schema_fingerprint(catalog: &Value) -> Result<String, CatalogError> {
+    validate_catalog(catalog)?;
+    let object = catalog.as_object().ok_or(CatalogError::InvalidShape)?;
+    let top_level = object
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let model = object
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| models.first())
+        .and_then(Value::as_object)
+        .map(|model| {
+            model
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .ok_or(CatalogError::InvalidShape)?;
+    let shape = json!({
+        "top_level": top_level,
+        "model": model,
+        "required": ["slug", "shell_type", "model_messages"],
+    });
+    let bytes = serde_json::to_vec(&shape)?;
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub fn merge_catalog(official: &Value, registry: &ProviderRegistry) -> Result<Value, CatalogError> {
@@ -91,34 +159,35 @@ pub fn merge_catalog(official: &Value, registry: &ProviderRegistry) -> Result<Va
 }
 
 fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> Value {
-    let mut entry = template.clone();
-    let object = entry
-        .as_object_mut()
-        .expect("validated Codex model entries are objects");
+    // The target Codex schema is versioned by the installed binary. Clone its
+    // audited template so required fields such as shell_type and
+    // model_messages survive upgrades, then explicitly clear capabilities the
+    // custom route cannot prove.
+    let mut object = template
+        .as_object()
+        .expect("validated Codex model entries are objects")
+        .clone();
 
-    set_string(object, "slug", &model.logical_model_id);
+    set_string(&mut object, "slug", &model.logical_model_id);
     let display_name = if model.display_name.is_empty() {
         format!("{provider_name} / {}", model.upstream_model_id)
     } else {
         model.display_name.clone()
     };
-    set_string(object, "display_name", &display_name);
+    set_string(&mut object, "display_name", &display_name);
     set_string(
-        object,
+        &mut object,
         "description",
         &format!("Custom model routed by Codex MultiProvider to {provider_name}."),
     );
     object.insert("visibility".into(), Value::String("list".into()));
     object.insert("supported_in_api".into(), Value::Bool(true));
     object.insert("priority".into(), json!(1000));
-    object.insert("upgrade".into(), Value::Null);
-    object.insert("availability_nux".into(), Value::Null);
     object.insert("additional_speed_tiers".into(), Value::Array(Vec::new()));
     object.insert("service_tiers".into(), Value::Array(Vec::new()));
     object.insert("default_service_tier".into(), Value::Null);
-    object.insert("supports_search_tool".into(), Value::Bool(false));
-    object.insert("supports_experimental_context".into(), Value::Bool(false));
-    object.insert("use_responses_lite".into(), Value::Bool(false));
+    object.insert("upgrade".into(), Value::Null);
+    object.insert("availability_nux".into(), Value::Null);
     object.insert("include_apps_usage_instructions".into(), Value::Bool(false));
     object.insert(
         "include_plugin_usage_instructions".into(),
@@ -127,6 +196,48 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
     object.insert(
         "include_skills_usage_instructions".into(),
         Value::Bool(false),
+    );
+    object.insert(
+        "supports_reasoning_summary_parameter".into(),
+        Value::Bool(model.capabilities.reasoning),
+    );
+    object.insert(
+        "default_reasoning_summary".into(),
+        Value::String(
+            if model.capabilities.reasoning {
+                "auto"
+            } else {
+                "none"
+            }
+            .into(),
+        ),
+    );
+    object.insert("support_verbosity".into(), Value::Bool(false));
+    object.insert("default_verbosity".into(), Value::Null);
+    object.insert("apply_patch_tool_type".into(), Value::Null);
+    object.insert("web_search_tool_type".into(), Value::String("text".into()));
+    object.insert(
+        "truncation_policy".into(),
+        json!({"mode": "tokens", "limit": 10_000}),
+    );
+    object.insert("supports_image_detail_original".into(), Value::Bool(false));
+    object.insert(
+        "experimental_supported_tools".into(),
+        Value::Array(Vec::new()),
+    );
+    object.insert("supports_search_tool".into(), Value::Bool(false));
+    object.insert("supports_experimental_context".into(), Value::Bool(false));
+    object.insert("use_responses_lite".into(), Value::Bool(false));
+    object.insert("node_repl_auto_review_required".into(), Value::Bool(false));
+    object.insert("node_repl_disabled".into(), Value::Bool(true));
+    object.insert("tool_mode".into(), Value::Null);
+    object.insert("multi_agent_version".into(), Value::Null);
+    object.insert("multi_agent_reasoning_effort".into(), Value::Null);
+    // Function tools are not advertised until the Router can prove the full
+    // tool lifecycle and context boundary for the selected provider.
+    object.insert(
+        "supports_parallel_tool_calls".into(),
+        Value::Bool(model.capabilities.tools),
     );
     object.insert("input_modalities".into(), {
         let mut modalities = vec![Value::String("text".into())];
@@ -154,10 +265,11 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
         object.remove("supported_reasoning_levels");
         object.remove("default_reasoning_level");
     }
-    if !model.capabilities.reasoning {
-        object.remove("supports_reasoning_summaries");
-    }
-    entry
+    object.insert(
+        "supports_reasoning_summaries".into(),
+        Value::Bool(model.capabilities.reasoning),
+    );
+    Value::Object(object)
 }
 
 fn set_string(object: &mut Map<String, Value>, key: &str, value: &str) {
@@ -170,8 +282,12 @@ pub fn write_catalog_atomic(catalog: &Value, path: impl AsRef<Path>) -> Result<(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(catalog)?)?;
+    let temp = path.with_extension(format!("{}.json.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(catalog)?;
+    let mut file = fs::File::create(&temp)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     atomic_replace(temp, path)?;
     set_private_permissions(path)?;
     Ok(())
@@ -199,6 +315,7 @@ mod tests {
                 "default_reasoning_level": "low",
                 "supported_reasoning_levels": [{"effort": "low", "description": "low"}],
                 "shell_type": "shell_command",
+                "model_messages": {"persistent_instructions": "safe", "instructions_template": "safe"},
                 "visibility": "list",
                 "supported_in_api": true,
                 "priority": 1,
@@ -225,8 +342,15 @@ mod tests {
         assert_eq!(merged["models"][0]["unknown_future_field"]["keep"], true);
         assert_eq!(merged["models"][1]["slug"], "newapi/qwen3.8");
         assert_eq!(merged["models"][1]["display_name"], "NewAPI / Qwen3.8");
-        assert!(merged["models"][1].get("unknown_future_field").is_none());
-        assert!(merged["models"][1].get("shell_type").is_none());
+        assert_eq!(merged["models"][1]["unknown_future_field"]["keep"], true);
+        assert_eq!(merged["models"][1]["shell_type"], "shell_command");
+        assert_eq!(merged["models"][1]["supports_search_tool"], false);
+        assert_eq!(merged["models"][1]["supports_parallel_tool_calls"], true);
+        assert_eq!(
+            merged["models"][1]["experimental_supported_tools"],
+            json!([])
+        );
+        assert!(merged["models"][1].get("model_messages").is_some());
     }
 
     #[test]
@@ -273,5 +397,15 @@ mod tests {
         assert_eq!(reparsed["models"].as_array().unwrap().len(), 9);
         assert_eq!(reparsed["models"][8]["slug"], "newapi/qwen3.8");
         assert_eq!(reparsed["models"][0]["slug"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn schema_fingerprint_is_structural_and_stable() {
+        let first = schema_fingerprint(&official()).unwrap();
+        let mut changed = official();
+        changed["models"][0]["display_name"] = json!("different value");
+        assert_eq!(first, schema_fingerprint(&changed).unwrap());
+        changed["models"][0]["future_structural_field"] = json!(true);
+        assert_ne!(first, schema_fingerprint(&changed).unwrap());
     }
 }

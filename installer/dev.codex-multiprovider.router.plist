@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.codex-multiprovider.router</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLI_PATH__</string>
+        <string>--registry</string>
+        <string>__REGISTRY_PATH__</string>
+        <string>router</string>
+        <string>--port</string>
+        <string>8787</string>
+        <string>--endpoint-file</string>
+        <string>__ENDPOINT_FILE__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__.stderr.log</string>
+</dict>
+</plist>

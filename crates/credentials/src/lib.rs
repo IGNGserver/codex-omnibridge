@@ -6,7 +6,11 @@
 //! keyring.
 
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyring::Entry;
 use secrecy::{ExposeSecret, SecretString};
@@ -58,6 +62,68 @@ fn set_private_file_permissions(path: &std::path::Path) -> Result<(), std::io::E
     Ok(())
 }
 
+fn file_backend_path() -> PathBuf {
+    directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
+        .map(|d| d.config_dir().join(".credentials"))
+        .unwrap_or_else(|| PathBuf::from(".credentials"))
+}
+
+fn write_private_json_atomic(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("credentials");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..16u32 {
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.{}.tmp",
+            std::process::id(),
+            timestamp,
+            attempt
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(mut file) => {
+                if let Err(error) = file
+                    .write_all(contents.as_bytes())
+                    .and_then(|_| file.sync_all())
+                {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+                drop(file);
+                if let Err(error) = fs::rename(&temporary, path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+                set_private_file_permissions(path)?;
+                #[cfg(unix)]
+                fs::File::open(parent)?.sync_all()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a private credentials temporary file",
+    ))
+}
+
 #[derive(Debug, Error)]
 pub enum CredentialStoreError {
     #[error("credential backend error: {0}")]
@@ -92,6 +158,16 @@ impl NativeCredentialStore {
         }
     }
 
+    /// Explicitly opt into the 0600 file backend for headless installations.
+    /// The default store never falls back to a plaintext credential file.
+    pub fn with_file_fallback(service: impl Into<String>) -> Self {
+        Self::new(service)
+    }
+
+    fn file_backend_enabled(&self) -> bool {
+        std::env::var("CODEX_MP_SECRET_BACKEND").as_deref() == Ok("file")
+    }
+
     fn entry(&self, reference: &str) -> Result<Entry, CredentialStoreError> {
         if reference.trim().is_empty() {
             return Err(CredentialStoreError::EmptyReference);
@@ -120,16 +196,14 @@ impl CredentialStore for NativeCredentialStore {
             return Ok(SecretString::from(val));
         }
 
-        // Try file fallback first if present
-        let config_dir = directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let fallback_file = config_dir.join(".credentials");
-        if let Ok(s) = std::fs::read_to_string(&fallback_file)
-            && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
-            && let Some(val) = map.get(reference)
-        {
-            return Ok(SecretString::from(val.clone()));
+        if self.file_backend_enabled() {
+            let fallback_file = file_backend_path();
+            if let Ok(s) = std::fs::read_to_string(&fallback_file)
+                && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
+                && let Some(val) = map.get(reference)
+            {
+                return Ok(SecretString::from(val.clone()));
+            }
         }
 
         let entry = self.entry(reference)?;
@@ -148,63 +222,43 @@ impl CredentialStore for NativeCredentialStore {
     fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
         match self.entry(reference)?.set_password(value.expose_secret()) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                // In headless/container environments where Secret Service prompt is dismissed,
-                // store in a secure 0600 file in user config as graceful fallback.
-                let config_dir =
-                    directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
-                        .map(|d| d.config_dir().to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let _ = std::fs::create_dir_all(&config_dir);
-                let fallback_file = config_dir.join(".credentials");
-                let mut map: HashMap<String, String> = std::fs::read_to_string(&fallback_file)
+            Err(e) if self.file_backend_enabled() => {
+                // File persistence is an explicit operator choice. It is
+                // still protected to 0600 and committed through a private,
+                // synced temporary file so a keyring failure cannot silently
+                // persist a partial secret document.
+                let fallback_file = file_backend_path();
+                let mut map: HashMap<String, String> = fs::read_to_string(&fallback_file)
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
                 map.insert(reference.to_owned(), value.expose_secret().to_owned());
                 if let Ok(json_str) = serde_json::to_string(&map) {
-                    let write_result = {
-                        #[cfg(unix)]
-                        use std::os::unix::fs::OpenOptionsExt;
-                        #[cfg(unix)]
-                        let result = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o600)
-                            .open(&fallback_file)
-                            .and_then(|mut f| {
-                                std::io::Write::write_all(&mut f, json_str.as_bytes())
-                            });
-                        #[cfg(not(unix))]
-                        let result = std::fs::write(&fallback_file, json_str);
-                        result
-                    };
-                    if let Err(error) = write_result {
-                        return Err(CredentialStoreError::Backend(error.to_string()));
-                    }
-                    if let Err(error) = set_private_file_permissions(&fallback_file) {
+                    if let Err(error) = write_private_json_atomic(&fallback_file, &json_str) {
                         return Err(CredentialStoreError::Backend(error.to_string()));
                     }
                     return Ok(());
                 }
                 Err(CredentialStoreError::Backend(e.to_string()))
             }
+            Err(e) => Err(CredentialStoreError::Backend(format!(
+                "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
+            ))),
         }
     }
 
     fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
         let _ = self.entry(reference)?.delete_credential();
-        let config_dir = directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let fallback_file = config_dir.join(".credentials");
-        if let Ok(s) = std::fs::read_to_string(&fallback_file)
+        if !self.file_backend_enabled() {
+            return Ok(());
+        }
+        let fallback_file = file_backend_path();
+        if let Ok(s) = fs::read_to_string(&fallback_file)
             && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
         {
             map.remove(reference);
             if let Ok(json_str) = serde_json::to_string(&map) {
-                let _ = std::fs::write(&fallback_file, json_str);
+                let _ = write_private_json_atomic(&fallback_file, &json_str);
             }
         }
         Ok(())
@@ -265,5 +319,39 @@ mod tests {
             store.get("provider:test"),
             Err(CredentialStoreError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn private_json_writer_commits_a_private_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-mp-credentials-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".credentials");
+        write_private_json_atomic(&path, r#"{"provider:test":"secret"}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"provider:test":"secret"}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!directory.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir_all(directory).unwrap();
     }
 }

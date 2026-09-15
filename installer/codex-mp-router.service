@@ -1,0 +1,22 @@
+[Unit]
+Description=Codex MultiProvider OmniBridge router
+Documentation=https://github.com/IGNGserver/codex-multiprovider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_MP_REGISTRY=%h/.config/codexmultiprovider/providers.json
+ExecStart=%h/.local/bin/codex-mp --registry %h/.config/codexmultiprovider/providers.json router --port 8787 --endpoint-file %h/.config/codexmultiprovider/router-endpoint.json
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGINT
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

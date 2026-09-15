@@ -1,4 +1,10 @@
-//! Lifecycle management for the local Router process.
+pub mod account;
+
+pub use account::{
+    AccountError, AccountManager, AccountSummary, AccountTokens, AccountUsageSnapshot,
+    ActiveAccountStatus, ManagedAccount, RateLimitSummary, ReserveLimitSummary, RestartCodexReport,
+    UsageWindow, default_accounts_path, default_codex_home,
+};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -11,7 +17,7 @@ use codex_mp_core::{
     ProviderRegistry,
 };
 use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
-use codex_mp_router::{RouterEndpoint, RouterError, load_router_endpoint};
+use codex_mp_router::{CAPABILITY_HEADER, RouterEndpoint, RouterError, load_router_endpoint};
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -534,6 +540,7 @@ pub struct RouterSupervisor {
     client: Client,
     child: Option<Child>,
     owns_endpoint: bool,
+    reused_endpoint: bool,
 }
 
 impl RouterSupervisor {
@@ -549,6 +556,7 @@ impl RouterSupervisor {
             client: Client::new(),
             child: None,
             owns_endpoint: false,
+            reused_endpoint: false,
         }
     }
 
@@ -570,6 +578,19 @@ impl RouterSupervisor {
         }
         self.child = None;
         self.owns_endpoint = false;
+        self.reused_endpoint = false;
+
+        // A panel, another CLI invocation, or a login-session service may
+        // already own a healthy Router. Reuse it instead of replacing its
+        // endpoint file and spawning a second process. This is important on
+        // Windows where the packaged panel and CLI commonly share one state
+        // directory.
+        if let Ok(endpoint) = load_router_endpoint(&self.endpoint_file)
+            && self.endpoint_is_healthy(&endpoint).await
+        {
+            self.reused_endpoint = true;
+            return Ok(endpoint);
+        }
         remove_stale_endpoint(&self.endpoint_file)?;
 
         let mut child = Command::new(&self.executable);
@@ -584,6 +605,7 @@ impl RouterSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        configure_background_process(&mut child);
         self.child = Some(child.spawn()?);
         let endpoint_file = self.endpoint_file.clone();
         let endpoint = timeout(STARTUP_TIMEOUT, async {
@@ -605,12 +627,40 @@ impl RouterSupervisor {
         Ok(endpoint)
     }
 
+    async fn endpoint_is_healthy(&self, endpoint: &RouterEndpoint) -> bool {
+        let expected_generation = codex_mp_core::ProviderRegistry::load(&self.registry_path)
+            .ok()
+            .map(|registry| registry.generation());
+        let Ok(response) = self
+            .client
+            .get(format!("{}/readyz", endpoint.base_url))
+            .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let Ok(payload) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        payload.get("instance").and_then(serde_json::Value::as_str) == Some("omnibridge")
+            && expected_generation.is_none_or(|generation| {
+                payload
+                    .get("registry_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(generation)
+            })
+    }
+
     pub async fn reload(&self) -> Result<(), ManagerError> {
         let endpoint = load_router_endpoint(&self.endpoint_file)?;
         let response = self
             .client
             .post(format!("{}/admin/reload", endpoint.base_url))
-            .bearer_auth(endpoint.capability_token.expose_secret())
+            .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
             .send()
             .await?;
         if response.status().is_success() {
@@ -626,7 +676,7 @@ impl RouterSupervisor {
         let response = self
             .client
             .post(format!("{}/admin/shutdown", endpoint.base_url))
-            .bearer_auth(endpoint.capability_token.expose_secret())
+            .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
             .send()
             .await?;
         if response.status().is_success() {
@@ -639,6 +689,21 @@ impl RouterSupervisor {
 
     pub async fn status(&mut self) -> Result<RouterStatus, ManagerError> {
         let Some(child) = self.child.as_mut() else {
+            if self.reused_endpoint {
+                let endpoint = match load_router_endpoint(&self.endpoint_file) {
+                    Ok(endpoint) => endpoint,
+                    Err(_) => {
+                        return Ok(RouterStatus {
+                            running: false,
+                            healthy: false,
+                        });
+                    }
+                };
+                return Ok(RouterStatus {
+                    running: true,
+                    healthy: self.endpoint_is_healthy(&endpoint).await,
+                });
+            }
             return Ok(RouterStatus {
                 running: false,
                 healthy: false,
@@ -661,12 +726,7 @@ impl RouterSupervisor {
                 });
             }
         };
-        let healthy = self
-            .client
-            .get(format!("{}/healthz", endpoint.base_url))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success());
+        let healthy = self.endpoint_is_healthy(&endpoint).await;
         Ok(RouterStatus {
             running: true,
             healthy,
@@ -674,6 +734,7 @@ impl RouterSupervisor {
     }
 
     pub async fn stop(&mut self) -> Result<(), ManagerError> {
+        let preserve_endpoint = self.reused_endpoint;
         if let Some(mut child) = self.child.take()
             && child.try_wait()?.is_none()
         {
@@ -683,8 +744,11 @@ impl RouterSupervisor {
                 let _ = child.wait().await;
             }
         }
-        remove_stale_endpoint(&self.endpoint_file)?;
+        if !preserve_endpoint {
+            remove_stale_endpoint(&self.endpoint_file)?;
+        }
         self.owns_endpoint = false;
+        self.reused_endpoint = false;
         Ok(())
     }
 }
@@ -708,11 +772,24 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+fn configure_background_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW keeps the Router hidden when launched by the
+        // Windows panel or by a .cmd wrapper.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_mp_credentials::MemoryCredentialStore;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn stop_removes_stale_endpoint() {
@@ -728,6 +805,56 @@ mod tests {
         supervisor.stop().await.unwrap();
 
         assert!(!endpoint_file.exists());
+    }
+
+    #[tokio::test]
+    async fn reused_endpoint_survives_supervisor_stop() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = br#"{"instance":"omnibridge","registry_generation":1}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let directory = tempdir().unwrap();
+        let endpoint_file = directory.path().join("router-endpoint.json");
+        std::fs::write(
+            &endpoint_file,
+            serde_json::json!({
+                "schema_version": codex_mp_router::ROUTER_ENDPOINT_SCHEMA_VERSION,
+                "base_url": format!("http://{address}"),
+                "capability_token": "test-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&endpoint_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let mut supervisor = RouterSupervisor::new(
+            "/does/not/exist",
+            directory.path().join("providers.json"),
+            &endpoint_file,
+        );
+
+        supervisor.start().await.unwrap();
+        supervisor.stop().await.unwrap();
+
+        assert!(endpoint_file.exists());
+        responder.await.unwrap();
     }
 
     #[test]

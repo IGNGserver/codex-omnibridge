@@ -10,8 +10,11 @@ async-stream = "0.3"
 async-trait.workspace = true
 axum.workspace = true
 bytes = "1.0"
+brotli.workspace = true
 codex-mp-core = { path = "../core" }
 codex-mp-credentials = { path = "../credentials" }
+codex-mp-protocol-bridge = { path = "../protocol-bridge" }
+flate2.workspace = true
 futures = "0.3"
 http.workspace = true
 reqwest.workspace = true
@@ -25,6 +28,8 @@ tower.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+sha2.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

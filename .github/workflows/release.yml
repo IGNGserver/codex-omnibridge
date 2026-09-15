@@ -4,25 +4,91 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号 (例如 v0.1.0-alpha.1)'
+        description: '发布版本号，例如 v0.1.0-rc.1 或 v0.1.0'
         required: true
-        default: 'v0.1.0-alpha.1'
-      is_prerelease:
-        description: '是否标记为预发布 (Pre-release)？默认勾选，明确要求正式版时才取消'
-        type: boolean
+        type: string
+      release_channel:
+        description: '发布通道；默认 prerelease，只有明确需要正式版时才选择 release'
         required: true
-        default: true
+        type: choice
+        options:
+          - prerelease
+          - release
+        default: prerelease
+      formal_release_confirmation:
+        description: '仅 release 通道需要填写：PUBLISH_FORMAL_RELEASE'
+        required: false
+        type: string
+        default: ''
       release_notes:
-        description: '本次更新内容说明 (中文)'
+        description: '本次 release 的更新内容（支持 Markdown，不能为空）'
         required: true
-        default: '### 🚀 更新内容\n- 初始预览版本发布\n- 支持多提供商添加与模型抓取\n- 支持无感保留官方订阅与同 Thread 自由切模型'
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    name: 校验发布参数
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      package_version: ${{ steps.release.outputs.package_version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      release_channel: ${{ steps.release.outputs.release_channel }}
+    steps:
+      - name: 校验版本、通道和更新说明
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+          RELEASE_CHANNEL: ${{ inputs.release_channel }}
+          FORMAL_RELEASE_CONFIRMATION: ${{ inputs.formal_release_confirmation }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "版本必须符合 semver，例如 v0.1.0-rc.1 或 v0.1.0" >&2
+            exit 2
+          fi
+          if [[ "${RELEASE_CHANNEL}" != "prerelease" && "${RELEASE_CHANNEL}" != "release" ]]; then
+            echo "未知发布通道: ${RELEASE_CHANNEL}" >&2
+            exit 2
+          fi
+          if [[ "${RELEASE_CHANNEL}" == "release" && "${FORMAL_RELEASE_CONFIRMATION}" != "PUBLISH_FORMAL_RELEASE" ]]; then
+            echo "正式版 release 必须明确填写 PUBLISH_FORMAL_RELEASE；否则请使用 prerelease。" >&2
+            exit 2
+          fi
+          if [[ "${RELEASE_CHANNEL}" == "release" && "${RELEASE_TAG}" == *-* ]]; then
+            echo "正式版 release 的版本号不能包含 prerelease 后缀（例如 -rc.1）。" >&2
+            exit 2
+          fi
+          if [[ -z "$(printf '%s' "${RELEASE_NOTES}" | tr -d '[:space:]')" ]]; then
+            echo "release_notes 不能为空；每个 release（含 prerelease）都必须说明更新内容。" >&2
+            exit 2
+          fi
+
+          package_version="${RELEASE_TAG#v}"
+          prerelease=true
+          if [[ "${RELEASE_CHANNEL}" == "release" ]]; then
+            prerelease=false
+          fi
+          {
+            printf 'release_tag=%s\n' "${RELEASE_TAG}"
+            printf 'package_version=%s\n' "${package_version}"
+            printf 'prerelease=%s\n' "${prerelease}"
+            printf 'release_channel=%s\n' "${RELEASE_CHANNEL}"
+          } >>"${GITHUB_OUTPUT}"
+
   build:
     name: Build (${{ matrix.target.os }})
+    needs: validate
     runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
@@ -30,16 +96,16 @@ jobs:
         target:
           - os: linux-x86_64
             runner: ubuntu-24.04
-            artifact_name: codex-omnibridge-linux-x86_64.tar.gz
+            architecture: x86_64
           - os: windows-x86_64
             runner: windows-latest
-            artifact_name: codex-omnibridge-windows-x86_64.zip
+            architecture: x86_64
           - os: macos-x86_64
-            runner: macos-13
-            artifact_name: codex-omnibridge-macos-x86_64.tar.gz
+            runner: macos-15-intel
+            architecture: x86_64
           - os: macos-aarch64
             runner: macos-14
-            artifact_name: codex-omnibridge-macos-aarch64.tar.gz
+            architecture: aarch64
 
     steps:
       - name: 检出源码
@@ -48,53 +114,181 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 安装 Linux 系统依赖 (GTK / WebKit / AppIndicator)
-        if: matrix.target.runner == 'ubuntu-24.04'
+      - name: 验证工作区 (跨平台无 GUI CLI / Web)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
 
-      - name: 编译核心程序 (CLI / Router)
+      - name: 编译核心程序 (CLI / Router / Web)
         run: |
           cargo build --release --locked --package codex-mp-cli
 
-      - name: 打包 Linux 产物
+      - name: 冒烟验证 Linux 产物
         if: matrix.target.runner == 'ubuntu-24.04'
         run: |
+          ./target/release/codex-mp --help >/dev/null
+          bash -n installer/install-linux.sh installer/uninstall-linux.sh
+          bash -n installer/install-macos.sh installer/uninstall-macos.sh
+          bash -n installer/install-router-service.sh installer/uninstall-router-service.sh
+          bash -n installer/install-router-service-macos.sh installer/uninstall-router-service-macos.sh
+          bash -n scripts/build-deb.sh scripts/build-appimage.sh scripts/build-dmg.sh
+
+      - name: 冒烟验证 Windows 产物
+        if: matrix.target.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          & .\target\release\codex-mp.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "codex-mp.exe --help failed with exit code $LASTEXITCODE" }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path installer/install-windows.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path installer/uninstall-windows.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path installer/install-router-service-windows.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path installer/uninstall-router-service-windows.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { throw "PowerShell installer syntax validation failed" }
+
+      - name: 冒烟验证 macOS 产物
+        if: startsWith(matrix.target.runner, 'macos')
+        run: |
+          ./target/release/codex-mp --help >/dev/null
+          bash -n installer/install-macos.sh installer/uninstall-macos.sh scripts/build-dmg.sh
+
+      - name: 安装 AppImage 打包工具
+        if: matrix.target.runner == 'ubuntu-24.04'
+        run: |
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            --output "${RUNNER_TEMP}/appimagetool"
+          chmod +x "${RUNNER_TEMP}/appimagetool"
+
+      - name: 打包 Linux 安装包 (DEB + AppImage + portable)
+        if: matrix.target.runner == 'ubuntu-24.04'
+        run: |
+          ./scripts/build-deb.sh "${{ needs.validate.outputs.package_version }}" amd64
+          APPIMAGETOOL="${RUNNER_TEMP}/appimagetool" \
+            ./scripts/build-appimage.sh "${{ needs.validate.outputs.package_version }}" x86_64
           mkdir -p dist/package
           cp target/release/codex-mp dist/package/
           cp installer/install-linux.sh dist/package/
           cp installer/uninstall-linux.sh dist/package/
-          cp README.md LICENSE dist/package/
-          tar -czf ${{ matrix.target.artifact_name }} -C dist/package .
+          cp installer/codex-mp-router.service installer/install-router-service.sh installer/uninstall-router-service.sh dist/package/
+          cp scripts/build-patched-codex.sh dist/package/
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/package/
+          cp -R third_party dist/package/
+          tar -czf "codex-omnibridge-linux-x86_64-${{ needs.validate.outputs.package_version }}.tar.gz" -C dist/package .
 
-      - name: 打包 Windows 产物
+      - name: 验证 Linux portable installer roundtrip
+        if: matrix.target.runner == 'ubuntu-24.04'
+        run: |
+          smoke_dir="$(mktemp -d)"
+          trap 'find "$smoke_dir" -depth -delete' EXIT
+          CODEX_MP_INSTALL_DIR="$smoke_dir/bin" \
+          CODEX_MP_REGISTRY="$smoke_dir/providers.json" \
+            dist/package/install-linux.sh >/dev/null
+          test -x "$smoke_dir/bin/codex-mp"
+          CODEX_MP_INSTALL_DIR="$smoke_dir/bin" \
+          CODEX_MP_REGISTRY="$smoke_dir/providers.json" \
+            "$smoke_dir/bin/codex-mp-uninstall" >/dev/null
+          test ! -e "$smoke_dir/bin/codex-mp"
+
+      - name: 安装 Inno Setup
+        if: matrix.target.runner == 'windows-latest'
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: 打包 Windows 安装包 (Setup.exe + portable)
         if: matrix.target.runner == 'windows-latest'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist/package
-          Copy-Item target/release/codex-mp.exe dist/package/
-          Copy-Item README.md, LICENSE dist/package/
-          Compress-Archive -Path dist/package/* -DestinationPath ${{ matrix.target.artifact_name }}
+          $packageVersion = "${{ needs.validate.outputs.package_version }}"
+          $innoCompiler = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $innoCompiler) { throw "Inno Setup compiler was not installed" }
 
-      - name: 打包 macOS 产物
+          $distDir = Join-Path $PWD "dist"
+          $projectRoot = (Get-Location).Path
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          & $innoCompiler "/DMyAppVersion=$packageVersion" "/DMyProjectRoot=$projectRoot" "/O$distDir" (Resolve-Path installer/windows/setup.iss)
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
+
+          $setup = Join-Path $distDir "codex-omnibridge-windows-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Inno Setup did not produce $setup" }
+          Rename-Item -LiteralPath $setup -NewName "codex-omnibridge-windows-x86_64-$packageVersion-setup.exe"
+
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          Copy-Item target/release/codex-mp.exe dist/package/
+          Copy-Item installer/install-windows.ps1,installer/uninstall-windows.ps1 dist/package/
+          Copy-Item installer/install-router-service-windows.ps1,installer/uninstall-router-service-windows.ps1 dist/package/
+          Copy-Item scripts/build-patched-codex.ps1 dist/package/
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md dist/package/
+          Copy-Item third_party dist/package/ -Recurse
+          Compress-Archive -Path dist/package/* -DestinationPath "codex-omnibridge-windows-x86_64-$packageVersion.zip"
+
+      - name: 验证 Windows portable installer roundtrip
+        if: matrix.target.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP "codex-mp-installer-smoke"
+          $registry = Join-Path $smokeDir "providers.json"
+          Remove-Item -LiteralPath $smokeDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+          $env:CODEX_MP_REGISTRY = $registry
+          & .\dist\package\install-windows.ps1 -PackageDir (Resolve-Path dist/package) -InstallDir $smokeDir
+          if ($LASTEXITCODE -ne 0) { throw "Windows installer smoke failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path (Join-Path $smokeDir "codex-mp.exe"))) { throw "codex-mp.exe was not installed" }
+          & (Join-Path $smokeDir "codex-mp-uninstall.ps1") -InstallDir $smokeDir
+          if ($LASTEXITCODE -ne 0) { throw "Windows uninstaller smoke failed with exit code $LASTEXITCODE" }
+          if (Test-Path (Join-Path $smokeDir "codex-mp.exe")) { throw "codex-mp.exe was not removed" }
+
+      - name: 打包 macOS 安装包 (DMG + portable)
         if: startsWith(matrix.target.runner, 'macos')
         run: |
+          ./scripts/build-dmg.sh "${{ needs.validate.outputs.package_version }}" "${{ matrix.target.architecture }}"
           mkdir -p dist/package
           cp target/release/codex-mp dist/package/
-          cp README.md LICENSE dist/package/
-          tar -czf ${{ matrix.target.artifact_name }} -C dist/package .
+          cp installer/install-macos.sh dist/package/
+          cp installer/uninstall-macos.sh dist/package/
+          cp installer/dev.codex-multiprovider.router.plist installer/install-router-service-macos.sh installer/uninstall-router-service-macos.sh dist/package/
+          cp scripts/build-patched-codex.sh dist/package/
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/package/
+          cp -R third_party dist/package/
+          tar -czf "codex-omnibridge-macos-${{ matrix.target.architecture }}-${{ needs.validate.outputs.package_version }}.tar.gz" -C dist/package .
 
-      - name: 上传构建构建产物
+      - name: 验证 macOS portable installer roundtrip
+        if: startsWith(matrix.target.runner, 'macos')
+        run: |
+          smoke_dir="$(mktemp -d)"
+          trap 'find "$smoke_dir" -depth -delete' EXIT
+          CODEX_MP_INSTALL_DIR="$smoke_dir/bin" \
+          CODEX_MP_REGISTRY="$smoke_dir/providers.json" \
+            dist/package/install-macos.sh >/dev/null
+          test -x "$smoke_dir/bin/codex-mp"
+          CODEX_MP_INSTALL_DIR="$smoke_dir/bin" \
+          CODEX_MP_REGISTRY="$smoke_dir/providers.json" \
+            "$smoke_dir/bin/codex-mp-uninstall" >/dev/null
+          test ! -e "$smoke_dir/bin/codex-mp"
+
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target.os }}
-          path: ${{ matrix.target.artifact_name }}
+          if-no-files-found: error
+          path: |
+            codex-omnibridge-*.tar.gz
+            codex-omnibridge-*.zip
+            dist/*.deb
+            dist/*.AppImage
+            dist/*-setup.exe
+            dist/*.dmg
 
   publish:
     name: Publish Release
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
@@ -104,20 +298,69 @@ jobs:
         with:
           path: release-artifacts
 
-      - name: 整理发布附件
+      - name: 防止重复版本覆盖
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        shell: bash
         run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub Release 已存在: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Git tag 已存在: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+      - name: 整理并校验发布附件
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p assets
-          find release-artifacts -type f -name "*.*" -exec cp {} assets/ \;
-          ls -la assets/
+          while IFS= read -r -d '' artifact; do
+            filename="${artifact##*/}"
+            if [[ -e "assets/${filename}" ]]; then
+              echo "发现重复发布附件名称: ${filename}" >&2
+              exit 1
+            fi
+            cp -- "${artifact}" "assets/${filename}"
+          done < <(find release-artifacts -type f -print0)
+
+          count_assets() {
+            find assets -maxdepth 1 -type f -name "$1" -print | wc -l | tr -d ' '
+          }
+          [[ "$(count_assets '*.deb')" -ge 1 ]] || { echo '缺少 Linux DEB 安装包' >&2; exit 1; }
+          [[ "$(count_assets '*.AppImage')" -ge 1 ]] || { echo '缺少 Linux AppImage 安装包' >&2; exit 1; }
+          [[ "$(count_assets '*-setup.exe')" -eq 1 ]] || { echo 'Windows Setup.exe 数量不是 1' >&2; exit 1; }
+          [[ "$(count_assets '*.dmg')" -eq 2 ]] || { echo 'macOS DMG（x86_64 + aarch64）不完整' >&2; exit 1; }
+
+          checksums_tmp="$(mktemp)"
+          (cd assets && sha256sum -- * | sort) >"${checksums_tmp}"
+          mv "${checksums_tmp}" assets/SHA256SUMS
+          ls -la assets
+
+      - name: 写入并校验 release 更新说明
+        shell: bash
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$(printf '%s' "${RELEASE_NOTES}" | tr -d '[:space:]')" ]]; then
+            echo 'release_notes 不能为空' >&2
+            exit 1
+          fi
+          printf '%s\n' "${RELEASE_NOTES}" >release-notes.md
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          name: ${{ github.event.inputs.version }}
-          body: ${{ github.event.inputs.release_notes }}
-          prerelease: ${{ github.event.inputs.is_prerelease }}
-          files: assets/*
+          tag_name: ${{ needs.validate.outputs.release_tag }}
+          name: ${{ needs.validate.outputs.release_tag }}
+          body_path: release-notes.md
+          prerelease: ${{ needs.validate.outputs.prerelease }}
           draft: false
+          files: assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

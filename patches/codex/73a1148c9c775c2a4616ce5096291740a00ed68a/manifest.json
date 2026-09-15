@@ -13,5 +13,5 @@
   "model_provider_invariant": "openai",
   "oauth_invariant": true,
   "thread_provider_invariant": true,
-  "scope": "Linux patched Codex Core per-turn logical routing; Desktop, Remote and real Provider E2E remain separate acceptance gates"
+  "scope": "Linux patched Codex Core per-turn logical routing with a separate reversible Desktop runtime adapter; Remote and real Provider E2E remain separate acceptance gates"
 }
