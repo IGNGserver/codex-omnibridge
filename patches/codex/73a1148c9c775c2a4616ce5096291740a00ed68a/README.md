@@ -17,7 +17,7 @@ It is the P0 implementation required to route a namespaced logical model from th
 - `core/src/client.rs`
   - Captures the endpoint once per `ModelClient` session.
   - Branches inside `ModelClientSession::stream()`.
-  - Sends custom turns to the Router with its capability token.
+  - Sends custom turns to the Router with the raw `x-codex-omnibridge-token` capability header.
   - Keeps official turns on the existing OpenAI/ChatGPT transport.
   - Skips custom WebSocket prewarm and rejects custom compaction.
   - Does not add ChatGPT OAuth to the custom Router request.
@@ -67,4 +67,4 @@ export CODEX_MP_ROUTER_ENDPOINT_FILE="$ENDPOINT_FILE"
 /path/to/patched/codex app-server
 ```
 
-The endpoint file contains the capability token and is written as mode 0600 on Unix. Do not commit, copy, log, or expose it. A real Codex CLI/app-server turn and a real third-party Provider are still required for product E2E proof; patch compilation and unit tests are not that proof.
+The endpoint file contains the capability token and is written as mode 0600 on Unix. Do not commit, copy, log, or expose it. A pinned Linux `codex-cli` and `codex-app-server` release build has completed an isolated custom turn and an Official → Custom → Official app-server thread using controlled official/custom mocks. A real ChatGPT Account, real third-party Provider, Desktop picker, and native Windows/macOS patched artifacts are still required for product-level E2E proof.

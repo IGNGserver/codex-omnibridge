@@ -3,20 +3,40 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+if [[ ! -f "${PROJECT_DIR}/Cargo.toml" && -x "${SCRIPT_DIR}/codex-mp" ]]; then
+  # Release archives place the executable and installer scripts together at
+  # the archive root; source checkouts keep this script below the workspace.
+  PROJECT_DIR="${SCRIPT_DIR}"
+fi
 INSTALL_DIR="${CODEX_MP_INSTALL_DIR:-${HOME}/.local/bin}"
-PANEL_MANIFEST="${PROJECT_DIR}/apps/panel/src-tauri/Cargo.toml"
-PANEL_BINARY="${PROJECT_DIR}/apps/panel/src-tauri/target/release/codex-mp-panel"
 PATCHED_CODEX_BUILD_SCRIPT="${PROJECT_DIR}/scripts/build-patched-codex.sh"
-PATCHED_CODEX_ARTIFACT_DIR="${CODEX_MP_CODEX_ARTIFACT_DIR:-${PROJECT_DIR}/dist/patched-codex}"
-APPLICATIONS_DIR="${HOME}/.local/share/applications"
-AUTOSTART_DIR="${HOME}/.config/autostart"
-DESKTOP_FILE_NAME="codex-multiprovider-panel.desktop"
+[[ -f "${PATCHED_CODEX_BUILD_SCRIPT}" ]] || PATCHED_CODEX_BUILD_SCRIPT="${PROJECT_DIR}/build-patched-codex.sh"
+UNINSTALL_SCRIPT="${PROJECT_DIR}/installer/uninstall-linux.sh"
+[[ -f "${UNINSTALL_SCRIPT}" ]] || UNINSTALL_SCRIPT="${PROJECT_DIR}/uninstall-linux.sh"
+ROUTER_SERVICE_INSTALLER="${PROJECT_DIR}/installer/install-router-service.sh"
+ROUTER_SERVICE_UNINSTALLER="${PROJECT_DIR}/installer/uninstall-router-service.sh"
+[[ -f "${ROUTER_SERVICE_INSTALLER}" ]] || ROUTER_SERVICE_INSTALLER="${PROJECT_DIR}/install-router-service.sh"
+[[ -f "${ROUTER_SERVICE_UNINSTALLER}" ]] || ROUTER_SERVICE_UNINSTALLER="${PROJECT_DIR}/uninstall-router-service.sh"
+STOCK_CODEX_ARTIFACT_DIR="${CODEX_MP_CODEX_ARTIFACT_DIR:-${PROJECT_DIR}/dist/stock-codex}"
 INSTALL_MANIFEST="${INSTALL_DIR}/.codex-mp-install-manifest"
 
-command -v cargo >/dev/null 2>&1 || {
-  echo "error: cargo is required" >&2
+CLI_BINARY="${PROJECT_DIR}/target/release/codex-mp"
+BUILD_FROM_SOURCE=0
+if [[ -f "${PROJECT_DIR}/Cargo.toml" ]]; then
+  BUILD_FROM_SOURCE=1
+elif [[ -x "${PROJECT_DIR}/codex-mp" ]]; then
+  CLI_BINARY="${PROJECT_DIR}/codex-mp"
+else
+  echo "error: package does not contain codex-mp and is not a source checkout" >&2
   exit 1
-}
+fi
+
+if [[ "${BUILD_FROM_SOURCE}" == "1" ]]; then
+  command -v cargo >/dev/null 2>&1 || {
+    echo "error: cargo is required when installing from a source checkout" >&2
+    exit 1
+  }
+fi
 
 if [[ -n "${CODEX_MP_NATIVE_SYSROOT:-}" ]]; then
   SYSROOT="${CODEX_MP_NATIVE_SYSROOT}"
@@ -39,26 +59,25 @@ if [[ -n "${CODEX_MP_LINKER:-}" ]]; then
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CODEX_MP_LINKER}"
 fi
 
-cargo build --release --locked --manifest-path "${PROJECT_DIR}/Cargo.toml" --package codex-mp-cli
-if [[ "${CODEX_MP_SKIP_PANEL:-0}" != "1" ]]; then
-  cargo build --release --locked --manifest-path "${PANEL_MANIFEST}"
+if [[ "${BUILD_FROM_SOURCE}" == "1" ]]; then
+  cargo build --release --locked --manifest-path "${PROJECT_DIR}/Cargo.toml" --package codex-mp-cli
 fi
 
 if [[ "${CODEX_MP_BUILD_CODEX:-0}" == "1" ]]; then
-  "${PATCHED_CODEX_BUILD_SCRIPT}" --output "${PATCHED_CODEX_ARTIFACT_DIR}"
+  "${PATCHED_CODEX_BUILD_SCRIPT}" --output "${STOCK_CODEX_ARTIFACT_DIR}"
 fi
 
-install_patched_codex=0
+install_stock_codex=0
 if [[ "${CODEX_MP_BUILD_CODEX:-0}" == "1" || -n "${CODEX_MP_CODEX_ARTIFACT_DIR:-}" ]]; then
-  install_patched_codex=1
+  install_stock_codex=1
   for artifact in \
     codex-mp-codex-bin \
     codex-mp-codex \
     codex-mp-app-server-bin \
     codex-mp-app-server \
     codex-mp-build.json; do
-    if [[ ! -f "${PATCHED_CODEX_ARTIFACT_DIR}/${artifact}" ]]; then
-      printf 'error: patched Codex artifact is missing: %s\n' "${PATCHED_CODEX_ARTIFACT_DIR}/${artifact}" >&2
+    if [[ ! -f "${STOCK_CODEX_ARTIFACT_DIR}/${artifact}" ]]; then
+      printf 'error: stock Codex artifact is missing: %s\n' "${STOCK_CODEX_ARTIFACT_DIR}/${artifact}" >&2
       exit 1
     fi
   done
@@ -75,48 +94,17 @@ if [[ -f "${INSTALL_MANIFEST}" ]]; then
   done <"${INSTALL_MANIFEST}"
 fi
 
-install -m 0755 "${PROJECT_DIR}/target/release/codex-mp" "${INSTALL_DIR}/codex-mp"
-install -m 0755 "${PROJECT_DIR}/installer/uninstall-linux.sh" "${INSTALL_DIR}/codex-mp-uninstall"
+install -m 0755 "${CLI_BINARY}" "${INSTALL_DIR}/codex-mp"
+install -m 0755 "${UNINSTALL_SCRIPT}" "${INSTALL_DIR}/codex-mp-uninstall"
+install -m 0755 "${ROUTER_SERVICE_INSTALLER}" "${INSTALL_DIR}/codex-mp-router-service-install"
+install -m 0755 "${ROUTER_SERVICE_UNINSTALLER}" "${INSTALL_DIR}/codex-mp-router-service-uninstall"
 
-if [[ "${CODEX_MP_SKIP_PANEL:-0}" != "1" ]]; then
-  install -m 0755 "${PANEL_BINARY}" "${INSTALL_DIR}/codex-mp-panel"
-  mkdir -p "${APPLICATIONS_DIR}"
-  desktop_file="${APPLICATIONS_DIR}/${DESKTOP_FILE_NAME}"
-  desktop_tmp="${desktop_file}.tmp"
-  cat >"${desktop_tmp}" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Codex MultiProvider
-Comment=Provider and model manager for Codex
-Exec=${INSTALL_DIR}/codex-mp-panel
-Terminal=false
-Categories=Development;
-StartupNotify=true
-EOF
-  install -m 0644 "${desktop_tmp}" "${desktop_file}"
-  rm -f "${desktop_tmp}"
-
-  if [[ "${CODEX_MP_AUTOSTART:-1}" == "1" ]]; then
-    mkdir -p "${AUTOSTART_DIR}"
-    autostart_file="${AUTOSTART_DIR}/${DESKTOP_FILE_NAME}"
-    autostart_tmp="${autostart_file}.tmp"
-    cat >"${autostart_tmp}" <<EOF
-[Desktop Entry]
-Type=Application
-Name=Codex MultiProvider
-Comment=Provider and model manager for Codex
-Exec=${INSTALL_DIR}/codex-mp-panel
-Terminal=false
-Categories=Development;
-StartupNotify=false
-X-GNOME-Autostart-enabled=true
-EOF
-    install -m 0644 "${autostart_tmp}" "${autostart_file}"
-    rm -f "${autostart_tmp}"
-  fi
+if [[ "${CODEX_MP_INSTALL_SERVICE:-0}" == "1" ]]; then
+  CODEX_MP_ENABLE_SERVICE="${CODEX_MP_ENABLE_SERVICE:-0}" \
+    "${INSTALL_DIR}/codex-mp-router-service-install"
 fi
 
-if [[ "${install_patched_codex}" == "1" ]]; then
+if [[ "${install_stock_codex}" == "1" ]]; then
   for artifact in \
     codex-mp-codex-bin \
     codex-mp-codex \
@@ -125,19 +113,28 @@ if [[ "${install_patched_codex}" == "1" ]]; then
     codex-mp-build.json; do
     mode=0644
     [[ "${artifact}" == *-bin || "${artifact}" == codex-mp-codex || "${artifact}" == codex-mp-app-server ]] && mode=0755
-    install -m "${mode}" "${PATCHED_CODEX_ARTIFACT_DIR}/${artifact}" "${INSTALL_DIR}/${artifact}"
+    install -m "${mode}" "${STOCK_CODEX_ARTIFACT_DIR}/${artifact}" "${INSTALL_DIR}/${artifact}"
   done
+fi
+
+if [[ "${CODEX_MP_INSTALL_DESKTOP:-0}" == "1" ]]; then
+  if [[ "${install_stock_codex}" != "1" ]]; then
+    echo "error: CODEX_MP_INSTALL_DESKTOP=1 requires the explicit experimental Desktop runtime artifact" >&2
+    exit 1
+  fi
+  "${INSTALL_DIR}/codex-mp" desktop install \
+    --app-server-binary "${INSTALL_DIR}/codex-mp-app-server-bin" \
+    --codex-mp-binary "${INSTALL_DIR}/codex-mp"
 fi
 
 manifest_tmp="${INSTALL_MANIFEST}.tmp"
 {
   printf '%s\n' \
     "${INSTALL_DIR}/codex-mp" \
-    "${INSTALL_DIR}/codex-mp-uninstall"
-  if [[ "${CODEX_MP_SKIP_PANEL:-0}" != "1" ]]; then
-    printf '%s\n' "${INSTALL_DIR}/codex-mp-panel"
-  fi
-  if [[ "${install_patched_codex}" == "1" ]]; then
+    "${INSTALL_DIR}/codex-mp-uninstall" \
+    "${INSTALL_DIR}/codex-mp-router-service-install" \
+    "${INSTALL_DIR}/codex-mp-router-service-uninstall"
+  if [[ "${install_stock_codex}" == "1" ]]; then
     printf '%s\n' \
       "${INSTALL_DIR}/codex-mp-codex-bin" \
       "${INSTALL_DIR}/codex-mp-codex" \
@@ -152,15 +149,14 @@ rm -f "${manifest_tmp}"
 
 echo "installed ${INSTALL_DIR}/codex-mp"
 echo "installed ${INSTALL_DIR}/codex-mp-uninstall"
-if [[ "${CODEX_MP_SKIP_PANEL:-0}" == "1" ]]; then
-  echo "panel build skipped (CODEX_MP_SKIP_PANEL=1)"
+echo "installed ${INSTALL_DIR}/codex-mp-router-service-install"
+if [[ "${install_stock_codex}" == "1" ]]; then
+  echo "installed stock Codex launchers in ${INSTALL_DIR}"
 else
-  echo "installed ${INSTALL_DIR}/codex-mp-panel"
+  echo "stock Codex artifact install skipped (set CODEX_MP_BUILD_CODEX=1 or CODEX_MP_CODEX_ARTIFACT_DIR=...)"
 fi
-if [[ "${install_patched_codex}" == "1" ]]; then
-  echo "installed patched Codex launchers in ${INSTALL_DIR}"
-else
-  echo "patched Codex build/install skipped (set CODEX_MP_BUILD_CODEX=1 or CODEX_MP_CODEX_ARTIFACT_DIR=...)"
+if [[ "${CODEX_MP_INSTALL_DESKTOP:-0}" == "1" ]]; then
+  echo "installed ChatGPT Desktop runtime adapter; restart ChatGPT Desktop"
 fi
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
   echo "note: add ${INSTALL_DIR} to PATH before running codex-mp"

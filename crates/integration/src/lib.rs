@@ -1,29 +1,42 @@
-//! Minimal, reversible Codex integration.
+//! Stock Codex integration for the single OmniBridge provider.
 //!
-//! The only field this crate edits is the root-level `model_catalog_json`.
-//! It intentionally never reads `auth.json`, OAuth tokens, `chatgpt_base_url`,
-//! `openai_base_url`, or provider selection fields.
+//! This module edits only the semantic Codex config, generated catalog,
+//! capability file and its own manifest. It never reads or writes `auth.json`
+//! or any OAuth material.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use codex_mp_catalog::{discover_official_catalog, merge_catalog, write_catalog_atomic};
-use codex_mp_core::{ProviderRegistry, default_registry_path};
+use codex_mp_catalog::{
+    discover_official_catalog, merge_catalog, official_model_ids, schema_fingerprint,
+    write_catalog_atomic,
+};
+use codex_mp_core::{
+    ProviderRegistry, atomic_replace, command_for_executable, default_registry_path,
+    set_private_permissions,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 const MANIFEST_FILE: &str = "integration.json";
 const MANAGED_KEY: &str = "model_catalog_json";
+const MANAGED_PROVIDER_KEY: &str = "model_provider";
+const OMNIBRIDGE_PROVIDER_ID: &str = "omnibridge";
 
 #[derive(Debug, Error)]
 pub enum IntegrationError {
+    #[error("provider registry error: {0}")]
+    Core(#[from] codex_mp_core::CoreError),
     #[error("integration IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("integration JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("integration TOML value error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("integration TOML serialization error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
     #[error(
         "managed config field `{MANAGED_KEY}` changed outside Codex MultiProvider; refusing to overwrite it"
     )]
@@ -36,6 +49,10 @@ pub enum IntegrationError {
     CatalogPathAlreadyExists(PathBuf),
     #[error("integration manifest is invalid: {0}")]
     InvalidManifest(String),
+    #[error("managed Codex provider configuration changed outside Codex MultiProvider")]
+    UserChangedProvider,
+    #[error("router capability is not available: {0}")]
+    Capability(String),
 }
 
 #[derive(Debug, Clone)]
@@ -62,9 +79,38 @@ impl Default for IntegrationPaths {
 }
 
 impl IntegrationPaths {
+    pub fn for_registry(registry_path: impl AsRef<Path>) -> Self {
+        let registry_path = registry_path.as_ref();
+        let config_dir = registry_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let default_registry = default_registry_path();
+        let codex_config = if registry_path == default_registry {
+            default_codex_config_path()
+        } else {
+            config_dir.join("config.toml")
+        };
+        Self {
+            config_dir: config_dir.clone(),
+            codex_config,
+            catalog: config_dir.join("models.json"),
+            manifest: config_dir.join(MANIFEST_FILE),
+        }
+    }
+
     pub fn with_codex_config(mut self, path: impl Into<PathBuf>) -> Self {
         self.codex_config = path.into();
         self
+    }
+
+    pub fn capability_path(&self) -> PathBuf {
+        self.config_dir.join("router-capability")
+    }
+
+    pub fn router_base_url(&self) -> String {
+        std::env::var("CODEX_MP_ROUTER_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8787/v1".into())
     }
 }
 
@@ -79,6 +125,22 @@ pub struct IntegrationManifest {
     pub catalog_path: PathBuf,
     pub codex_binary: PathBuf,
     pub codex_version: Option<String>,
+    #[serde(default = "default_managed_provider")]
+    pub managed_provider: String,
+    #[serde(default = "default_omnibridge_provider")]
+    pub applied_provider: String,
+    #[serde(default)]
+    pub original_provider: Option<String>,
+    #[serde(default)]
+    pub original_provider_present: bool,
+    #[serde(default)]
+    pub provider_table_present: bool,
+    #[serde(default)]
+    pub capability_path: Option<PathBuf>,
+    #[serde(default)]
+    pub catalog_schema_fingerprint: Option<String>,
+    #[serde(default)]
+    pub official_model_count: usize,
 }
 
 pub fn default_codex_config_path() -> PathBuf {
@@ -97,6 +159,7 @@ pub fn build_and_install(
 ) -> Result<IntegrationManifest, IntegrationError> {
     let config_existed = paths.codex_config.exists();
     let config_content = read_config(&paths.codex_config)?;
+    let mut config = parse_config(&config_content)?;
     let existing_manifest = if paths.manifest.exists() {
         let manifest = load_manifest(&paths.manifest)?;
         if manifest.config_path != paths.codex_config {
@@ -123,44 +186,60 @@ pub fn build_and_install(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let current_value = read_root_string_field_from_content(&config_content, MANAGED_KEY)?;
+    let current_value = root_string(&config, MANAGED_KEY);
+    let current_provider = root_string(&config, MANAGED_PROVIDER_KEY);
+    let provider_table_present = has_omnibridge_provider(&config);
 
-    let (original_value, original_key_present) = if let Some(previous) = &existing_manifest {
-        // A second sync must not replace the user's original value with our own
-        // catalog path. Refuse to overwrite a value changed outside the manifest
-        // rather than silently taking ownership of it.
-        if current_value.as_deref() != Some(previous.applied_value.as_str()) {
-            return Err(IntegrationError::UserChangedManagedField);
-        }
-        (
-            previous.original_value.clone(),
-            previous.original_key_present,
-        )
-    } else {
-        (
-            current_value.clone(),
-            root_key_line(&config_content, MANAGED_KEY).is_some(),
-        )
-    };
+    let (original_value, original_key_present, original_provider, original_provider_present) =
+        if let Some(previous) = &existing_manifest {
+            // A second sync must not replace the user's original value with our own
+            // catalog path. Refuse to overwrite a value changed outside the manifest
+            // rather than silently taking ownership of it.
+            if current_value.as_deref() != Some(previous.applied_value.as_str()) {
+                return Err(IntegrationError::UserChangedManagedField);
+            }
+            if current_provider.as_deref() != Some(previous.applied_provider.as_str())
+                || !provider_table_matches(&config, paths)
+            {
+                return Err(IntegrationError::UserChangedProvider);
+            }
+            (
+                previous.original_value.clone(),
+                previous.original_key_present,
+                previous.original_provider.clone(),
+                previous.original_provider_present,
+            )
+        } else {
+            if current_provider.as_deref() == Some(OMNIBRIDGE_PROVIDER_ID) || provider_table_present
+            {
+                return Err(IntegrationError::UserChangedProvider);
+            }
+            (
+                current_value.clone(),
+                current_value.is_some(),
+                current_provider.clone(),
+                current_provider.is_some(),
+            )
+        };
 
     let official = discover_official_catalog(&codex_binary)?;
+    let official_ids = official_model_ids(&official)?;
+    let catalog_schema_fingerprint = Some(schema_fingerprint(&official)?);
     let merged = merge_catalog(&official, registry)?;
+    let capability_path = paths.capability_path();
+    let capability = ensure_capability(&capability_path)?;
     write_catalog_atomic(&merged, &paths.catalog)?;
     let applied_value = paths.catalog.to_string_lossy().to_string();
-    let mut updated_config = config_content.clone();
-    if let Err(error) =
-        set_root_string_field_in_content(&mut updated_config, MANAGED_KEY, &applied_value)
-    {
-        let _ = restore_catalog_snapshot(&paths.catalog, previous_catalog.as_deref());
-        return Err(error);
-    }
+    let router_base_url = paths.router_base_url();
+    apply_omnibridge_config(&mut config, &applied_value, &router_base_url, &capability)?;
+    let updated_config = toml::to_string_pretty(&config)?;
     if let Err(error) = write_config(&paths.codex_config, &updated_config) {
         let _ = restore_catalog_snapshot(&paths.catalog, previous_catalog.as_deref());
         return Err(error);
     }
 
     let manifest = IntegrationManifest {
-        schema_version: 1,
+        schema_version: 2,
         config_path: paths.codex_config.clone(),
         managed_field: MANAGED_KEY.into(),
         applied_value,
@@ -169,6 +248,14 @@ pub fn build_and_install(
         catalog_path: paths.catalog.clone(),
         codex_binary: codex_binary.as_ref().to_path_buf(),
         codex_version: codex_version(codex_binary.as_ref()),
+        managed_provider: MANAGED_PROVIDER_KEY.into(),
+        applied_provider: OMNIBRIDGE_PROVIDER_ID.into(),
+        original_provider,
+        original_provider_present,
+        provider_table_present,
+        capability_path: Some(capability_path),
+        catalog_schema_fingerprint,
+        official_model_count: official_ids.len(),
     };
     if let Err(error) = save_manifest(&paths.manifest, &manifest) {
         let config_rollback =
@@ -182,7 +269,156 @@ pub fn build_and_install(
         }
         return Err(error);
     }
+    let mut effective_registry = registry.clone();
+    effective_registry.set_official_model_ids(official_ids);
+    if let Err(error) = effective_registry.save() {
+        let _ = restore_config_snapshot(&paths.codex_config, &config_content, config_existed);
+        let _ = restore_catalog_snapshot(&paths.catalog, previous_catalog.as_deref());
+        return Err(error.into());
+    }
     Ok(manifest)
+}
+
+fn default_managed_provider() -> String {
+    MANAGED_PROVIDER_KEY.into()
+}
+
+fn default_omnibridge_provider() -> String {
+    OMNIBRIDGE_PROVIDER_ID.into()
+}
+
+fn parse_config(content: &str) -> Result<toml::Value, IntegrationError> {
+    if content.trim().is_empty() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+    Ok(toml::from_str(content)?)
+}
+
+fn root_string(config: &toml::Value, key: &str) -> Option<String> {
+    config
+        .as_table()
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn has_omnibridge_provider(config: &toml::Value) -> bool {
+    config
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|providers| providers.contains_key(OMNIBRIDGE_PROVIDER_ID))
+}
+
+fn provider_table_matches(config: &toml::Value, paths: &IntegrationPaths) -> bool {
+    let Some(provider) = config
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .and_then(|providers| providers.get(OMNIBRIDGE_PROVIDER_ID))
+        .and_then(toml::Value::as_table)
+    else {
+        return false;
+    };
+    let expected_base = paths.router_base_url();
+    let capability = fs::read_to_string(paths.capability_path())
+        .ok()
+        .map(|value| value.trim().to_owned());
+    let header_matches = provider
+        .get("http_headers")
+        .and_then(toml::Value::as_table)
+        .and_then(|headers| headers.get("x-codex-omnibridge-token"))
+        .and_then(toml::Value::as_str)
+        .zip(capability.as_deref())
+        .is_some_and(|(left, right)| left == right);
+    provider.get("name").and_then(toml::Value::as_str) == Some("OpenAI")
+        && provider.get("base_url").and_then(toml::Value::as_str) == Some(expected_base.as_str())
+        && provider.get("wire_api").and_then(toml::Value::as_str) == Some("responses")
+        && provider
+            .get("requires_openai_auth")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+        && provider
+            .get("supports_websockets")
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+        && header_matches
+}
+
+fn apply_omnibridge_config(
+    config: &mut toml::Value,
+    catalog_path: &str,
+    base_url: &str,
+    capability: &str,
+) -> Result<(), IntegrationError> {
+    let root = config.as_table_mut().ok_or_else(|| {
+        IntegrationError::InvalidManifest("root TOML value is not a table".into())
+    })?;
+    root.insert(
+        MANAGED_PROVIDER_KEY.into(),
+        toml::Value::String(OMNIBRIDGE_PROVIDER_ID.into()),
+    );
+    root.insert(MANAGED_KEY.into(), toml::Value::String(catalog_path.into()));
+    let providers = root
+        .entry("model_providers")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            IntegrationError::InvalidManifest("model_providers must be a table".into())
+        })?;
+    let mut bridge = toml::map::Map::new();
+    bridge.insert("name".into(), toml::Value::String("OpenAI".into()));
+    bridge.insert("base_url".into(), toml::Value::String(base_url.into()));
+    bridge.insert("wire_api".into(), toml::Value::String("responses".into()));
+    bridge.insert("requires_openai_auth".into(), toml::Value::Boolean(true));
+    bridge.insert("supports_websockets".into(), toml::Value::Boolean(false));
+    let mut headers = toml::map::Map::new();
+    headers.insert(
+        "x-codex-omnibridge-token".into(),
+        toml::Value::String(capability.into()),
+    );
+    bridge.insert("http_headers".into(), toml::Value::Table(headers));
+    providers.insert(OMNIBRIDGE_PROVIDER_ID.into(), toml::Value::Table(bridge));
+    Ok(())
+}
+
+fn restore_root_string(
+    root: &mut toml::map::Map<String, toml::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        root.insert(key.into(), toml::Value::String(value.into()));
+    } else {
+        root.remove(key);
+    }
+}
+
+pub fn ensure_capability(path: &Path) -> Result<String, IntegrationError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(IntegrationError::Capability(format!(
+                "capability path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let value = fs::read_to_string(path)?.trim().to_owned();
+        if value.is_empty() {
+            return Err(IntegrationError::Capability(
+                "capability file is empty".into(),
+            ));
+        }
+        set_private_permissions(path)?;
+        return Ok(value);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let value = Uuid::new_v4().to_string();
+    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&temp, format!("{value}\n"))?;
+    set_private_permissions(&temp)?;
+    atomic_replace(temp, path)?;
+    set_private_permissions(path)?;
+    Ok(value)
 }
 
 pub fn repair(
@@ -203,6 +439,53 @@ pub fn repair(
 
 pub fn restore(paths: &IntegrationPaths) -> Result<(), IntegrationError> {
     let manifest = load_manifest(&paths.manifest)?;
+    if manifest.schema_version >= 2 {
+        let content = read_config(&manifest.config_path)?;
+        let mut config = parse_config(&content)?;
+        if root_string(&config, &manifest.managed_field).as_deref()
+            != Some(manifest.applied_value.as_str())
+            || root_string(&config, &manifest.managed_provider).as_deref()
+                != Some(manifest.applied_provider.as_str())
+            || !has_omnibridge_provider(&config)
+        {
+            return Err(IntegrationError::UserChangedProvider);
+        }
+        let root = config.as_table_mut().ok_or_else(|| {
+            IntegrationError::InvalidManifest("root TOML value is not a table".into())
+        })?;
+        restore_root_string(
+            root,
+            &manifest.managed_field,
+            manifest.original_value.as_deref(),
+        );
+        restore_root_string(
+            root,
+            &manifest.managed_provider,
+            manifest.original_provider.as_deref(),
+        );
+        if let Some(providers) = root
+            .get_mut("model_providers")
+            .and_then(toml::Value::as_table_mut)
+        {
+            providers.remove(OMNIBRIDGE_PROVIDER_ID);
+            if providers.is_empty() {
+                root.remove("model_providers");
+            }
+        }
+        write_config(&manifest.config_path, &toml::to_string_pretty(&config)?)?;
+        if manifest.catalog_path.exists() {
+            fs::remove_file(&manifest.catalog_path)?;
+        }
+        if let Some(capability) = manifest.capability_path.as_ref()
+            && capability.exists()
+        {
+            fs::remove_file(capability)?;
+        }
+        fs::remove_file(&paths.manifest)?;
+        return Ok(());
+    }
+
+    // v1 manifests were catalog-only and are restored with the legacy guard.
     let current = read_root_string_field(&manifest.config_path, &manifest.managed_field)?;
     let already_restored = if manifest.original_key_present {
         current.as_deref() == manifest.original_value.as_deref()
@@ -243,7 +526,7 @@ pub fn restore_if_present(paths: &IntegrationPaths) -> Result<bool, IntegrationE
 
 pub fn load_manifest(path: impl AsRef<Path>) -> Result<IntegrationManifest, IntegrationError> {
     let manifest: IntegrationManifest = serde_json::from_str(&fs::read_to_string(path)?)?;
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         return Err(IntegrationError::InvalidManifest(format!(
             "unsupported schema version {}",
             manifest.schema_version
@@ -252,6 +535,11 @@ pub fn load_manifest(path: impl AsRef<Path>) -> Result<IntegrationManifest, Inte
     if manifest.managed_field != MANAGED_KEY {
         return Err(IntegrationError::InvalidManifest(format!(
             "managed field must be `{MANAGED_KEY}`"
+        )));
+    }
+    if manifest.schema_version >= 2 && manifest.managed_provider != MANAGED_PROVIDER_KEY {
+        return Err(IntegrationError::InvalidManifest(format!(
+            "managed provider field must be `{MANAGED_PROVIDER_KEY}`"
         )));
     }
     if manifest.original_key_present && manifest.original_value.is_none() {
@@ -270,7 +558,7 @@ pub fn save_manifest(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("json.tmp");
+    let temp = path.with_extension(format!("{}.json.tmp", Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(manifest)?;
     {
         let mut file = fs::File::create(&temp)?;
@@ -279,7 +567,7 @@ pub fn save_manifest(
         file.write_all(b"\n")?;
         file.sync_all()?;
     }
-    fs::rename(temp, path)?;
+    atomic_replace(temp, path)?;
     set_private_permissions(path)?;
     Ok(())
 }
@@ -355,13 +643,13 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), IntegrationError>
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("json.tmp");
+    let temp = path.with_extension(format!("{}.json.tmp", Uuid::new_v4()));
     {
         let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(temp, path)?;
+    atomic_replace(temp, path)?;
     set_private_permissions(path)?;
     Ok(())
 }
@@ -492,18 +780,25 @@ fn read_config(path: &Path) -> Result<String, IntegrationError> {
 }
 
 fn write_config(path: &Path, content: &str) -> Result<(), IntegrationError> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(IntegrationError::InvalidConfigPath(path.to_path_buf()));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("toml.tmp");
-    fs::write(&temp, content)?;
-    fs::rename(temp, path)?;
+    let temp = path.with_extension(format!("{}.toml.tmp", Uuid::new_v4()));
+    let mut file = fs::File::create(&temp)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    atomic_replace(temp, path)?;
     set_private_permissions(path)?;
     Ok(())
 }
 
 fn codex_version(path: &Path) -> Option<String> {
-    std::process::Command::new(path)
+    command_for_executable(path)
         .arg("--version")
         .output()
         .ok()
@@ -511,20 +806,32 @@ fn codex_version(path: &Path) -> Option<String> {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn set_private_permissions(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_mp_core::{ProviderConfig, ProviderRegistry};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    fn test_codex_binary(dir: &Path) -> PathBuf {
+        let catalog = r#"{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","shell_type":"shell_command","model_messages":{"persistent_instructions":"safe","instructions_template":"safe"} }]}"#;
+
+        #[cfg(unix)]
+        {
+            let path = dir.join("codex-stub");
+            fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", catalog)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+
+        #[cfg(windows)]
+        {
+            let path = dir.join("codex-stub.cmd");
+            fs::write(&path, format!("@echo off\r\necho {}\r\n", catalog)).unwrap();
+            path
+        }
+    }
 
     #[test]
     fn patch_only_touches_root_model_catalog_field() {
@@ -568,6 +875,14 @@ mod tests {
             catalog_path: dir.path().join("models.json"),
             codex_binary: PathBuf::from("codex"),
             codex_version: None,
+            managed_provider: MANAGED_PROVIDER_KEY.into(),
+            applied_provider: OMNIBRIDGE_PROVIDER_ID.into(),
+            original_provider: None,
+            original_provider_present: false,
+            provider_table_present: false,
+            capability_path: None,
+            catalog_schema_fingerprint: None,
+            official_model_count: 0,
         };
         save_manifest(&manifest_path, &manifest).unwrap();
         let paths = IntegrationPaths {
@@ -595,8 +910,8 @@ mod tests {
             catalog: dir.path().join("models.json"),
             manifest: dir.path().join("integration.json"),
         };
-        let manifest =
-            build_and_install(&paths, &registry, "/home/lvziw/.local/bin/codex").unwrap();
+        let codex_binary = test_codex_binary(dir.path());
+        let manifest = build_and_install(&paths, &registry, codex_binary).unwrap();
         assert_eq!(manifest.managed_field, MANAGED_KEY);
         assert!(paths.catalog.exists());
     }
@@ -636,8 +951,9 @@ mod tests {
         };
         fs::write(&config, "model_catalog_json = '/tmp/user-catalog.json'\n").unwrap();
         let registry = ProviderRegistry::empty(dir.path().join("providers.json"));
-        let first = build_and_install(&paths, &registry, "/home/lvziw/.local/bin/codex").unwrap();
-        let second = build_and_install(&paths, &registry, "/home/lvziw/.local/bin/codex").unwrap();
+        let codex_binary = test_codex_binary(dir.path());
+        let first = build_and_install(&paths, &registry, &codex_binary).unwrap();
+        let second = build_and_install(&paths, &registry, &codex_binary).unwrap();
         assert_eq!(
             first.original_value.as_deref(),
             Some("/tmp/user-catalog.json")
@@ -668,6 +984,14 @@ mod tests {
             catalog_path: manifest_catalog.clone(),
             codex_binary: PathBuf::from("codex"),
             codex_version: None,
+            managed_provider: MANAGED_PROVIDER_KEY.into(),
+            applied_provider: OMNIBRIDGE_PROVIDER_ID.into(),
+            original_provider: None,
+            original_provider_present: false,
+            provider_table_present: false,
+            capability_path: None,
+            catalog_schema_fingerprint: None,
+            official_model_count: 0,
         };
         save_manifest(&manifest_path, &manifest).unwrap();
         let paths = IntegrationPaths {
@@ -700,6 +1024,14 @@ mod tests {
             catalog_path: catalog.clone(),
             codex_binary: PathBuf::from("codex"),
             codex_version: None,
+            managed_provider: MANAGED_PROVIDER_KEY.into(),
+            applied_provider: OMNIBRIDGE_PROVIDER_ID.into(),
+            original_provider: None,
+            original_provider_present: false,
+            provider_table_present: false,
+            capability_path: None,
+            catalog_schema_fingerprint: None,
+            official_model_count: 0,
         };
         save_manifest(&manifest_path, &manifest).unwrap();
         let paths = IntegrationPaths {

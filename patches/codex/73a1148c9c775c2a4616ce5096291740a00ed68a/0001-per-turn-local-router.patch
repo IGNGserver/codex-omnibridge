@@ -2,14 +2,6 @@ diff --git a/core/src/client.rs b/core/src/client.rs
 index a813022548c9e714d6ccf07c99513367f8bc78f2..119b13c374a4da6b148c72a72584a723402a8145 100644
 --- a/core/src/client.rs
 +++ b/core/src/client.rs
-@@ -102,6 +102,7 @@ use futures::StreamExt;
- use http::HeaderMap as ApiHeaderMap;
- use http::HeaderValue;
- use http::StatusCode;
-+use http::header::AUTHORIZATION;
- use std::time::Duration;
- use std::time::Instant;
- use tokio::sync::mpsc;
 @@ -125,6 +126,9 @@ use crate::context::BaseInstructionsFragment;
  use crate::context::ContextualUserFragment;
  use crate::cyber_access_program;
@@ -44,8 +36,8 @@ index a813022548c9e714d6ccf07c99513367f8bc78f2..119b13c374a4da6b148c72a72584a723
 +
 +impl AuthProvider for LocalRouterCapabilityAuth {
 +    fn add_auth_headers(&self, headers: &mut ApiHeaderMap) {
-+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.token)) {
-+            headers.insert(AUTHORIZATION, value);
++        if let Ok(value) = HeaderValue::from_str(&self.token) {
++            headers.insert("x-codex-omnibridge-token", value);
 +        }
 +    }
 +}
