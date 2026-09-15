@@ -151,16 +151,17 @@ mod linux_tray {
 mod windows_tray {
     use super::*;
     use std::ptr::null_mut;
+    use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::UI::Shell::{
         NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-        GetCursorPos, GetMessageW, IDI_APPLICATION, LoadIconW, MF_DISABLED, MF_GRAYED,
-        MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
+        GetCursorPos, IDI_APPLICATION, LoadIconW, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+        MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
+        WM_RBUTTONUP, WNDCLASSW,
     };
 
     const WM_TRAYICON: u32 = WM_APP + 1;
@@ -168,7 +169,7 @@ mod windows_tray {
     const IDM_URL: usize = 1002;
     const IDM_EXIT: usize = 1003;
 
-    static mut GLOBAL_CONFIG: Option<TrayConfig> = None;
+    static GLOBAL_CONFIG: OnceLock<TrayConfig> = OnceLock::new();
 
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
@@ -180,7 +181,7 @@ mod windows_tray {
             WM_TRAYICON => {
                 match lparam as u32 {
                     WM_LBUTTONDBLCLK => {
-                        if let Some(config) = &GLOBAL_CONFIG {
+                        if let Some(config) = GLOBAL_CONFIG.get() {
                             let _ = open::that(&config.web_url);
                         }
                     }
@@ -194,7 +195,7 @@ mod windows_tray {
                         let url_str: Vec<u16> = format!(
                             "访问: {}\0",
                             GLOBAL_CONFIG
-                                .as_ref()
+                                .get()
                                 .map(|c| c.web_url.as_str())
                                 .unwrap_or("")
                         )
@@ -230,7 +231,7 @@ mod windows_tray {
             WM_COMMAND => {
                 match wparam {
                     IDM_OPEN => {
-                        if let Some(config) = &GLOBAL_CONFIG {
+                        if let Some(config) = GLOBAL_CONFIG.get() {
                             let _ = open::that(&config.web_url);
                         }
                     }
@@ -251,7 +252,7 @@ mod windows_tray {
 
     pub fn run_windows_tray(config: TrayConfig, stop: Arc<AtomicBool>) {
         unsafe {
-            GLOBAL_CONFIG = Some(config.clone());
+            let _ = GLOBAL_CONFIG.set(config.clone());
             let class_name: Vec<u16> = "CodexTrayWindowClass\0".encode_utf16().collect();
 
             let wnd_class = WNDCLASSW {
