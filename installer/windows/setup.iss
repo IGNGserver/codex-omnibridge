@@ -41,7 +41,7 @@ Name: "startupicon"; Description: "开机自动在系统托盘启动"; GroupDesc
 
 [Files]
 Source: "{#MyProjectRoot}\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#MyProjectRoot}\assets\icon.png"; DestDir: "{app}"; Flags: ignoreversion optional
+Source: "{#MyProjectRoot}\assets\icon.png"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyProjectRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyProjectRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyProjectRoot}\installer\install-windows.ps1"; DestDir: "{app}"; Flags: ignoreversion
