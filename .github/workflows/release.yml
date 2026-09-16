@@ -191,32 +191,35 @@ jobs:
             "$smoke_dir/bin/codex-mp-uninstall" >/dev/null
           test ! -e "$smoke_dir/bin/codex-mp"
 
-      - name: 安装 Inno Setup
+      - name: 安装 Node.js
         if: matrix.target.runner == 'windows-latest'
-        shell: pwsh
-        run: choco install innosetup --no-progress --yes
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
-      - name: 打包 Windows 安装包 (Setup.exe + portable)
+      - name: 打包 Windows 原生 Electron 安装包 (Setup.exe + portable)
         if: matrix.target.runner == 'windows-latest'
         shell: pwsh
         run: |
           $packageVersion = "${{ needs.validate.outputs.package_version }}"
-          $innoCompiler = @(
-            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-            "C:\Program Files\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-          if (-not $innoCompiler) { throw "Inno Setup compiler was not installed" }
-
           $distDir = Join-Path $PWD "dist"
-          $projectRoot = (Get-Location).Path
           New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-          & $innoCompiler "/DMyAppVersion=$packageVersion" "/DMyProjectRoot=$projectRoot" "/O$distDir" (Resolve-Path installer/windows/setup.iss)
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE" }
 
-          $setup = Join-Path $distDir "codex-omnibridge-windows-setup.exe"
-          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Inno Setup did not produce $setup" }
-          Rename-Item -LiteralPath $setup -NewName "codex-omnibridge-windows-x86_64-$packageVersion-setup.exe"
+          # 1. 安装 Electron 构建依赖
+          npm install
 
+          # 2. 使用 electron-builder 打包生成真正的 Electron Windows 原生 NSIS 安装包
+          npx electron-builder --win nsis --x64 -c.extraMetadata.version=$packageVersion
+
+          # 拷贝生成的 NSIS setup 到 dist 目录供 CI 校验和收集
+          Get-ChildItem -Path dist/electron -Filter "*-setup.exe" | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $distDir "codex-omnibridge-windows-x86_64-$packageVersion-setup.exe") -Force
+          }
+
+          $setup = Join-Path $distDir "codex-omnibridge-windows-x86_64-$packageVersion-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Electron Builder did not produce $setup" }
+
+          # 3. 准备 portable 绿色运行包
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item target/release/codex-mp.exe dist/package/
           Copy-Item installer/install-windows.ps1,installer/uninstall-windows.ps1 dist/package/

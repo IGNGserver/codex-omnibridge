@@ -48,7 +48,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "include": "installer/windows/uninstaller.nsh"
+      "include": "installer/windows/uninstaller.nsh",
+      "artifactName": "codex-omnibridge-windows-${arch}-${version}-setup.${ext}"
     },
     "mac": {
       "target": ["dmg", "zip"],
@@ -63,7 +64,7 @@
     "deb": {
       "packageCategory": "utils",
       "priority": "optional",
-      "scripts": "installer/linux/deb"
+      "afterRemove": "installer/linux/deb/postrm"
     }
   }
 }

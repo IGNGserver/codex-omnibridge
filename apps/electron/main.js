@@ -63,6 +63,7 @@ function startRustBackend() {
   try {
     rustProcess = spawn(binPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       env: {
         ...process.env,
         CODEX_MP_LOCAL_TOKEN: localToken,
@@ -197,7 +198,7 @@ function createTray() {
       click: async () => {
         try {
           const binPath = getBinaryPath();
-          const p = spawn(binPath, ["sync"]);
+          const p = spawn(binPath, ["sync"], { windowsHide: true });
           p.on("close", (code) => {
             if (code === 0) {
               if (mainWindow) {
@@ -263,7 +264,7 @@ ipcMain.on("app-quit", () => {
 ipcMain.handle("sync-codex", async () => {
   const binPath = getBinaryPath();
   return new Promise((resolve) => {
-    const p = spawn(binPath, ["sync"]);
+    const p = spawn(binPath, ["sync"], { windowsHide: true });
     p.on("close", (code) => {
       resolve({ success: code === 0 });
     });
