@@ -22,9 +22,11 @@ async function api(path, options = {}) {
     "Content-Type": "application/json",
     ...(options.headers || {}),
   };
+  // 实时从 electronAPI 获取可能延迟就绪的 localToken
   const activeToken = (window.electronAPI && window.electronAPI.localToken)
     ? window.electronAPI.localToken
-    : sessionToken;
+    : (sessionToken || localStorage.getItem("codex_mp_token") || "");
+
   if (activeToken) {
     headers["Authorization"] = `Bearer ${activeToken}`;
   }
@@ -35,8 +37,7 @@ async function api(path, options = {}) {
   });
 
   if (response.status === 401) {
-    if (window.electronAPI && window.electronAPI.localToken) {
-      // Electron 环境下免密，若收到 401 说明后台可能重启，刷新 localToken
+    if (window.electronAPI && window.electronAPI.isElectron) {
       console.warn("Electron 环境免密鉴权失效，请检查后台");
     } else {
       showLoginDialog();
@@ -1273,7 +1274,18 @@ if (window.electronAPI && window.electronAPI.isElectron) {
   if (closeBtn) closeBtn.onclick = () => window.electronAPI.closeWindow();
 }
 
-// ==========================================================================
-// 9. 启动自检
-// ==========================================================================
-refreshAll();
+// 启动自检：如果处于 Electron 环境且尚未取得 localToken，等待拿到后再触发全量刷新
+if (window.electronAPI && window.electronAPI.isElectron) {
+  const waitForToken = async () => {
+    for (let i = 0; i < 20; i++) {
+      if (window.electronAPI.localToken) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    refreshAll();
+  };
+  waitForToken();
+} else {
+  refreshAll();
+}
