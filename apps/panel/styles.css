@@ -85,12 +85,12 @@
   --md-sys-color-on-error-container: #ffdad6;
 
   --md-sys-color-background: #0f1416;
-  --md-sys-color-on-background: #de1f3f5;
+  --md-sys-color-on-background: #e1e3e5;
 
   --md-sys-color-surface: #0f1416;
   --md-sys-color-on-surface: #e1e3e5;
-  --md-sys-color-surface-variant: #3f484a;
-  --md-sys-color-on-surface-variant: #bfc8ca;
+  --md-sys-color-surface-variant: #283033;
+  --md-sys-color-on-surface-variant: #e1e3e5;
 
   --md-sys-color-surface-container-lowest: #0a0f11;
   --md-sys-color-surface-container-low: #171d1f;
@@ -98,8 +98,8 @@
   --md-sys-color-surface-container-high: #252b2e;
   --md-sys-color-surface-container-highest: #303639;
 
-  --md-sys-color-outline: #899294;
-  --md-sys-color-outline-variant: #3f484a;
+  --md-sys-color-outline: #a4afb2;
+  --md-sys-color-outline-variant: #434c4e;
   --md-sys-color-scrim: #000000;
 
   --md-sys-elevation-1: 0 1px 3px 1px rgba(0, 0, 0, 0.35);
@@ -139,10 +139,10 @@ button, input, select, textarea {
 .m3-title-medium { font-size: 16px; line-height: 24px; font-weight: 600; }
 .m3-body-large { font-size: 16px; line-height: 24px; font-weight: 400; }
 .m3-body-medium { font-size: 14px; line-height: 20px; font-weight: 400; }
-.m3-body-small { font-size: 12px; line-height: 16px; font-weight: 400; }
+.m3-body-small { font-size: 13px; line-height: 18px; font-weight: 400; }
 .m3-label-large { font-size: 14px; line-height: 20px; font-weight: 600; letter-spacing: 0.01em; }
-.m3-label-medium { font-size: 12px; line-height: 16px; font-weight: 600; letter-spacing: 0.02em; }
-.m3-label-small { font-size: 11px; line-height: 16px; font-weight: 600; letter-spacing: 0.04em; }
+.m3-label-medium { font-size: 13px; line-height: 18px; font-weight: 600; letter-spacing: 0.02em; }
+.m3-label-small { font-size: 12px; line-height: 16px; font-weight: 600; letter-spacing: 0.04em; }
 
 /* Material Symbols Icon Utility */
 .material-symbols-outlined {
@@ -176,8 +176,8 @@ button, input, select, textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 56px;
-  padding: 0 16px 0 20px;
+  height: 48px;
+  padding: 0 0 0 16px;
   background-color: var(--md-sys-color-surface-container-low);
   border-bottom: 1px solid var(--md-sys-color-outline-variant);
   position: sticky;
@@ -200,33 +200,45 @@ button, input, select, textarea {
 .desktop-window-controls {
   display: flex;
   align-items: center;
-  margin-left: 10px;
-  border-left: 1px solid var(--md-sys-color-outline-variant);
-  padding-left: 10px;
+  margin-left: 12px;
+  height: 100%;
 }
 
 .desktop-win-btn {
-  width: 34px;
-  height: 34px;
+  width: 48px;
+  height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: transparent;
-  color: var(--md-sys-color-on-surface-variant);
-  border-radius: var(--md-shape-corner-small);
+  color: var(--md-sys-color-on-surface);
   cursor: pointer;
-  transition: background-color var(--md-motion-duration-short), color var(--md-motion-duration-short);
+  transition: background-color 100ms ease, color 100ms ease;
+}
+
+.desktop-win-btn svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
 }
 
 .desktop-win-btn:hover {
-  background-color: var(--md-sys-color-surface-container-highest);
-  color: var(--md-sys-color-on-surface);
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.desktop-win-btn:active {
+  background-color: rgba(255, 255, 255, 0.14);
 }
 
 .desktop-win-btn.desktop-win-close:hover {
-  background-color: var(--md-sys-color-error);
-  color: var(--md-sys-color-on-error);
+  background-color: #e81123 !important;
+  color: #ffffff !important;
+}
+
+.desktop-win-btn.desktop-win-close:active {
+  background-color: #bf0f1d !important;
+  color: #ffffff !important;
 }
 
 .m3-app-brand {
@@ -728,6 +740,8 @@ button, input, select, textarea {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  background-color: var(--md-sys-color-surface-container);
+  border: 1px solid var(--md-sys-color-outline-variant);
 }
 
 .m3-metric-top {
