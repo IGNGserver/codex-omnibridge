@@ -6,6 +6,17 @@ let sessionToken = (window.electronAPI && window.electronAPI.localToken)
 // ==========================================================================
 // 1. API 客户端与鉴权
 // ==========================================================================
+function resolveApiUrl(path) {
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    return path;
+  }
+  // 如果当前是 file:// 协议加载的本地页面，将相对 API 路径定向到本地后台服务
+  if (window.location.protocol === "file:") {
+    return `http://localhost:31828${path}`;
+  }
+  return path;
+}
+
 async function api(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
@@ -17,7 +28,8 @@ async function api(path, options = {}) {
   if (activeToken) {
     headers["Authorization"] = `Bearer ${activeToken}`;
   }
-  const response = await fetch(path, {
+  const targetUrl = resolveApiUrl(path);
+  const response = await fetch(targetUrl, {
     ...options,
     headers,
   });
@@ -1245,6 +1257,21 @@ document.querySelector("#settings-desktop-restore-btn").onclick = async () => {
     notify(err.message, true);
   }
 };
+
+// 桌面端窗口按钮绑定
+if (window.electronAPI && window.electronAPI.isElectron) {
+  const controls = document.querySelector("#desktop-window-controls");
+  if (controls) controls.style.display = "flex";
+
+  const minBtn = document.querySelector("#win-min-btn");
+  if (minBtn) minBtn.onclick = () => window.electronAPI.minimizeWindow();
+
+  const maxBtn = document.querySelector("#win-max-btn");
+  if (maxBtn) maxBtn.onclick = () => window.electronAPI.maximizeWindow();
+
+  const closeBtn = document.querySelector("#win-close-btn");
+  if (closeBtn) closeBtn.onclick = () => window.electronAPI.closeWindow();
+}
 
 // ==========================================================================
 // 9. 启动自检

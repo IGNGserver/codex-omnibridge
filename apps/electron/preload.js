@@ -3,8 +3,9 @@ const { contextBridge, ipcRenderer } = require("electron");
 // 向渲染层（Panel 网页）注入安全本地免密通信通道与系统控制方法
 contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: true,
-  localToken: window.process ? "" : undefined, // 由 preload 初始化
+  localToken: undefined,
   minimizeWindow: () => ipcRenderer.send("window-minimize"),
+  maximizeWindow: () => ipcRenderer.send("window-maximize"),
   closeWindow: () => ipcRenderer.send("window-close"),
   quitApp: () => ipcRenderer.send("app-quit"),
   syncCodex: () => ipcRenderer.invoke("sync-codex"),
