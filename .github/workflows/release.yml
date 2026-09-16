@@ -208,8 +208,11 @@ jobs:
           # 1. 安装 Electron 构建依赖
           npm install
 
-          # 2. 使用 electron-builder 打包生成真正的 Electron Windows 原生 NSIS 安装包
-          npx electron-builder --win nsis --x64 -c.extraMetadata.version=$packageVersion
+          # 2. 动态更新 package.json 中的版本号
+          npm version $packageVersion --no-git-tag-version --allow-same-version
+
+          # 3. 使用 electron-builder 打包生成真正的 Electron Windows 原生 NSIS 安装包
+          npx electron-builder --win nsis --x64
 
           # 拷贝生成的 NSIS setup 到 dist 目录供 CI 校验和收集
           Get-ChildItem -Path dist/electron -Filter "*-setup.exe" | ForEach-Object {
@@ -219,7 +222,7 @@ jobs:
           $setup = Join-Path $distDir "codex-omnibridge-windows-x86_64-$packageVersion-setup.exe"
           if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Electron Builder did not produce $setup" }
 
-          # 3. 准备 portable 绿色运行包
+          # 4. 准备 portable 绿色运行包
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item target/release/codex-mp.exe dist/package/
           Copy-Item installer/install-windows.ps1,installer/uninstall-windows.ps1 dist/package/
