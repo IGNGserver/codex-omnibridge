@@ -1,6 +1,7 @@
 /target
 /apps/panel/src-tauri/target
 /dist
+/node_modules
 .env
 *.tmp
 *.json.tmp
