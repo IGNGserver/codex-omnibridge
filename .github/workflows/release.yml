@@ -153,6 +153,12 @@ jobs:
           ./target/release/codex-mp --help >/dev/null
           bash -n installer/install-macos.sh installer/uninstall-macos.sh scripts/build-dmg.sh
 
+      - name: 安装 Node.js
+        if: matrix.target.runner == 'ubuntu-24.04'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: 安装 AppImage 打包工具
         if: matrix.target.runner == 'ubuntu-24.04'
         run: |
@@ -164,9 +170,12 @@ jobs:
       - name: 打包 Linux 安装包 (DEB + AppImage + portable)
         if: matrix.target.runner == 'ubuntu-24.04'
         run: |
-          ./scripts/build-deb.sh "${{ needs.validate.outputs.package_version }}" amd64
-          APPIMAGETOOL="${RUNNER_TEMP}/appimagetool" \
-            ./scripts/build-appimage.sh "${{ needs.validate.outputs.package_version }}" x86_64
+          npm install
+          npm version "${{ needs.validate.outputs.package_version }}" --no-git-tag-version --allow-same-version
+          npx electron-builder --linux deb AppImage --x64 -p never
+          mkdir -p dist
+          cp dist/electron/*.deb dist/
+          cp dist/electron/*.AppImage dist/
           mkdir -p dist/package
           cp target/release/codex-mp dist/package/
           cp installer/install-linux.sh dist/package/
@@ -248,10 +257,29 @@ jobs:
           if (-not $?) { throw "Windows uninstaller smoke failed" }
           if (Test-Path (Join-Path $smokeDir "codex-mp.exe")) { throw "codex-mp.exe was not removed" }
 
+      - name: 安装 Node.js
+        if: startsWith(matrix.target.runner, 'macos')
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: 打包 macOS 安装包 (DMG + portable)
         if: startsWith(matrix.target.runner, 'macos')
         run: |
-          ./scripts/build-dmg.sh "${{ needs.validate.outputs.package_version }}" "${{ matrix.target.architecture }}"
+          npm install
+          npm version "${{ needs.validate.outputs.package_version }}" --no-git-tag-version --allow-same-version
+          arch_flag="--x64"
+          if [[ "${{ matrix.target.architecture }}" == "aarch64" || "${{ matrix.target.architecture }}" == "arm64" ]]; then
+            arch_flag="--arm64"
+          fi
+          npx electron-builder --mac dmg --${arch_flag#--} -p never
+          mkdir -p dist
+          # 将生成的 dmg 规范命名放到 dist/
+          for dmg in dist/electron/*.dmg; do
+            if [[ -f "$dmg" ]]; then
+              cp "$dmg" "dist/codex-omnibridge-macos-${{ matrix.target.architecture }}-${{ needs.validate.outputs.package_version }}.dmg"
+            fi
+          done
           mkdir -p dist/package
           cp target/release/codex-mp dist/package/
           cp installer/install-macos.sh dist/package/

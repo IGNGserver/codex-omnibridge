@@ -10,17 +10,17 @@
   </head>
   <body>
     <div class="m3-layout-root">
-      <!-- 顶部应用栏 (Top App Bar) -->
-      <header class="m3-top-app-bar">
-        <div class="m3-app-brand">
+      <!-- 顶部应用栏 (Top App Bar & 融合标题栏) -->
+      <header class="m3-top-app-bar window-drag-region">
+        <div class="m3-app-brand window-no-drag">
           <div class="m3-brand-icon">
             <span class="material-symbols-outlined">hub</span>
           </div>
           <span class="m3-brand-title">Codex OmniBridge</span>
-          <span class="m3-brand-badge">Material 3</span>
+          <span class="m3-brand-badge">Desktop</span>
         </div>
 
-        <div class="m3-topbar-actions">
+        <div class="m3-topbar-actions window-no-drag">
           <div class="m3-badge m3-badge-success" id="router-state-badge">
             <span class="material-symbols-outlined" style="font-size: 16px;">dns</span>
             <span id="router-state-text">Router 检查中…</span>
@@ -38,6 +38,19 @@
           <button class="m3-icon-btn" id="logout-btn" title="退出管理登录" style="display: none;">
             <span class="material-symbols-outlined">logout</span>
           </button>
+
+          <!-- 桌面端原生无边框窗口控制按钮 (Windows/Linux) -->
+          <div class="desktop-window-controls" id="desktop-window-controls" style="display: none;">
+            <button class="desktop-win-btn" id="win-min-btn" title="最小化">
+              <span class="material-symbols-outlined" style="font-size: 16px;">minimize</span>
+            </button>
+            <button class="desktop-win-btn" id="win-max-btn" title="最大化/还原">
+              <span class="material-symbols-outlined" style="font-size: 16px;">crop_square</span>
+            </button>
+            <button class="desktop-win-btn desktop-win-close" id="win-close-btn" title="关闭 (隐藏到托盘)">
+              <span class="material-symbols-outlined" style="font-size: 16px;">close</span>
+            </button>
+          </div>
         </div>
       </header>
 

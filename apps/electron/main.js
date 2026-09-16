@@ -23,24 +23,39 @@ function getBinaryPath() {
     return process.env.CODEX_MP_BIN;
   }
 
-  // 2. 尝试打包后同目录 resources/bin 或 extraFiles
-  const bundledPath = path.join(process.resourcesPath || "", "bin", binaryName);
-  if (fs.existsSync(bundledPath)) {
-    return bundledPath;
+  // 2. 打包安装环境：各种可能的存放路径
+  const exeDir = path.dirname(app.getPath("exe"));
+  const candidates = [
+    path.join(process.resourcesPath || "", "bin", binaryName),
+    path.join(process.resourcesPath || "", binaryName),
+    path.join(exeDir, "resources", "bin", binaryName),
+    path.join(exeDir, "resources", binaryName),
+    path.join(exeDir, "bin", binaryName),
+    path.join(exeDir, binaryName),
+  ];
+
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) {
+      console.log(`[Electron Main] 找到打包二进制: ${c}`);
+      return c;
+    }
   }
 
   // 3. 开发环境 target/release 或 target/debug
   const projectRoot = path.resolve(__dirname, "../..");
-  const releasePath = path.join(projectRoot, "target", "release", binaryName);
-  if (fs.existsSync(releasePath)) {
-    return releasePath;
-  }
-  const debugPath = path.join(projectRoot, "target", "debug", binaryName);
-  if (fs.existsSync(debugPath)) {
-    return debugPath;
+  const devCandidates = [
+    path.join(projectRoot, "target", "release", binaryName),
+    path.join(projectRoot, "target", "debug", binaryName),
+  ];
+  for (const d of devCandidates) {
+    if (fs.existsSync(d)) {
+      console.log(`[Electron Main] 找到开发环境二进制: ${d}`);
+      return d;
+    }
   }
 
   // 4. PATH 中的全局命令
+  console.log(`[Electron Main] 使用 PATH 二进制: ${binaryName}`);
   return binaryName;
 }
 
@@ -64,6 +79,7 @@ function startRustBackend() {
     rustProcess = spawn(binPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      detached: false,
       env: {
         ...process.env,
         CODEX_MP_LOCAL_TOKEN: localToken,
@@ -88,6 +104,11 @@ function startRustBackend() {
 
     rustProcess.on("error", (err) => {
       console.error(`[Rust Core] 启动失败:`, err);
+      if (mainWindow) {
+        mainWindow.webContents.executeJavaScript(`
+          console.error("启动后台 Rust 失败: ${err.message.replace(/\\/g, '\\\\')}");
+        `);
+      }
     });
   } catch (err) {
     console.error(`[Rust Core] 创建子进程异常:`, err);
@@ -118,38 +139,49 @@ function waitForBackend(url, maxRetries = 40, intervalMs = 250) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
-    minWidth: 900,
-    minHeight: 650,
+    width: 1220,
+    height: 840,
+    minWidth: 920,
+    minHeight: 660,
     title: "Codex OmniBridge",
     icon: getAppIcon(),
     show: false,
-    backgroundColor: "#1c1b1f",
+    frame: false, // 去除系统原生外边框和原生标题栏
+    autoHideMenuBar: true, // 彻底隐藏并去除 File, Edit, View 等菜单栏
+    backgroundColor: "#0f1416",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
+      webSecurity: false,
     },
   });
 
+  // 彻底移除默认的 application menu
+  Menu.setApplicationMenu(null);
+
+  const localFile = path.resolve(__dirname, "../panel/index.html");
   const webUrl = `http://localhost:${defaultPort}`;
 
-  // 优雅加载：等待后端服务就绪后再 loadURL
-  waitForBackend(`${webUrl}/api/v1/security/status`)
-    .then(() => {
-      mainWindow.loadURL(webUrl);
-    })
-    .catch(() => {
-      // 若等待超时仍尝试加载
-      mainWindow.loadURL(webUrl);
-    });
+  // 优先直接加载本地打包的控制中心页面（永不黑屏，即开即显）
+  if (fs.existsSync(localFile)) {
+    mainWindow.loadFile(localFile);
+  } else {
+    mainWindow.loadURL(webUrl);
+  }
 
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
     mainWindow.focus();
   });
+
+  // 兜底显示：防止极端情况下 ready-to-show 没触发导致一直黑屏
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isVisible()) {
+      mainWindow.show();
+    }
+  }, 1200);
 
   // 关键机制：点击关闭（X）不退出，而是隐藏至系统托盘
   mainWindow.on("close", (event) => {
@@ -250,6 +282,16 @@ ipcMain.handle("get-local-token", () => {
 
 ipcMain.on("window-minimize", () => {
   if (mainWindow) mainWindow.minimize();
+});
+
+ipcMain.on("window-maximize", () => {
+  if (mainWindow) {
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+  }
 });
 
 ipcMain.on("window-close", () => {
