@@ -25,21 +25,15 @@
       "apps/panel/**/*",
       "assets/**/*"
     ],
-    "extraFiles": [
-      {
-        "from": "target/release/codex-mp",
-        "to": "bin/codex-mp",
-        "filter": ["**/*"]
-      }
-    ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "assets/icon.png",
       "extraFiles": [
         {
           "from": "target/release/codex-mp.exe",
-          "to": "bin/codex-mp.exe",
-          "filter": ["**/*"]
+          "to": "bin/codex-mp.exe"
         }
       ]
     },
@@ -52,14 +46,32 @@
       "artifactName": "codex-omnibridge-windows-${arch}-${version}-setup.${ext}"
     },
     "mac": {
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "icon": "assets/icon.png",
-      "category": "public.app-category.developer-tools"
+      "category": "public.app-category.developer-tools",
+      "extraFiles": [
+        {
+          "from": "target/release/codex-mp",
+          "to": "bin/codex-mp"
+        }
+      ]
     },
     "linux": {
-      "target": ["deb", "AppImage"],
+      "target": [
+        "deb",
+        "AppImage"
+      ],
       "icon": "assets/icon.png",
-      "category": "Development"
+      "category": "Development",
+      "extraFiles": [
+        {
+          "from": "target/release/codex-mp",
+          "to": "bin/codex-mp"
+        }
+      ]
     },
     "deb": {
       "packageCategory": "utils",
