@@ -132,7 +132,7 @@ struct WebStartArgs {
     #[arg(long)]
     endpoint_file: Option<PathBuf>,
     /// Loopback secret token for local desktop IPC / embedded window direct access
-    #[arg(long, env = "CODEX_MP_LOCAL_TOKEN")]
+    #[arg(long, env = "CODEX_MP_LOCAL_TOKEN", alias = "token")]
     local_token: Option<String>,
 }
 

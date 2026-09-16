@@ -240,12 +240,18 @@ async fn auth_middleware(
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+    let custom_token_header = headers
+        .get("x-local-token")
+        .and_then(|v| v.to_str().ok());
+
     let token = if let Some(auth) = auth_header {
         if let Some(token) = auth.strip_prefix("Bearer ") {
             Some(token.trim().to_string())
         } else {
             None
         }
+    } else if let Some(custom) = custom_token_header {
+        Some(custom.trim().to_string())
     } else {
         None
     };

@@ -131,6 +131,33 @@ button, input, select, textarea {
   font-size: inherit;
 }
 
+/* 自定义现代深色滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: rgba(255, 255, 255, 0.45);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* M3 Typography Scale */
 .m3-display-small { font-size: 36px; line-height: 44px; font-weight: 700; letter-spacing: -0.02em; }
 .m3-headline-medium { font-size: 28px; line-height: 36px; font-weight: 600; letter-spacing: -0.01em; }
