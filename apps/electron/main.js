@@ -14,6 +14,14 @@ let isQuitting = false;
 const localToken = crypto.randomUUID();
 const defaultPort = 31828;
 
+// 保存 localToken 到用户数据目录供 CLI/扩展安全免密调用
+try {
+  const tokenFile = path.join(app.getPath("userData"), "local_token");
+  fs.writeFileSync(tokenFile, localToken, { mode: 0o600 });
+} catch (e) {
+  // 忽略
+}
+
 // 寻找 codex-mp 二进制路径
 function getBinaryPath() {
   const binaryName = process.platform === "win32" ? "codex-mp.exe" : "codex-mp";
@@ -69,10 +77,8 @@ function startRustBackend() {
     "web",
     "start",
     "--headless",
-    "--local-token",
-    localToken,
-    "--port",
-    String(defaultPort),
+    `--local-token=${localToken}`,
+    `--port=${defaultPort}`,
   ];
 
   try {
@@ -166,9 +172,11 @@ function createWindow() {
 
   // 优先直接加载本地打包的控制中心页面（永不黑屏，即开即显）
   if (fs.existsSync(localFile)) {
-    mainWindow.loadFile(localFile);
+    mainWindow.loadFile(localFile, {
+      query: { local_token: localToken }
+    });
   } else {
-    mainWindow.loadURL(webUrl);
+    mainWindow.loadURL(`${webUrl}?local_token=${localToken}`);
   }
 
   mainWindow.once("ready-to-show", () => {
@@ -276,6 +284,10 @@ function createTray() {
 }
 
 // IPC 处理器：注入 localToken 免密与窗口控制
+ipcMain.on("get-local-token-sync", (event) => {
+  event.returnValue = localToken;
+});
+
 ipcMain.handle("get-local-token", () => {
   return localToken;
 });

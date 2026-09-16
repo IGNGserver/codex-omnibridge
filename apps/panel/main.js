@@ -1,7 +1,13 @@
 // Material 3 Codex OmniBridge Web 客户端逻辑
+const urlParams = new URLSearchParams(window.location.search);
+const queryToken = urlParams.get("local_token");
+if (queryToken) {
+  localStorage.setItem("codex_mp_local_token", queryToken);
+}
+
 let sessionToken = (window.electronAPI && window.electronAPI.localToken)
   ? window.electronAPI.localToken
-  : (localStorage.getItem("codex_mp_token") || "");
+  : (queryToken || localStorage.getItem("codex_mp_local_token") || localStorage.getItem("codex_mp_token") || "");
 
 // ==========================================================================
 // 1. API 客户端与鉴权
@@ -22,13 +28,14 @@ async function api(path, options = {}) {
     "Content-Type": "application/json",
     ...(options.headers || {}),
   };
-  // 实时从 electronAPI 获取可能延迟就绪的 localToken
+  // 实时从 electronAPI、URL query 或 localStorage 获取 localToken
   const activeToken = (window.electronAPI && window.electronAPI.localToken)
     ? window.electronAPI.localToken
-    : (sessionToken || localStorage.getItem("codex_mp_token") || "");
+    : (sessionToken || queryToken || localStorage.getItem("codex_mp_local_token") || localStorage.getItem("codex_mp_token") || "");
 
   if (activeToken) {
     headers["Authorization"] = `Bearer ${activeToken}`;
+    headers["X-Local-Token"] = activeToken;
   }
   const targetUrl = resolveApiUrl(path);
   const response = await fetch(targetUrl, {
