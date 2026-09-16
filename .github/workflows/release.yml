@@ -211,8 +211,8 @@ jobs:
           # 2. 动态更新 package.json 中的版本号
           npm version $packageVersion --no-git-tag-version --allow-same-version
 
-          # 3. 使用 electron-builder 打包生成真正的 Electron Windows 原生 NSIS 安装包
-          npx electron-builder --win nsis --x64
+          # 3. 使用 electron-builder 打包生成真正的 Electron Windows 原生 NSIS 安装包 (--publish never 避免尝试自动发布)
+          npx electron-builder --win nsis --x64 -p never
 
           # 拷贝生成的 NSIS setup 到 dist 目录供 CI 校验和收集
           Get-ChildItem -Path dist/electron -Filter "*-setup.exe" | ForEach-Object {
