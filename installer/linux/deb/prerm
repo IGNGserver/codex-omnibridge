@@ -1,0 +1,17 @@
+#!/bin/bash
+set -e
+
+# 停止运行中的进程
+pkill -f 'codex-mp' || true
+pkill -f 'codex-omnibridge' || true
+
+# 执行纯净还原
+if command -v codex-mp >/dev/null 2>&1; then
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    runuser -u "${SUDO_USER}" -- codex-mp uninstall || true
+  else
+    codex-mp uninstall || true
+  fi
+fi
+
+exit 0

@@ -17,6 +17,9 @@ pub const DEFAULT_WEB_PORT: u16 = 31828;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebSecurityConfig {
+    /// Whether web browser access is enabled (default false: local app direct access only)
+    #[serde(default)]
+    pub web_enabled: bool,
     /// PBKDF2-HMAC-SHA256 hash formatted as salt$hash (hex-encoded)
     pub password_hash: Option<String>,
     #[serde(default)]
@@ -32,6 +35,7 @@ fn default_web_port() -> u16 {
 impl Default for WebSecurityConfig {
     fn default() -> Self {
         Self {
+            web_enabled: false,
             password_hash: None,
             allow_remote: false,
             port: DEFAULT_WEB_PORT,

@@ -1,0 +1,69 @@
+{
+  "name": "codex-omnibridge",
+  "version": "0.1.0",
+  "description": "Codex OmniBridge - Native Desktop Application with Electron and Rust Core",
+  "main": "apps/electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "author": "Codex MultiProvider Contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.codex.omnibridge",
+    "productName": "Codex OmniBridge",
+    "directories": {
+      "output": "dist/electron"
+    },
+    "files": [
+      "apps/electron/**/*",
+      "apps/panel/**/*",
+      "assets/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "target/release/codex-mp",
+        "to": "bin/codex-mp",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icon.png",
+      "extraFiles": [
+        {
+          "from": "target/release/codex-mp.exe",
+          "to": "bin/codex-mp.exe",
+          "filter": ["**/*"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "include": "installer/windows/uninstaller.nsh"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "icon": "assets/icon.png",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": ["deb", "AppImage"],
+      "icon": "assets/icon.png",
+      "category": "Development"
+    },
+    "deb": {
+      "packageCategory": "utils",
+      "priority": "optional",
+      "scripts": "installer/linux/deb"
+    }
+  }
+}

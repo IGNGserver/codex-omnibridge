@@ -1,5 +1,7 @@
 // Material 3 Codex OmniBridge Web 客户端逻辑
-let sessionToken = localStorage.getItem("codex_mp_token") || "";
+let sessionToken = (window.electronAPI && window.electronAPI.localToken)
+  ? window.electronAPI.localToken
+  : (localStorage.getItem("codex_mp_token") || "");
 
 // ==========================================================================
 // 1. API 客户端与鉴权
@@ -9,8 +11,11 @@ async function api(path, options = {}) {
     "Content-Type": "application/json",
     ...(options.headers || {}),
   };
-  if (sessionToken) {
-    headers["Authorization"] = `Bearer ${sessionToken}`;
+  const activeToken = (window.electronAPI && window.electronAPI.localToken)
+    ? window.electronAPI.localToken
+    : sessionToken;
+  if (activeToken) {
+    headers["Authorization"] = `Bearer ${activeToken}`;
   }
   const response = await fetch(path, {
     ...options,
@@ -18,7 +23,12 @@ async function api(path, options = {}) {
   });
 
   if (response.status === 401) {
-    showLoginDialog();
+    if (window.electronAPI && window.electronAPI.localToken) {
+      // Electron 环境下免密，若收到 401 说明后台可能重启，刷新 localToken
+      console.warn("Electron 环境免密鉴权失效，请检查后台");
+    } else {
+      showLoginDialog();
+    }
     throw new Error("请先登录访问控制中心");
   }
 
@@ -331,24 +341,34 @@ async function refreshDesktopStatus() {
 // 6.3 刷新安全控制状态
 async function refreshSecurityStatus() {
   const accessBadge = document.querySelector("#settings-access-state-badge");
+  const webEnabledInput = document.querySelector("#settings-web-enabled");
   const allowRemoteInput = document.querySelector("#settings-allow-remote");
   const tip = document.querySelector("#settings-security-tip");
   const logoutBtn = document.querySelector("#logout-btn");
 
   try {
     const sec = await api("/api/v1/security/status");
-    allowRemoteInput.checked = sec.allow_remote;
+    if (webEnabledInput) webEnabledInput.checked = !!sec.web_enabled;
+    if (allowRemoteInput) allowRemoteInput.checked = !!sec.allow_remote;
 
-    if (sec.password_set) {
-      accessBadge.textContent = sec.allow_remote ? "已设密码 · 允许外网" : "已设密码 · 仅本机";
-      accessBadge.className = "m3-badge m3-badge-success";
-      tip.textContent = `已开启密码保护。当前监听地址：${sec.bind_addr}:${sec.port}。`;
-      logoutBtn.style.display = "inline-flex";
+    if (window.electronAPI && window.electronAPI.localToken) {
+      logoutBtn.style.display = "none"; // 桌面应用内免密，不显示退出登录按钮
     } else {
-      accessBadge.textContent = "未设密码 · 仅限本机";
+      logoutBtn.style.display = sec.password_set ? "inline-flex" : "none";
+    }
+
+    if (!sec.web_enabled) {
+      accessBadge.textContent = "仅应用内免密 · 网页访问已禁用";
       accessBadge.className = "m3-badge m3-badge-warning";
-      tip.textContent = "未设置访问密码。为了系统安全，外网访问已自动锁定，仅允许 127.0.0.1 访问。";
-      logoutBtn.style.display = "none";
+      tip.textContent = "当前网页端访问处于禁用状态。应用客户端内部可正常通信与配置；如需从浏览器访问，请设置密码并勾选启用。";
+    } else if (sec.allow_remote) {
+      accessBadge.textContent = "已设密码 · 允许外网/局域网网页访问";
+      accessBadge.className = "m3-badge m3-badge-success";
+      tip.textContent = `已开启外网访问密码保护。任何局域网设备均可访问：http://${sec.bind_addr === "0.0.0.0" ? "<本机IP>" : sec.bind_addr}:${sec.port}。`;
+    } else {
+      accessBadge.textContent = "已设密码 · 仅本机浏览器访问";
+      accessBadge.className = "m3-badge m3-badge-success";
+      tip.textContent = `已启用本机网页访问。可通过浏览器访问：http://localhost:${sec.port}，需输入密码。`;
     }
   } catch (e) {
     accessBadge.textContent = "获取失败";
@@ -1179,6 +1199,7 @@ document.querySelector("#providers-refresh-btn").onclick = () => {
 document.querySelector("#settings-security-form").onsubmit = async (e) => {
   e.preventDefault();
   const password = document.querySelector("#settings-web-password").value;
+  const web_enabled = document.querySelector("#settings-web-enabled").checked;
   const allow_remote = document.querySelector("#settings-allow-remote").checked;
 
   try {
@@ -1186,6 +1207,7 @@ document.querySelector("#settings-security-form").onsubmit = async (e) => {
       method: "POST",
       body: JSON.stringify({
         password: password.trim() ? password.trim() : null,
+        web_enabled,
         allow_remote,
       }),
     });
@@ -1194,7 +1216,7 @@ document.querySelector("#settings-security-form").onsubmit = async (e) => {
       sessionToken = res.token;
       localStorage.setItem("codex_mp_token", sessionToken);
     }
-    notify("安全与网络设置已更新！");
+    notify("访问安全配置已更新！");
     await refreshSecurityStatus();
   } catch (err) {
     notify(err.message, true);

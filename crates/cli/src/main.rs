@@ -98,8 +98,20 @@ enum WebCommand {
     Password(WebPasswordArgs),
     /// Configure external/remote network access for the Web panel.
     Remote(WebRemoteArgs),
+    /// Enable or disable web browser access.
+    Access(WebAccessArgs),
     /// Show Web panel status and security configuration.
     Status,
+}
+
+#[derive(Debug, Args)]
+struct WebAccessArgs {
+    /// Enable web browser access (requires password to be set)
+    #[arg(long)]
+    enable: bool,
+    /// Disable web browser access (local desktop direct access only)
+    #[arg(long)]
+    disable: bool,
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +131,9 @@ struct WebStartArgs {
     /// Secure endpoint file used by the background router
     #[arg(long)]
     endpoint_file: Option<PathBuf>,
+    /// Loopback secret token for local desktop IPC / embedded window direct access
+    #[arg(long, env = "CODEX_MP_LOCAL_TOKEN")]
+    local_token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1031,13 +1046,14 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
                 });
             }
 
-            codex_mp_web::run_web_server(
+            codex_mp_web::run_web_server_with_local_token(
                 registry_path.to_path_buf(),
                 endpoint_file,
                 router_bin,
                 codex_bin,
                 args.port,
                 allow_remote,
+                args.local_token,
             )
             .await
             .context("running Web control panel")?;
@@ -1047,9 +1063,10 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             if args.clear {
                 let sec = registry.web_security_mut();
                 sec.password_hash = None;
+                sec.web_enabled = false;
                 sec.allow_remote = false;
                 registry.save()?;
-                println!("Web panel password cleared; remote access disabled.");
+                println!("Web panel password cleared; web browser access disabled.");
                 return Ok(());
             }
 
@@ -1072,6 +1089,30 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             registry.save()?;
             println!("Web panel access password updated successfully.");
         }
+        WebCommand::Access(args) => {
+            if args.enable && args.disable {
+                bail!("--enable and --disable are mutually exclusive");
+            }
+            let mut registry = ProviderRegistry::load(registry_path)?;
+            if args.enable {
+                if registry.web_security().password_hash.is_none() {
+                    bail!(
+                        "cannot enable web access: please set a password first using `codex-mp web password <PASSWORD>`"
+                    );
+                }
+                registry.web_security_mut().web_enabled = true;
+                registry.save()?;
+                println!("Web browser access enabled.");
+            } else if args.disable {
+                let sec = registry.web_security_mut();
+                sec.web_enabled = false;
+                sec.allow_remote = false;
+                registry.save()?;
+                println!("Web browser access disabled (local desktop direct access only).");
+            } else {
+                println!("specify either --enable or --disable");
+            }
+        }
         WebCommand::Remote(args) => {
             if args.enable && args.disable {
                 bail!("--enable and --disable are mutually exclusive");
@@ -1083,7 +1124,9 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
                         "cannot enable remote access: please set a password first using `codex-mp web password <PASSWORD>`"
                     );
                 }
-                registry.web_security_mut().allow_remote = true;
+                let sec = registry.web_security_mut();
+                sec.web_enabled = true;
+                sec.allow_remote = true;
                 registry.save()?;
                 println!("Web panel remote access enabled (bind 0.0.0.0).");
             } else if args.disable {
@@ -1100,11 +1143,19 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             println!("Web panel configuration:");
             println!("  configured port: {}", sec.port);
             println!(
+                "  web browser access: {}",
+                if sec.web_enabled {
+                    "enabled"
+                } else {
+                    "disabled (local direct access only)"
+                }
+            );
+            println!(
                 "  password protected: {}",
                 if sec.password_hash.is_some() {
                     "yes"
                 } else {
-                    "no (loopback only)"
+                    "no"
                 }
             );
             println!(

@@ -254,22 +254,33 @@
               <div class="m3-card m3-card-elevated">
                 <div class="m3-section-header" style="margin-bottom: 16px;">
                   <div>
-                    <h3 class="m3-title-large">面板网络与访问控制</h3>
-                    <p class="m3-body-medium">设置安全访问密码以开启局域网/外网访问 (0.0.0.0)</p>
+                    <h3 class="m3-title-large">网页端与网络访问控制</h3>
+                    <p class="m3-body-medium">桌面应用内置免密访问。开启网页端或局域网/外网访问必须预先设置安全访问密码</p>
                   </div>
                   <div class="m3-badge m3-badge-success" id="settings-access-state-badge">检测中…</div>
                 </div>
 
                 <form id="settings-security-form" style="display: flex; flex-direction: column; gap: 20px;">
                   <div class="m3-text-field">
-                    <label for="settings-web-password">面板访问密码</label>
+                    <label for="settings-web-password">网页端访问密码</label>
                     <input class="m3-input" id="settings-web-password" type="password" autocomplete="new-password" placeholder="留空则保持现状，输入新密码进行修改或设置" />
                   </div>
 
-                  <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-top: 1px solid var(--md-sys-color-outline-variant);">
+                    <div>
+                      <div class="m3-label-large">启用浏览器网页访问</div>
+                      <div class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant);">允许通过浏览器访问本控制面板（桌面端内始终直接免密访问；开启网页端需验证密码）</div>
+                    </div>
+                    <label class="m3-switch">
+                      <input type="checkbox" id="settings-web-enabled" />
+                      <span class="m3-switch-slider"></span>
+                    </label>
+                  </div>
+
+                  <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-top: 1px solid var(--md-sys-color-outline-variant);">
                     <div>
                       <div class="m3-label-large">允许外网 / 局域网访问</div>
-                      <div class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant);">开启后将服务绑定到 0.0.0.0（必须设置访问密码方可生效）</div>
+                      <div class="m3-body-small" style="color: var(--md-sys-color-on-surface-variant);">将服务绑定到 0.0.0.0，使局域网其他设备或手机可通过浏览器远程配置</div>
                     </div>
                     <label class="m3-switch">
                       <input type="checkbox" id="settings-allow-remote" />

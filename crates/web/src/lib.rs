@@ -96,6 +96,8 @@ pub struct WebState {
     pub codex_binary: PathBuf,
     pub sessions: Arc<RwLock<HashSet<String>>>,
     pub listen_addr: Arc<RwLock<SocketAddr>>,
+    /// Secret loopback token for desktop/local IPC direct access without password
+    pub local_token: Arc<String>,
 }
 
 impl WebState {
@@ -104,6 +106,22 @@ impl WebState {
         endpoint_file: PathBuf,
         router_bin: PathBuf,
         codex_bin: PathBuf,
+    ) -> Self {
+        Self::with_local_token(
+            registry_path,
+            endpoint_file,
+            router_bin,
+            codex_bin,
+            Uuid::new_v4().to_string(),
+        )
+    }
+
+    pub fn with_local_token(
+        registry_path: PathBuf,
+        endpoint_file: PathBuf,
+        router_bin: PathBuf,
+        codex_bin: PathBuf,
+        local_token: String,
     ) -> Self {
         let providers = Arc::new(ProviderManager::new(registry_path.clone()));
         let supervisor = Arc::new(Mutex::new(RouterSupervisor::new(
@@ -127,6 +145,7 @@ impl WebState {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 codex_mp_core::DEFAULT_WEB_PORT,
             ))),
+            local_token: Arc::new(local_token),
         }
     }
 
@@ -171,7 +190,6 @@ pub fn create_web_router(state: WebState) -> Router {
         .route("/models/enabled", post(api_set_model_enabled))
         .route("/models/remove", post(api_remove_model))
         // 安全控制
-        .route("/security/status", get(api_security_status))
         .route("/security/update", post(api_security_update))
         // 官方账号与额度管理
         .route("/accounts", get(api_list_accounts))
@@ -190,6 +208,7 @@ pub fn create_web_router(state: WebState) -> Router {
 
     // 无需鉴权的接口（登录和静态资源）
     Router::new()
+        .route("/api/v1/security/status", get(api_security_status))
         .route("/api/v1/security/login", post(api_security_login))
         .nest("/api/v1", api_router)
         .fallback(static_handler)
@@ -217,13 +236,7 @@ async fn auth_middleware(
     };
     let sec = registry.web_security();
 
-    // 如果未设置密码，则仅允许来自 loopback 的访问免密通过；若非 loopback 则要求认证
-    if sec.password_hash.is_none() {
-        // 未设密码时，在 loopback 下完全放行
-        return next.run(request).await;
-    }
-
-    // 已设密码：检查 Bearer Token 或 Cookie
+    // 检查是否有 Authorization 标头
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -237,9 +250,41 @@ async fn auth_middleware(
         None
     };
 
-    if let Some(tok) = token {
+    // 1. 如果请求携带了本地桌面特权 Local Token，无条件免密放行
+    if let Some(ref tok) = token {
+        if constant_time_equal(tok.as_bytes(), state.local_token.as_bytes()) {
+            return next.run(request).await;
+        }
+    }
+
+    // 2. 如果未开启网页访问（web_enabled 为 false），禁止普通 Web/浏览器访问
+    if !sec.web_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "WebAccessDisabled",
+                "message": "网页访问功能已禁用。如需通过网页访问，请在应用设置中开启并设置访问密码。"
+            })),
+        )
+            .into_response();
+    }
+
+    // 3. 如果开启了网页访问，但没有设置密码，拒绝远程访问（仅允许已验证的会话或禁止）
+    if sec.password_hash.is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "PasswordRequired",
+                "message": "启用网页访问必须先设置访问密码。"
+            })),
+        )
+            .into_response();
+    }
+
+    // 4. 验证 Web 会话 Token
+    if let Some(ref tok) = token {
         let sessions = state.sessions.read().await;
-        if sessions.contains(&tok) {
+        if sessions.contains(tok) {
             return next.run(request).await;
         }
     }
@@ -293,6 +338,7 @@ async fn static_handler(uri: axum::http::Uri) -> impl IntoResponse {
 
 #[derive(Serialize)]
 struct SecurityStatusResponse {
+    web_enabled: bool,
     password_set: bool,
     allow_remote: bool,
     bind_addr: String,
@@ -313,6 +359,7 @@ async fn api_security_status(State(state): State<WebState>) -> Response {
     let sec = registry.web_security();
     let addr = *state.listen_addr.read().await;
     Json(SecurityStatusResponse {
+        web_enabled: sec.web_enabled,
         password_set: sec.password_hash.is_some(),
         allow_remote: sec.allow_remote,
         bind_addr: addr.ip().to_string(),
@@ -346,6 +393,13 @@ async fn api_security_login(
         }
     };
     let sec = registry.web_security();
+    if !sec.web_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "网页访问功能已禁用，请在应用设置中启用"})),
+        )
+            .into_response();
+    }
     if let Some(stored_hash) = &sec.password_hash {
         if verify_password(&payload.password, stored_hash) {
             let token = Uuid::new_v4().to_string();
@@ -362,8 +416,9 @@ async fn api_security_login(
 
 #[derive(Deserialize)]
 struct UpdateSecurityRequest {
+    web_enabled: Option<bool>,
     password: Option<String>,
-    allow_remote: bool,
+    allow_remote: Option<bool>,
 }
 
 async fn api_security_update(
@@ -389,10 +444,18 @@ async fn api_security_update(
         .map(str::trim)
         .is_some_and(|p| !p.is_empty());
 
-    if payload.allow_remote && !has_existing_pwd && !is_setting_new_pwd {
+    let target_web_enabled = payload
+        .web_enabled
+        .unwrap_or(registry.web_security().web_enabled);
+    let target_allow_remote = payload
+        .allow_remote
+        .unwrap_or(registry.web_security().allow_remote);
+
+    // 校验：启用网页访问或允许外网，必须有密码
+    if (target_web_enabled || target_allow_remote) && !has_existing_pwd && !is_setting_new_pwd {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "必须先设置访问密码，才允许开启外网/局域网访问"})),
+            Json(serde_json::json!({"error": "开启网页访问或外网访问必须先设置访问密码"})),
         )
             .into_response();
     }
@@ -406,7 +469,14 @@ async fn api_security_update(
             new_token = Some(token);
         }
     }
-    sec.allow_remote = payload.allow_remote;
+    sec.web_enabled = target_web_enabled;
+    sec.allow_remote = target_allow_remote;
+    // 如果关闭了网页访问，同时重置 allow_remote
+    if !sec.web_enabled {
+        sec.allow_remote = false;
+    }
+
+    let final_web_enabled = sec.web_enabled;
     let final_allow_remote = sec.allow_remote;
 
     if let Err(e) = registry.save() {
@@ -421,6 +491,7 @@ async fn api_security_update(
         "status": "ok",
         "message": "安全配置已保存",
         "token": new_token,
+        "web_enabled": final_web_enabled,
         "allow_remote": final_allow_remote,
     }))
     .into_response()
@@ -1111,6 +1182,27 @@ pub async fn run_web_server(
     port_override: Option<u16>,
     allow_remote_override: Option<bool>,
 ) -> Result<(), WebError> {
+    run_web_server_with_local_token(
+        registry_path,
+        endpoint_file,
+        router_bin,
+        codex_bin,
+        port_override,
+        allow_remote_override,
+        None,
+    )
+    .await
+}
+
+pub async fn run_web_server_with_local_token(
+    registry_path: PathBuf,
+    endpoint_file: PathBuf,
+    router_bin: PathBuf,
+    codex_bin: PathBuf,
+    port_override: Option<u16>,
+    allow_remote_override: Option<bool>,
+    local_token: Option<String>,
+) -> Result<(), WebError> {
     let registry =
         ProviderRegistry::load(&registry_path).map_err(|e| WebError::Internal(e.to_string()))?;
     let sec = registry.web_security();
@@ -1132,7 +1224,14 @@ pub async fn run_web_server(
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let state = WebState::new(registry_path, endpoint_file, router_bin, codex_bin);
+    let token = local_token.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let state = WebState::with_local_token(
+        registry_path,
+        endpoint_file,
+        router_bin,
+        codex_bin,
+        token.clone(),
+    );
     *state.listen_addr.write().await = local_addr;
 
     // 自动在后台守护启动 Router（如果尚未启动）
@@ -1149,12 +1248,16 @@ pub async fn run_web_server(
     } else {
         println!(" 外网/局域网访问: [已关闭 - 仅限本机 loopback 访问]");
     }
+    if sec.web_enabled {
+        println!(" 网页端访问: [已启用]");
+    } else {
+        println!(" 网页端访问: [已禁用 (仅限应用内免密通信)]");
+    }
     if sec.password_hash.is_some() {
         println!(" 访问控制: [已设置访问密码保护]");
     } else {
-        println!(" 访问控制: [未设置访问密码 (仅限本机)]");
+        println!(" 访问控制: [未设置访问密码]");
     }
-    println!(" 按 Ctrl+C 停止面板服务");
     println!("============================================================");
 
     let app = create_web_router(state);

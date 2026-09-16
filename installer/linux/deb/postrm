@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+if [[ "$1" = "purge" ]]; then
+  echo "Codex OmniBridge purged completely."
+fi
+
+exit 0
