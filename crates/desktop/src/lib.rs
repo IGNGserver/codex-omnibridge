@@ -14,7 +14,9 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codex_mp_core::{FileLock, atomic_replace, default_registry_path, set_private_permissions};
+use codex_mp_core::{
+    FileLock, atomic_replace, clean_verbatim_path, default_registry_path, set_private_permissions,
+};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -140,6 +142,7 @@ impl DesktopPaths {
         let codex_home = codex_home.into();
         let requested_entrypoint = entrypoint.into();
         let entrypoint = fs::canonicalize(&requested_entrypoint)
+            .map(clean_verbatim_path)
             .map_err(|_| DesktopError::NotFound(requested_entrypoint.clone()))?;
         let bin_dir = entrypoint
             .parent()

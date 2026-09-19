@@ -387,8 +387,16 @@ impl AccountManager {
             let reference = account_credential_reference(&account.id);
             if !account.tokens.is_empty() {
                 let secret = SecretString::from(serde_json::to_string(&account.tokens)?);
-                self.credentials.set(&reference, &secret)?;
-                migrated_legacy_secrets = true;
+                // Attempt migration to keyring/credential store. If migration fails (e.g. platform limits or backend issues),
+                // do NOT fail the entire load_file: keep the inline tokens in memory so the accounts can still be used.
+                if let Err(err) = self.credentials.set(&reference, &secret) {
+                    eprintln!(
+                        "codex-mp: failed to migrate inline tokens for account `{}` to credentials store: {err}",
+                        account.id
+                    );
+                } else {
+                    migrated_legacy_secrets = true;
+                }
                 continue;
             }
             match self.credentials.get(&reference) {

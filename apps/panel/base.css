@@ -18,6 +18,8 @@ html {
   /* Anchored scroll and in-page jumps should not be jarring. */
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 body {
@@ -31,10 +33,10 @@ body {
   color: var(--md-sys-color-on-background);
   /* dvh, not vh: a vh-based full height jumps when mobile browser chrome
      collapses, which this panel hits when opened from a phone. */
-  min-height: 100dvh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
-  overflow-x: hidden;
+  overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;

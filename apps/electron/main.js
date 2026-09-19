@@ -102,6 +102,11 @@ function startRustBackend() {
       env: {
         ...process.env,
         CODEX_MP_LOCAL_TOKEN: localToken,
+        // Windows 凭据管理器有 2560 字符硬限制，而 OAuth JWT token 集通常远超该限制。
+        // 在 Windows 平台桌面运行时默认选用 0600 安全文件后端存储凭据，防止账号保存与加载报错。
+        ...(process.platform === "win32" && !process.env.CODEX_MP_SECRET_BACKEND
+          ? { CODEX_MP_SECRET_BACKEND: "file" }
+          : {}),
       },
     });
 

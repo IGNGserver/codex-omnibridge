@@ -492,6 +492,8 @@ function setTheme(theme) {
   currentTheme = theme;
   localStorage.setItem(THEME_KEY, theme);
   applyPreferences();
+  const names = { system: "跟随系统", light: "浅色", dark: "深色" };
+  notify(`外观主题已切换为：${names[theme] || theme}`);
 }
 
 function setContrast(contrast) {
@@ -499,6 +501,8 @@ function setContrast(contrast) {
   currentContrast = contrast;
   localStorage.setItem(CONTRAST_KEY, contrast);
   applyPreferences();
+  const names = { standard: "标准对比度", high: "高对比度" };
+  notify(`对比度已设置为：${names[contrast] || contrast}`);
 }
 
 function setMotion(motion) {
@@ -506,6 +510,8 @@ function setMotion(motion) {
   currentMotion = motion;
   localStorage.setItem(MOTION_KEY, motion);
   applyPreferences();
+  const names = { full: "完整动效", reduced: "减弱动效" };
+  notify(`动效已设置为：${names[motion] || motion}`);
 }
 
 // Reflect the stored preferences onto both the app-bar menu and the settings
@@ -720,7 +726,14 @@ window.addEventListener("hashchange", activateViewFromHash);
 // The app bar gains elevation once content scrolls under it.
 {
   const appBar = document.querySelector("#top-app-bar");
-  const onScroll = () => appBar.classList.toggle("m3-top-app-bar--scrolled", window.scrollY > 4);
+  const mainContent = document.querySelector("#main-content");
+  const onScroll = () => {
+    const scrolled = (mainContent ? mainContent.scrollTop : 0) > 4 || window.scrollY > 4;
+    appBar.classList.toggle("m3-top-app-bar--scrolled", scrolled);
+  };
+  if (mainContent) {
+    mainContent.addEventListener("scroll", onScroll, { passive: true });
+  }
   window.addEventListener("scroll", onScroll, { passive: true });
   onScroll();
 }
@@ -867,6 +880,13 @@ function errorState({ title, body, retryId }) {
 }
 
 // ==========================================================================
+function cleanPath(p) {
+  if (typeof p !== "string") return p;
+  if (p.startsWith("\\\\?\\UNC\\")) return "\\\\" + p.slice(8);
+  if (p.startsWith("\\\\?\\")) return p.slice(4);
+  return p;
+}
+
 // 6. 状态刷新：Router / Desktop / 安全
 // ==========================================================================
 
@@ -878,6 +898,7 @@ async function refreshRouterStatus() {
   const text = document.querySelector("#router-state-text");
   const metricVal = document.querySelector("#metric-router-val");
   const metricDesc = document.querySelector("#metric-router-desc");
+  const restartBtn = document.querySelector("#router-restart-btn");
 
   try {
     const status = await api("/api/v1/router/status");
@@ -886,22 +907,36 @@ async function refreshRouterStatus() {
       text.textContent = "Router 正常";
       metricVal.textContent = "在线运行中";
       metricDesc.textContent = "透传官方与自定义分流正常";
-    } else if (status.running) {
+      if (restartBtn) restartBtn.classList.remove("is-hidden");
+    } else if (status.running && status.starting) {
       badge.className = "m3-chip m3-chip--warning";
       text.textContent = "Router 启动中";
       metricVal.textContent = "启动中…";
       metricDesc.textContent = "正在建立端点连接";
+      if (restartBtn) restartBtn.classList.add("is-hidden");
+    } else if (status.running) {
+      badge.className = "m3-chip m3-chip--warning";
+      text.textContent = "Router 异常";
+      metricVal.textContent = "运行异常";
+      metricDesc.textContent = status.last_error
+        ? `异常原因: ${status.last_error}`
+        : "服务未通过健康检查";
+      if (restartBtn) restartBtn.classList.remove("is-hidden");
     } else {
       badge.className = "m3-chip m3-chip--error";
       text.textContent = "Router 未运行";
       metricVal.textContent = "离线";
-      metricDesc.textContent = "后台服务未启动";
+      metricDesc.textContent = status.last_error
+        ? `启动失败: ${status.last_error}`
+        : "后台服务未启动";
+      if (restartBtn) restartBtn.classList.remove("is-hidden");
     }
   } catch {
     badge.className = "m3-chip m3-chip--warning";
     text.textContent = "Router 状态未知";
     metricVal.textContent = "未知";
     metricDesc.textContent = "无法获取状态";
+    if (restartBtn) restartBtn.classList.remove("is-hidden");
   }
 }
 
@@ -922,7 +957,7 @@ async function refreshDesktopStatus() {
     settingsBadge.textContent = label;
     settingsBadge.className =
       status.state === "managed" ? "m3-chip m3-chip--success" : "m3-chip m3-chip--warning";
-    settingsDetail.textContent = `${status.version} · 入口: ${status.entrypoint}${
+    settingsDetail.textContent = `${status.version} · 入口: ${cleanPath(status.entrypoint)}${
       status.active_pids && status.active_pids.length
         ? ` · 运行中 PID: ${status.active_pids.join(", ")}`
         : " · Desktop 当前未运行"
@@ -936,12 +971,15 @@ async function refreshDesktopStatus() {
   }
 }
 
+let currentWebUrl = "";
+
 async function refreshSecurityStatus() {
   const accessBadge = document.querySelector("#settings-access-state-badge");
   const webEnabledInput = document.querySelector("#settings-web-enabled");
   const allowRemoteInput = document.querySelector("#settings-allow-remote");
   const tip = document.querySelector("#settings-security-tip");
   const logoutBtn = document.querySelector("#logout-btn");
+  const urlActions = document.querySelector("#settings-security-actions");
 
   try {
     const sec = await api("/api/v1/security/status");
@@ -955,24 +993,34 @@ async function refreshSecurityStatus() {
     }
 
     if (!sec.web_enabled) {
+      currentWebUrl = "";
       accessBadge.textContent = "仅应用内免密 · 网页访问已禁用";
       accessBadge.className = "m3-chip m3-chip--warning";
       tip.textContent =
         "当前网页端访问处于禁用状态。应用客户端内部可正常通信与配置；如需从浏览器访问，请设置密码并勾选启用。";
+      if (urlActions) urlActions.classList.add("is-hidden");
     } else if (sec.allow_remote) {
+      const port = sec.port || 31828;
+      currentWebUrl = `http://${sec.bind_addr && sec.bind_addr !== "0.0.0.0" ? sec.bind_addr : "localhost"}:${port}`;
       accessBadge.textContent = "已设密码 · 允许外网/局域网网页访问";
       accessBadge.className = "m3-chip m3-chip--success";
       tip.textContent = `已开启外网访问密码保护。任何局域网设备均可访问：http://${
         sec.bind_addr === "0.0.0.0" ? "<本机IP>" : sec.bind_addr
-      }:${sec.port}。`;
+      }:${port}。`;
+      if (urlActions) urlActions.classList.remove("is-hidden");
     } else {
+      const port = sec.port || 31828;
+      currentWebUrl = `http://localhost:${port}`;
       accessBadge.textContent = "已设密码 · 仅本机浏览器访问";
       accessBadge.className = "m3-chip m3-chip--success";
-      tip.textContent = `已启用本机网页访问。可通过浏览器访问：http://localhost:${sec.port}，需输入密码。`;
+      tip.textContent = `已启用本机网页访问。可通过浏览器访问：http://localhost:${port}，需输入密码。`;
+      if (urlActions) urlActions.classList.remove("is-hidden");
     }
   } catch {
+    currentWebUrl = "";
     accessBadge.textContent = "获取失败";
     accessBadge.className = "m3-chip m3-chip--error";
+    if (urlActions) urlActions.classList.add("is-hidden");
   }
 }
 
@@ -1559,6 +1607,7 @@ loginForm.addEventListener("submit", async (e) => {
   loginError.textContent = "";
   loginPasswordField.classList.remove("m3-text-field--error");
 
+  let loginSuccess = false;
   await withBusy(submitBtn, async () => {
     try {
       // Must go through resolveApiUrl(): under Electron the page is file://, so a
@@ -1569,20 +1618,23 @@ loginForm.addEventListener("submit", async (e) => {
         body: JSON.stringify({ password: pwd }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || "登录失败，密码错误");
+      if (!res.ok) throw new Error(data.message || data.error || "登录失败，密码错误");
 
       sessionToken = data.token;
       localStorage.setItem("codex_mp_token", sessionToken);
       document.querySelector("#m3-login-password").value = "";
       hideLoginDialog();
       notify("登录成功");
-      await refreshAll();
+      loginSuccess = true;
     } catch (err) {
       loginError.textContent = err.message;
       loginPasswordField.classList.add("m3-text-field--error");
       document.querySelector("#m3-login-password").focus();
     }
   });
+  if (loginSuccess) {
+    await refreshAll();
+  }
 });
 
 logoutBtn.onclick = async () => {
@@ -1617,11 +1669,26 @@ const syncBtn = bindClick("#topbar-sync-btn");
 syncBtn.onclick = () => withBusy(syncBtn, async () => {
   try {
     const res = await api("/api/v1/catalog/sync", { method: "POST" });
-    notify(`Codex Catalog 同步成功：${res.catalog_path}`);
+    notify(`Codex Catalog 同步成功：${cleanPath(res.catalog_path)}`);
   } catch (err) {
     notify(err.message, true);
   }
 });
+
+const routerRestartBtn = document.querySelector("#router-restart-btn");
+if (routerRestartBtn) {
+  routerRestartBtn.onclick = () => withBusy(routerRestartBtn, async () => {
+    try {
+      notify("正在重启 Router 服务…");
+      await api("/api/v1/router/restart", { method: "POST" });
+      notify("Router 已成功重启并就绪");
+      await refreshRouterStatus();
+    } catch (err) {
+      notify(`Router 重启失败: ${err.message}`, true);
+      await refreshRouterStatus();
+    }
+  });
+}
 
 const overviewRefreshBtn = bindClick("#overview-refresh-btn");
 overviewRefreshBtn.onclick = () => withBusy(overviewRefreshBtn, async () => {
@@ -1885,6 +1952,34 @@ providersRefreshBtn.onclick = () => withBusy(providersRefreshBtn, async () => {
       else pwdSupport.textContent = "提交后将更新网页端访问密码";
     });
   }
+
+  const openBrowserBtn = document.querySelector("#security-open-browser-btn");
+  if (openBrowserBtn) {
+    openBrowserBtn.onclick = () => {
+      if (!currentWebUrl) return;
+      window.open(currentWebUrl, "_blank");
+    };
+  }
+
+  const copyUrlBtn = document.querySelector("#security-copy-url-btn");
+  if (copyUrlBtn) {
+    copyUrlBtn.onclick = async () => {
+      if (!currentWebUrl) return;
+      try {
+        await navigator.clipboard.writeText(currentWebUrl);
+        notify("已复制控制地址到剪贴板");
+      } catch {
+        // Fallback for clipboard
+        const input = document.createElement("input");
+        input.value = currentWebUrl;
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand("copy");
+        document.body.removeChild(input);
+        notify("已复制控制地址到剪贴板");
+      }
+    };
+  }
 }
 
 bindClick("#settings-security-form").onsubmit = async (e) => {
@@ -1892,27 +1987,30 @@ bindClick("#settings-security-form").onsubmit = async (e) => {
   const password = document.querySelector("#settings-web-password").value;
   const web_enabled = document.querySelector("#settings-web-enabled").checked;
   const allow_remote = document.querySelector("#settings-allow-remote").checked;
+  const submitBtn = document.querySelector("#settings-security-form button[type='submit']");
 
-  try {
-    const res = await api("/api/v1/security/update", {
-      method: "POST",
-      body: JSON.stringify({
-        password: password.trim() ? password.trim() : null,
-        web_enabled,
-        allow_remote,
-      }),
-    });
-    document.querySelector("#settings-web-password").value = "";
-    document.querySelector("#settings-password-counter").textContent = "";
-    if (res.token) {
-      sessionToken = res.token;
-      localStorage.setItem("codex_mp_token", sessionToken);
+  await withBusy(submitBtn, async () => {
+    try {
+      const res = await api("/api/v1/security/update", {
+        method: "POST",
+        body: JSON.stringify({
+          password: password.trim() ? password.trim() : null,
+          web_enabled,
+          allow_remote,
+        }),
+      });
+      document.querySelector("#settings-web-password").value = "";
+      document.querySelector("#settings-password-counter").textContent = "";
+      if (res.token) {
+        sessionToken = res.token;
+        localStorage.setItem("codex_mp_token", sessionToken);
+      }
+      notify("访问安全配置已更新");
+      await refreshSecurityStatus();
+    } catch (err) {
+      notify(err.message, true);
     }
-    notify("访问安全配置已更新");
-    await refreshSecurityStatus();
-  } catch (err) {
-    notify(err.message, true);
-  }
+  });
 };
 
 const desktopInstallBtn = bindClick("#settings-desktop-install-btn");
