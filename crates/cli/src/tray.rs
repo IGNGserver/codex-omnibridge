@@ -5,7 +5,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+// Only the Linux and Windows arms spawn a tray thread; macOS takes the fallback
+// arm below, where these would otherwise be unused imports.
+#[cfg(any(target_os = "linux", windows))]
 use std::thread;
+#[cfg(any(target_os = "linux", windows))]
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -55,7 +59,11 @@ pub fn spawn_tray(config: TrayConfig) -> Option<TrayHandle> {
 
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = (config, stop_clone);
+        // No tray on this platform. Read the fields explicitly so they are not
+        // reported as never-read, and so the fallback stays honest about ignoring
+        // a configuration it cannot act on.
+        let TrayConfig { web_url, title } = config;
+        let _ = (web_url, title, stop_clone);
         None
     }
 }

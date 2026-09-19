@@ -1463,6 +1463,10 @@ pub fn find_codex_running_pids() -> Vec<u32> {
 /// A match now requires argv[0] to be a Codex runtime binary (not `codex-mp`),
 /// with `app-server` present as its own argument, and never selects this process
 /// or its parent.
+///
+/// Only the Linux and macOS arms parse `/proc` / `ps` output; Windows uses
+/// `tasklist`, so this is dead code there and would fail `-D dead-code`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_codex_app_server_process(args: &[String], pid: u32) -> bool {
     let Some(program) = args.first() else {
         return false;
@@ -2070,7 +2074,15 @@ mod tests {
         let codex_home = dir.path().join("codex_home");
         fs::create_dir_all(&codex_home).unwrap();
 
-        let manager = AccountManager::with_paths(&store_path, &codex_home);
+        // A memory store, not the host keyring: CI runners have no keyring
+        // service, so `with_paths` failed there with "No default store has been
+        // set". Every other test in this module already injects one; this test
+        // was the only one still depending on the environment.
+        let manager = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
 
         let initial_auth = serde_json::json!({
             "auth_mode": "chatgpt",
