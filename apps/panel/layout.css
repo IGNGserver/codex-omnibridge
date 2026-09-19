@@ -1,0 +1,1071 @@
+/* ==========================================================================
+   Layout layer: app shell, adaptive navigation, page composition.
+   Depends on tokens.css, base.css and components.css.
+
+   Breakpoints follow the M3 window size classes:
+     compact  < 600   bottom navigation bar
+     medium   600-839 navigation rail
+     expanded 840-1199 navigation rail (labelled)
+     large    1200+   navigation drawer
+   ========================================================================== */
+
+.m3-layout-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+}
+
+/* ==========================================================================
+   Top app bar (small, 64dp) with a scrolled state
+   ========================================================================== */
+
+.m3-top-app-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--md-sys-space-16);
+  block-size: var(--md-sys-app-bar-height);
+  padding-inline: var(--md-sys-space-16) 0;
+  background-color: var(--md-sys-color-surface);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  user-select: none;
+  transition:
+    background-color var(--md-sys-motion-duration-medium2)
+      var(--md-sys-motion-easing-standard),
+    box-shadow var(--md-sys-motion-duration-medium2)
+      var(--md-sys-motion-easing-standard);
+}
+
+.m3-top-app-bar--scrolled {
+  background-color: var(--md-sys-color-surface-container);
+  box-shadow: var(--md-sys-elevation-2);
+}
+
+/* Electron frameless window: the bar is the drag handle. */
+.window-drag-region {
+  -webkit-app-region: drag;
+}
+
+.window-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.m3-app-bar__leading {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-12);
+  min-inline-size: 0;
+}
+
+.m3-app-bar__trailing {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex: none;
+  min-inline-size: 0;
+}
+
+/* Below the expanded class the app bar sheds its wordmark, and on a compact
+   window it goes further: the sync button drops its label and the router chip
+   shrinks to a dot. Without this the trailing cluster alone is wider than the
+   viewport. */
+@media (max-width: 839px) {
+  .m3-brand-title,
+  .m3-brand-version {
+    display: none;
+  }
+
+  .m3-brand-icon {
+    inline-size: 36px;
+    block-size: 36px;
+  }
+}
+
+@media (max-width: 599px) {
+  .m3-top-app-bar {
+    padding-inline: var(--md-sys-space-8) 0;
+    gap: var(--md-sys-space-4);
+  }
+
+  #topbar-sync-btn .m3-btn__label {
+    display: none;
+  }
+
+  #topbar-sync-btn {
+    --m3-btn-padding: 12px;
+  }
+
+  #router-state-badge {
+    padding-inline: var(--md-sys-space-8);
+    min-inline-size: 0;
+  }
+
+  #router-state-text {
+    display: none;
+  }
+
+  .desktop-win-btn {
+    inline-size: 36px;
+  }
+}
+
+.m3-brand-icon {
+  inline-size: 40px;
+  block-size: 40px;
+  flex: none;
+  border-radius: var(--md-sys-shape-corner-medium);
+  /* Solid container rather than the old primary→tertiary gradient, which
+     could not respond to contrast settings. */
+  background-color: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.m3-brand-icon .material-symbols-outlined::before {
+  font-variation-settings: "FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24;
+}
+
+.m3-brand-title {
+  font-size: var(--md-sys-typescale-title-large-size);
+  line-height: var(--md-sys-typescale-title-large-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-regular);
+  letter-spacing: var(--md-sys-typescale-title-large-tracking);
+  color: var(--md-sys-color-on-surface);
+  white-space: nowrap;
+}
+
+.m3-brand-version {
+  color: var(--md-sys-color-on-surface-variant);
+  white-space: nowrap;
+}
+
+/* --- desktop window controls --------------------------------------------- */
+
+.desktop-window-controls {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  margin-inline-start: var(--md-sys-space-8);
+}
+
+.desktop-win-btn {
+  inline-size: 46px;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface);
+  cursor: pointer;
+  transition: background-color var(--md-sys-motion-duration-short3)
+    var(--md-sys-motion-easing-standard);
+}
+
+.desktop-win-btn svg {
+  inline-size: 12px;
+  block-size: 12px;
+  fill: currentColor;
+}
+
+.desktop-win-btn:hover {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-on-surface) var(--md-sys-state-hover),
+    transparent
+  );
+}
+
+.desktop-win-btn:active {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-on-surface) var(--md-sys-state-pressed),
+    transparent
+  );
+}
+
+/* Close uses the error role rather than a vendor-specific red. */
+.desktop-win-btn.desktop-win-close:hover {
+  background-color: var(--md-sys-color-error);
+  color: var(--md-sys-color-on-error);
+}
+
+.desktop-win-btn.desktop-win-close:active {
+  background-color: color-mix(in srgb, var(--md-sys-color-error) 85%, black);
+  color: var(--md-sys-color-on-error);
+}
+
+/* ==========================================================================
+   App body
+   ========================================================================== */
+
+.m3-app-body {
+  display: flex;
+  flex: 1;
+  min-block-size: 0;
+}
+
+/* ==========================================================================
+   Navigation
+   One DOM, three shapes. The container decides which one applies, so the
+   router in main.js never has to branch on window size.
+   ========================================================================== */
+
+.m3-navigation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  padding: var(--md-sys-space-12);
+  background-color: var(--md-sys-color-surface-container-low);
+  flex: none;
+}
+
+.m3-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-12);
+  min-block-size: var(--md-sys-touch-target);
+  padding-inline: var(--md-sys-space-16);
+  border: none;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: pointer;
+  inline-size: 100%;
+  text-align: start;
+  font-family: var(--md-sys-typescale-font);
+  font-size: var(--md-sys-typescale-label-large-size);
+  line-height: var(--md-sys-typescale-label-large-line);
+  font-weight: var(--md-sys-typescale-label-large-weight);
+  letter-spacing: var(--md-sys-typescale-label-large-tracking);
+  isolation: isolate;
+  transition:
+    background-color var(--md-sys-motion-duration-short4)
+      var(--md-sys-motion-easing-standard),
+    color var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+}
+
+.m3-nav-item::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-color: currentColor;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--md-sys-motion-duration-short4)
+    var(--md-sys-motion-easing-standard);
+  z-index: -1;
+}
+
+.m3-nav-item:hover::before {
+  opacity: var(--md-sys-state-hover);
+}
+
+.m3-nav-item:focus-visible::before {
+  opacity: var(--md-sys-state-focus);
+}
+
+.m3-nav-item:active::before {
+  opacity: var(--md-sys-state-pressed);
+}
+
+.m3-nav-item.active {
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+  font-weight: var(--md-sys-typescale-weight-emphasized-medium);
+}
+
+.m3-nav-item .material-symbols-outlined {
+  flex: none;
+}
+
+.m3-nav-item.active .material-symbols-outlined::before {
+  font-variation-settings: "FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24;
+}
+
+/* The label is kept in the DOM in every shape so the accessible name is
+   always present; rail/bottom-bar shapes hide it visually. */
+.m3-nav-item__label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.m3-nav-footer {
+  margin-block-start: auto;
+  padding-block-start: var(--md-sys-space-16);
+  border-block-start: 1px solid var(--md-sys-color-outline-variant);
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+}
+
+/* --- shape: drawer (large and up) ---------------------------------------- */
+
+@media (min-width: 1200px) {
+  .m3-navigation {
+    inline-size: var(--md-sys-layout-drawer-width);
+    border-inline-end: 1px solid var(--md-sys-color-outline-variant);
+  }
+}
+
+/* --- shape: rail (medium and expanded) ----------------------------------- */
+
+@media (min-width: 600px) and (max-width: 1199px) {
+  .m3-navigation {
+    inline-size: var(--md-sys-layout-rail-width);
+    align-items: center;
+    gap: var(--md-sys-space-8);
+    padding: var(--md-sys-space-12) var(--md-sys-space-8);
+    border-inline-end: 1px solid var(--md-sys-color-outline-variant);
+  }
+
+  .m3-nav-item {
+    flex-direction: column;
+    gap: 2px;
+    inline-size: 72px;
+    min-block-size: 56px;
+    padding: var(--md-sys-space-4) var(--md-sys-space-4);
+    border-radius: var(--md-sys-shape-corner-large);
+    justify-content: center;
+  }
+
+  .m3-nav-item__label {
+    font-size: var(--md-sys-typescale-label-small-size);
+    line-height: var(--md-sys-typescale-label-small-line);
+    letter-spacing: 0;
+    max-inline-size: 100%;
+  }
+
+  /* The selected indicator is the pill behind the icon, not a full-width row. */
+  .m3-nav-item.active {
+    background-color: transparent;
+    color: var(--md-sys-color-on-surface);
+  }
+
+  .m3-nav-item.active::after {
+    content: "";
+    position: absolute;
+    inset-block-start: var(--md-sys-space-4);
+    inline-size: 56px;
+    block-size: 32px;
+    border-radius: var(--md-sys-shape-corner-full);
+    background-color: var(--md-sys-color-secondary-container);
+    z-index: -1;
+  }
+
+  .m3-nav-footer {
+    display: none;
+  }
+}
+
+/* --- shape: bottom bar (compact) ----------------------------------------- */
+
+@media (max-width: 599px) {
+  .m3-app-body {
+    flex-direction: column;
+  }
+
+  .m3-navigation {
+    order: 2;
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: stretch;
+    inline-size: 100%;
+    position: fixed;
+    inset-block-end: 0;
+    inset-inline: 0;
+    z-index: 200;
+    padding: var(--md-sys-space-4) var(--md-sys-space-4)
+      calc(var(--md-sys-space-4) + env(safe-area-inset-bottom, 0px));
+    background-color: var(--md-sys-color-surface-container);
+    border-block-start: 1px solid var(--md-sys-color-outline-variant);
+    box-shadow: var(--md-sys-elevation-2);
+  }
+
+  .m3-nav-item {
+    flex-direction: column;
+    gap: 2px;
+    inline-size: auto;
+    flex: 1;
+    min-block-size: 56px;
+    padding: var(--md-sys-space-4);
+    border-radius: var(--md-sys-shape-corner-large);
+    justify-content: center;
+  }
+
+  .m3-nav-item__label {
+    font-size: var(--md-sys-typescale-label-small-size);
+    line-height: var(--md-sys-typescale-label-small-line);
+    letter-spacing: 0;
+  }
+
+  .m3-nav-item.active {
+    background-color: transparent;
+    color: var(--md-sys-color-on-surface);
+  }
+
+  .m3-nav-item.active::after {
+    content: "";
+    position: absolute;
+    inset-block-start: var(--md-sys-space-4);
+    inline-size: 56px;
+    block-size: 32px;
+    border-radius: var(--md-sys-shape-corner-full);
+    background-color: var(--md-sys-color-secondary-container);
+    z-index: -1;
+  }
+
+  .m3-nav-footer {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   Main content
+   ========================================================================== */
+
+.m3-main-content {
+  flex: 1;
+  min-inline-size: 0;
+  background-color: var(--md-sys-color-surface);
+  padding: var(--md-sys-space-24) var(--md-sys-space-32) var(--md-sys-space-64);
+  /* Constrained and centred: previously max-width without auto margins left
+     content pinned to the left edge on wide windows. */
+  inline-size: 100%;
+}
+
+.m3-content-column {
+  inline-size: 100%;
+  max-inline-size: var(--md-sys-layout-content-max);
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-24);
+}
+
+.m3-content-wide {
+  inline-size: 100%;
+  max-inline-size: var(--md-sys-layout-wide-max);
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-24);
+}
+
+@media (max-width: 599px) {
+  .m3-main-content {
+    padding: var(--md-sys-space-16) var(--md-sys-space-16)
+      /* Space for the fixed bottom navigation bar. */
+      calc(var(--md-sys-layout-nav-bar-height) + var(--md-sys-space-24));
+  }
+}
+
+@media (min-width: 600px) and (max-width: 839px) {
+  .m3-main-content {
+    padding: var(--md-sys-space-20) var(--md-sys-space-20) var(--md-sys-space-48);
+  }
+}
+
+/* ==========================================================================
+   View sections + shared page furniture
+   ========================================================================== */
+
+.m3-view-section {
+  display: none;
+}
+
+.m3-view-section.active {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-24);
+  /* The grids inside query this element's inline size, so the layout responds
+     to the navigation changing shape and not only to the window. */
+  container-type: inline-size;
+}
+
+/* Shared-axis enter transition; staggered children follow. */
+.m3-view-section.active > * {
+  animation: m3e-view-enter var(--md-sys-motion-duration-medium4)
+    var(--md-sys-motion-easing-emphasized-decelerate) both;
+}
+
+.m3-view-section.active > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+
+.m3-view-section.active > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+
+.m3-view-section.active > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+
+.m3-view-section.active > *:nth-child(n + 5) {
+  animation-delay: 160ms;
+}
+
+@keyframes m3e-view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Navigating in from the left/right shifts along the shared axis. */
+.m3-view-section.active.m3-view--forward > * {
+  animation-name: m3e-view-enter-forward;
+}
+
+.m3-view-section.active.m3-view--backward > * {
+  animation-name: m3e-view-enter-backward;
+}
+
+@keyframes m3e-view-enter-forward {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes m3e-view-enter-backward {
+  from {
+    opacity: 0;
+    transform: translateX(-24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.m3-section-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-20);
+  flex-wrap: wrap;
+}
+
+.m3-section-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  min-inline-size: 0;
+}
+
+.m3-section-title-group h2 {
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--md-sys-typescale-headline-small-size);
+  line-height: var(--md-sys-typescale-headline-small-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-regular);
+}
+
+.m3-section-title-group p {
+  color: var(--md-sys-color-on-surface-variant);
+  max-inline-size: 68ch;
+}
+
+.m3-section-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+/* ==========================================================================
+   Metric grid
+   Container queries rather than viewport queries, so the grid responds to the
+   navigation changing shape instead of only to the window.
+   ========================================================================== */
+
+.m3-metric-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--md-sys-space-16);
+}
+
+@container (min-width: 480px) {
+  .m3-metric-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@container (min-width: 900px) {
+  .m3-metric-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  /* Bento emphasis: the two primary metrics span two columns. */
+  .m3-metric-card--primary {
+    grid-column: span 2;
+  }
+}
+
+.m3-metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-12);
+  padding: var(--md-sys-space-20);
+  background-color: var(--md-sys-color-surface-container);
+  border-radius: var(--md-sys-shape-corner-medium);
+  transition: background-color var(--md-sys-motion-duration-medium2)
+    var(--md-sys-motion-easing-standard);
+}
+
+.m3-metric-card:hover {
+  background-color: var(--md-sys-color-surface-container-high);
+}
+
+.m3-metric-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-12);
+}
+
+.m3-metric-label {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.m3-metric-icon {
+  inline-size: 44px;
+  block-size: 44px;
+  flex: none;
+  border-radius: var(--md-sys-shape-corner-large);
+  background-color: var(--md-sys-color-surface-container-highest);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-sys-color-primary);
+}
+
+.m3-metric-value {
+  font-size: var(--md-sys-typescale-display-small-size);
+  line-height: var(--md-sys-typescale-display-small-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-regular);
+  letter-spacing: var(--md-sys-typescale-display-small-tracking);
+  color: var(--md-sys-color-on-surface);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* The account metric can hold an email, so it needs to wrap smaller. */
+.m3-metric-value--compact {
+  font-size: var(--md-sys-typescale-title-large-size);
+  line-height: var(--md-sys-typescale-title-large-line);
+}
+
+.m3-metric-support {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ==========================================================================
+   Accounts
+   ========================================================================== */
+
+.m3-accounts-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--md-sys-space-16);
+}
+
+@container (min-width: 640px) {
+  .m3-accounts-grid {
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  }
+}
+
+.m3-account-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--md-sys-color-surface-container-low);
+  position: relative;
+  overflow: hidden;
+}
+
+/* "Currently active" reads as a tonal surface plus a leading indicator,
+   instead of the previous glow shadow. */
+.m3-account-card.active {
+  background-color: var(--md-sys-color-surface-container);
+  border-color: var(--md-sys-color-primary);
+}
+
+.m3-account-card.active::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0;
+  inset-block: 0;
+  inline-size: 3px;
+  background-color: var(--md-sys-color-primary);
+}
+
+.m3-account-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-12);
+}
+
+.m3-account-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  min-inline-size: 0;
+}
+
+.m3-account-name {
+  font-size: var(--md-sys-typescale-title-medium-size);
+  line-height: var(--md-sys-typescale-title-medium-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-medium);
+  letter-spacing: var(--md-sys-typescale-title-medium-tracking);
+  overflow-wrap: anywhere;
+}
+
+.m3-account-badges {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-account-metrics-box {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+  background-color: var(--md-sys-color-surface-container-lowest);
+  padding: var(--md-sys-space-16);
+  border-radius: var(--md-sys-shape-corner-small);
+}
+
+.m3-account-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  margin-block-start: auto;
+  flex-wrap: wrap;
+}
+
+.m3-account-actions .m3-account-actions__spacer {
+  margin-inline-start: auto;
+}
+
+/* ==========================================================================
+   Providers and models
+   ========================================================================== */
+
+.m3-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+}
+
+.m3-provider-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--md-sys-color-surface-container-low);
+}
+
+.m3-provider-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-16);
+  flex-wrap: wrap;
+}
+
+.m3-provider-identity {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  min-inline-size: 0;
+}
+
+.m3-provider-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-provider-name {
+  font-size: var(--md-sys-typescale-title-large-size);
+  line-height: var(--md-sys-typescale-title-large-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-regular);
+  letter-spacing: var(--md-sys-typescale-title-large-tracking);
+}
+
+.m3-provider-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-8);
+}
+
+.m3-model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--md-sys-space-16);
+  padding: var(--md-sys-space-12) var(--md-sys-space-16);
+  background-color: var(--md-sys-color-surface-container-lowest);
+  border-radius: var(--md-sys-shape-corner-small);
+  flex-wrap: wrap;
+}
+
+.m3-model-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  min-inline-size: 0;
+  flex: 1;
+}
+
+.m3-model-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-model-name {
+  font-size: var(--md-sys-typescale-title-small-size);
+  line-height: var(--md-sys-typescale-title-small-line);
+  font-weight: var(--md-sys-typescale-weight-emphasized-medium);
+}
+
+.m3-model-tags {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-model-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--md-sys-space-4);
+  flex: none;
+}
+
+/* Discover panel: expands with a spring rather than toggling display. */
+.m3-discover {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows var(--md-sys-motion-spring-slow-spatial-duration)
+      var(--md-sys-motion-spring-slow-spatial),
+    opacity var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard);
+}
+
+.m3-discover[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.m3-discover__inner {
+  overflow: hidden;
+  min-block-size: 0;
+}
+
+.m3-discover__body {
+  margin-block-start: var(--md-sys-space-16);
+  padding: var(--md-sys-space-16);
+  border-radius: var(--md-sys-shape-corner-small);
+  background-color: var(--md-sys-color-surface-container);
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-12);
+}
+
+.m3-discover__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-12);
+  flex-wrap: wrap;
+}
+
+.m3-discover__items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-4);
+  max-block-size: 260px;
+  overflow-y: auto;
+}
+
+.m3-discover__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--md-sys-space-8);
+  padding-block-start: var(--md-sys-space-12);
+  border-block-start: 1px solid var(--md-sys-color-outline-variant);
+}
+
+/* ==========================================================================
+   Settings
+   ========================================================================== */
+
+.m3-settings-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-24);
+  max-inline-size: 900px;
+}
+
+.m3-settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+}
+
+.m3-settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-20);
+}
+
+.m3-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
+.m3-settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-8);
+}
+
+.m3-settings-row__label {
+  color: var(--md-sys-color-on-surface);
+}
+
+.m3-settings-hint {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ==========================================================================
+   Overview page specifics
+   ========================================================================== */
+
+.m3-quick-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--md-sys-space-16);
+}
+
+@container (min-width: 560px) {
+  .m3-quick-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.m3-quick-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-8);
+}
+
+.m3-quick-card__body {
+  color: var(--md-sys-color-on-surface-variant);
+  margin-block-end: var(--md-sys-space-8);
+}
+
+.m3-quick-card .m3-btn {
+  align-self: flex-start;
+  margin-block-start: auto;
+}
+
+.m3-usage-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--md-sys-space-20);
+}
+
+@container (min-width: 560px) {
+  .m3-usage-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@container (min-width: 900px) {
+  .m3-usage-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+.m3-quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--md-sys-space-16);
+}
+
+.m3-quota-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--md-sys-space-16);
+  flex-wrap: wrap;
+}
+
+.m3-quota-note {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ==========================================================================
+   Print
+   ========================================================================== */
+
+@media print {
+  .m3-navigation,
+  .m3-top-app-bar,
+  .m3-section-actions,
+  .m3-account-actions,
+  .m3-provider-actions,
+  .m3-model-actions,
+  .m3-snackbar {
+    display: none !important;
+  }
+
+  .m3-main-content {
+    padding: 0;
+  }
+
+  .m3-view-section {
+    display: flex !important;
+    flex-direction: column;
+    gap: var(--md-sys-space-16);
+  }
+
+  .m3-card {
+    break-inside: avoid;
+  }
+}
