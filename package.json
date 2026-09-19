@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "check:panel": "node scripts/check-panel-tokens.js && node scripts/check-panel-auth.js && node scripts/check-csp-identical.js",
+    "verify:panel": "node tools/panel-verify/run.mjs"
   },
   "author": {
     "name": "Codex MultiProvider Contributors",
@@ -26,7 +28,15 @@
     "files": [
       "apps/electron/**/*",
       "apps/panel/**/*",
-      "assets/**/*"
+      "assets/**/*",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "extraResources": [
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      }
     ],
     "win": {
       "target": [
@@ -37,6 +47,10 @@
         {
           "from": "target/release/codex-mp.exe",
           "to": "bin/codex-mp.exe"
+        },
+        {
+          "from": "THIRD_PARTY_NOTICES.md",
+          "to": "THIRD_PARTY_NOTICES.md"
         }
       ]
     },
@@ -59,6 +73,10 @@
         {
           "from": "target/release/codex-mp",
           "to": "bin/codex-mp"
+        },
+        {
+          "from": "THIRD_PARTY_NOTICES.md",
+          "to": "THIRD_PARTY_NOTICES.md"
         }
       ]
     },
@@ -74,13 +92,21 @@
         {
           "from": "target/release/codex-mp",
           "to": "bin/codex-mp"
+        },
+        {
+          "from": "THIRD_PARTY_NOTICES.md",
+          "to": "THIRD_PARTY_NOTICES.md"
         }
       ]
     },
     "deb": {
       "packageCategory": "utils",
       "priority": "optional",
-      "afterRemove": "installer/linux/deb/postrm"
+      "afterRemove": "installer/linux/deb/postrm",
+      "fpm": [
+        "--before-remove",
+        "installer/linux/deb/prerm"
+      ]
     }
   }
 }

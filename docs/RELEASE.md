@@ -16,7 +16,7 @@
 
 发布 job 会在创建 Release 前检查附件矩阵：
 
-- Windows：原生 Inno Setup `*-setup.exe`，另附 portable `.zip`；
+- Windows：electron-builder **NSIS** `*-setup.exe`，另附 portable `.zip`；
 - macOS：Intel `x86_64` 和 Apple Silicon `aarch64` 两个 `.dmg`，另附 portable `.tar.gz`；
 - Linux：`.deb` 和 x86_64 `.AppImage`，另附 portable `.tar.gz`；
 - `SHA256SUMS`：由发布 job 对全部附件生成。
@@ -34,4 +34,9 @@ bash -n scripts/build-deb.sh scripts/build-appimage.sh scripts/build-dmg.sh
 ```
 
 AppImage 需要本机安装 `appimagetool`，macOS DMG 需要在对应 macOS runner 上由
-`hdiutil` 生成；Windows Setup.exe 由 CI 安装 Inno Setup 后生成。
+`hdiutil` 生成；Windows `*-setup.exe` 由 electron-builder 的 NSIS target 生成
+（见根目录 `package.json` 的 `build.nsis`），不使用 Inno Setup。
+
+> 注意：`scripts/build-*.sh` 是**本地/离线**打包脚本，CI 的发布产物由
+> electron-builder 生成，两者内容并不完全一致（例如 `.deb` 的 prerm/postrm 钩子）。
+> 修改打包行为时请同时检查这两条路径。

@@ -1,0 +1,41 @@
+# Normalize line endings in the repository.
+#
+# The project ships POSIX shell installers for Linux/macOS. If those files are
+# committed with CRLF endings they fail on the target platform with
+# "\r: command not found" / "syntax error near unexpected token", so shell
+# scripts are pinned to LF regardless of the contributor's platform.
+* text=auto eol=lf
+
+# POSIX shell / service units / desktop entries
+*.sh text eol=lf
+*.bash text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+*.plist text eol=lf
+*.desktop text eol=lf
+
+# Windows-native tooling
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.nsh text eol=crlf
+*.iss text eol=crlf
+
+# Binary assets must never be touched
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+
+# Lockfiles: keep them stable and diff-friendly
+Cargo.lock text eol=lf
+package-lock.json text eol=lf
+
+# Patch files are applied with `git apply`, which is whitespace sensitive.
+*.patch text eol=lf

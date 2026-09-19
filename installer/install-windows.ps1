@@ -114,9 +114,14 @@ if (Test-Path -LiteralPath $routerServiceUninstaller -PathType Leaf) {
 
 if ($InstallRouterService.IsPresent -or $env:CODEX_MP_INSTALL_SERVICE -eq "1") {
     $serviceInstallerScript = Join-Path $InstallDir "codex-mp-router-service-install.ps1"
-    if (Test-Path -LiteralPath $serviceInstallerScript -PathType Leaf) {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $serviceInstallerScript -InstallDir $InstallDir -CliBinary $cliDestination
+    if (-not (Test-Path -LiteralPath $serviceInstallerScript -PathType Leaf)) {
+        throw "router service installer is missing: $serviceInstallerScript"
     }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $serviceInstallerScript -InstallDir $InstallDir -CliBinary $cliDestination
+    # A native process exit is not an exception, so $ErrorActionPreference = "Stop"
+    # (line 10) does not cover this call. Without the check a failed service
+    # install is swallowed and the script still prints "installed ..." with exit 0.
+    if ($LASTEXITCODE -ne 0) { throw "router service installation failed with exit code $LASTEXITCODE" }
 }
 
 if ($InstallPatched) {

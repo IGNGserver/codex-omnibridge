@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$InstallDir = "$(Join-Path $env:LOCALAPPDATA 'CodexMultiProvider\bin')"
+    [string]$InstallDir = "$(Join-Path $env:LOCALAPPDATA 'CodexMultiProvider\bin')",
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,10 +10,6 @@ $CliBinary = Join-Path $InstallDir "codex-mp.exe"
 $Uninstaller = Join-Path $InstallDir "codex-mp-uninstall.ps1"
 $RouterServiceUninstaller = Join-Path $InstallDir "codex-mp-router-service-uninstall.ps1"
 $Manifest = Join-Path $InstallDir ".codex-mp-install-manifest"
-
-if (Test-Path -LiteralPath $RouterServiceUninstaller -PathType Leaf) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $RouterServiceUninstaller -ErrorAction SilentlyContinue
-}
 
 $InstallRoot = ([System.IO.Path]::GetFullPath($InstallDir)).TrimEnd([char[]]@('\', '/'))
 $InstallRootPrefix = "$InstallRoot$([System.IO.Path]::DirectorySeparatorChar)"
@@ -26,13 +24,23 @@ function Test-OwnedInstallPath([string]$Path) {
     return $FullPath.StartsWith($InstallRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
-if (-not (Test-Path -LiteralPath $CliBinary -PathType Leaf)) {
-    throw "$CliBinary is missing; refusing to remove Codex integration"
+# Stop and unregister the router service first so no running process keeps the
+# binaries locked. This step is best-effort: it must never abort the cleanup.
+if (Test-Path -LiteralPath $RouterServiceUninstaller -PathType Leaf) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $RouterServiceUninstaller
 }
 
-& $CliBinary uninstall @args
-if ($LASTEXITCODE -ne 0) {
-    throw "codex-mp uninstall failed with exit code $LASTEXITCODE"
+# A half-finished or partially removed install is exactly the case the manifest
+# exists for, so never abort just because the CLI binary is gone: degrade to
+# manifest-driven cleanup instead.
+if (Test-Path -LiteralPath $CliBinary -PathType Leaf) {
+    & $CliBinary uninstall @RemainingArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "codex-mp uninstall failed with exit code $LASTEXITCODE; continuing with file cleanup"
+    }
+} else {
+    Write-Warning "$CliBinary is missing; skipping Codex integration restore"
+    Write-Warning "re-install codex-mp and run 'codex-mp uninstall' to restore config.toml"
 }
 
 if (Test-Path -LiteralPath $Manifest -PathType Leaf) {
