@@ -77,8 +77,23 @@ for (const vp of WIDTHS) {
 
   // Content must not hide behind a fixed bottom navigation bar.
   if (vp.w < 600) {
+    // `html { scroll-behavior: smooth }` makes `scrollTo` animate. A fixed
+    // timeout measured the page mid-scroll on slower machines (Chromium headless
+    // shell on CI reported a 40px overlap that never existed), so wait until the
+    // scroll position actually stops changing instead of guessing a delay.
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(400);
+    // Poll `evaluate` rather than `waitForFunction`: the panel's CSP is
+    // `script-src 'self'`, and `waitForFunction` serialises its predicate into a
+    // string that is then evaluated as script, which the CSP blocks.
+    {
+      let previous = -1;
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        const y = await page.evaluate(() => Math.round(window.scrollY));
+        if (y === previous) break;
+        previous = y;
+        await page.waitForTimeout(100);
+      }
+    }
     const overlap = await page.evaluate(() => {
       const navTop = document.querySelector("#app-navigation").getBoundingClientRect().top;
       const cards = [...document.querySelectorAll(".m3-view-section.active .m3-card")];

@@ -105,7 +105,7 @@ impl DesktopPaths {
 
         #[cfg(windows)]
         {
-            return discover_windows(codex_home);
+            discover_windows(codex_home)
         }
 
         #[cfg(not(windows))]
@@ -908,7 +908,7 @@ fn release_dir_for_entrypoint(bin_dir: &Path) -> Result<PathBuf, DesktopError> {
                 .map(Path::to_path_buf)
                 .ok_or_else(|| DesktopError::InvalidPath(bin_dir.display().to_string()));
         }
-        return Ok(bin_dir.to_path_buf());
+        Ok(bin_dir.to_path_buf())
     }
     #[cfg(target_os = "macos")]
     {
@@ -918,10 +918,10 @@ fn release_dir_for_entrypoint(bin_dir: &Path) -> Result<PathBuf, DesktopError> {
         if contents.file_name().and_then(|name| name.to_str()) != Some("Contents") {
             return Ok(contents.to_path_buf());
         }
-        return contents
+        contents
             .parent()
             .map(Path::to_path_buf)
-            .ok_or_else(|| DesktopError::InvalidPath(contents.display().to_string()));
+            .ok_or_else(|| DesktopError::InvalidPath(contents.display().to_string()))
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -940,7 +940,7 @@ fn version_for_release(release_dir: &Path) -> Result<String, DesktopError> {
         .ok_or_else(|| DesktopError::InvalidPath(release_dir.display().to_string()))?;
     #[cfg(target_os = "macos")]
     {
-        return Ok(name.strip_suffix(".app").unwrap_or(name).to_owned());
+        Ok(name.strip_suffix(".app").unwrap_or(name).to_owned())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1399,7 +1399,7 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
             return Ok(None);
         }
         let text = String::from_utf8_lossy(&output.stdout);
-        return Ok(text.lines().find_map(|line| {
+        Ok(text.lines().find_map(|line| {
             let mut fields = line
                 .trim()
                 .splitn(3, char::is_whitespace)
@@ -1410,7 +1410,7 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
             }
             fields.next()?;
             Some(PathBuf::from(fields.next()?))
-        }));
+        }))
     }
     #[cfg(target_os = "macos")]
     {
@@ -1421,7 +1421,7 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
             return Ok(None);
         }
         let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        return Ok((!value.is_empty()).then(|| PathBuf::from(value)));
+        Ok((!value.is_empty()).then(|| PathBuf::from(value)))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
