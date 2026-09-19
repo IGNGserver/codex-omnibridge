@@ -12,10 +12,17 @@
 - 在同一个对话里，想中途换一个模型解答或补充，必须新建会话甚至改坏本地配置。
 
 **Codex OmniBridge 正是为此而生：**
-1. **官方账号路径保持不变**：项目不读取、不修改 OAuth 或 `auth.json`；stock Codex 只配置一个 `omnibridge` Responses provider，官方请求由 Router 安全透传到官方 backend；
+1. **官方模型路径保持不变**：stock Codex 只配置一个 `omnibridge` Responses provider，官方请求由 Router 原样透传到官方 backend，官方 Authorization、reasoning、hosted tools 与生图能力都不经过第三方兼容层；
 2. **同对话切模型**：同一 Thread 的每轮 `model` 由 Router 按 registry 精确 route，可在官方和自定义模型之间切换；本地 stock app-server 的 official→custom→official fixture E2E 已通过，Remote Control 仍按合同单独验收；
-3. **安全钥匙箱托管**：默认使用系统安全的钥匙串，绝不向官方泄露；无桌面钥匙串的 headless fallback 需要按部署环境单独评估，不能等同于系统钥匙串；
-4. **内置嵌入式 Web 面板与远程访问**：单文件即可启动 Web 控制面板，用户可在网页端进行全量配置；支持密码保护及一键开启外网/局域网访问，实现多设备远程操控。
+3. **安全钥匙箱托管**：第三方 Provider 的 API Key 与托管账号的 OAuth 令牌都只存在系统钥匙串中，不写入 `providers.json` / `accounts.json` 等普通文件，也绝不随请求转发给第三方；
+4. **内置嵌入式 Web 面板与远程访问**：单文件即可启动 Web 控制面板，用户可在网页端进行全量配置；支持密码保护及一键开启外网/局域网访问，实现多设备远程操控；
+5. **M3 Expressive 界面**：面板按 Material 3 Expressive 规范构建——弹簧物理动效与形态变形、五档按钮尺寸、强调字阶、色调表面与自适应导航（窄屏底部导航栏 / 中屏导航轨道 / 宽屏抽屉），并内置浅色、深色、跟随系统三种主题与标准/高对比度、完整/减弱动效偏好。
+
+> **关于 `auth.json` 的准确说明**：本项目的账号管理功能（Web 面板的「账号」页）会读取
+> `~/.codex/auth.json` 以显示当前登录账号，并在你**主动点击切换账号**时备份并改写它。
+> 除此之外，安装、同步、路由与卸载流程都不读写 `auth.json`；Profile 中的
+> `model_provider` 由本项目管理，`auth.json` 的 OAuth 令牌永远不会被发送给任何第三方
+> Provider。
 
 ---
 
@@ -34,10 +41,62 @@ codex-mp web start
 # 为 Web 面板设置访问密码（设置后支持开启外网/局域网访问）
 codex-mp web password "你的安全密码"
 
-# 开启外网/局域网访问（绑定 0.0.0.0）
+# 开启外网/局域网访问（绑定 0.0.0.0；必须先设置访问密码，否则会拒绝启动）
 codex-mp web remote --enable
 ```
 在浏览器中打开 `http://localhost:31828`（或远程设备打开 `http://<主机IP>:31828`）即可直观管理！
+
+> **⚠️ 远程访问安全说明**
+> 面板通过**明文 HTTP** 提供服务，没有 TLS。开启远程访问后，访问密码与所有请求内容
+> 都会以明文经过网络，任何能读取该流量的人都可以接管面板。
+> - 请**只**在可信内网中开启；开启时命令会再次打印安全警告。
+> - 需要跨公网访问时，请保持远程访问**关闭**，改用隧道：
+>   `ssh -L 31828:127.0.0.1:31828 <主机>`，然后在本地打开 `http://localhost:31828`。
+> - 未设置密码时无法开启 0.0.0.0 绑定；登录接口带失败次数限流，连续失败会被临时拒绝。
+
+### 面板界面资源（开发者）
+
+面板是零依赖的本地 SPA，静态资源位于 `apps/panel/`，由 `crates/web` 通过
+`RustEmbed` 内嵌、同时被 electron-builder 打包。两条分发路径共用同一份文件。
+
+字体与图标均为**自托管**（`apps/panel/fonts/`）。这不是风格选择，而是必需：
+Electron 以 `file://` 加载面板，离线时 CDN 字体不可用，且自托管才能让 CSP 的
+`font-src` 保持 `'self'`、不引入任何第三方源。
+
+| 文件 | 体积 | 覆盖 |
+|---|---|---|
+| `roboto-flex-latin*.woff2` | 143 KB | Roboto Flex 可变字体，Latin + Latin Ext |
+| `noto-sans-sc.woff2` | 1020 KB | Noto Sans SC，GB2312 一级字库（3755 常用汉字） |
+| `material-symbols-outlined.woff2` | 36 KB | 图标字形子集（原 3.9 MB） |
+
+三者均保留 `wght` 可变轴，因此强调字阶（500/700）对中英文一并生效。
+`Noto Sans SC` 按 `unicode-range` 限定在 CJK 区段，`Roboto Flex` 在前——所以
+「Plus 主号」这类混排字符串的拉丁部分仍走 Roboto Flex，不会整串退化。
+
+```bash
+# 重新生成字体（需要 fonttools + brotli，且需要联网）
+# 仅在图标集合或 CJK 覆盖范围变化时需要运行
+./scripts/build-panel-fonts.sh
+
+# 重新渲染品牌图标（assets/icon.svg -> assets/icon.png 与面板 favicon）
+node scripts/build-icons.mjs
+
+# 设计令牌纪律检查：语义层不得出现裸色值、基线字阶不得超过 500 字重、
+# 必需的自托管字体与 Expressive 令牌必须存在
+node scripts/check-panel-tokens.js
+```
+
+面板另有一套真实浏览器验证套件（结构 / 对比度 / 功能），见
+`tools/panel-verify/README.md`：
+
+```bash
+npm i -D playwright && npx playwright install --with-deps chromium
+node tools/panel-verify/run.mjs
+```
+
+> 新增图标时，请同时更新 `scripts/build-panel-fonts.sh` 中的 `ICONS` 列表并重跑，
+> 然后在 `apps/panel/icons.css` 中使用生成的 `.m3-i-*` 类。图标以**码点类**而非连字名
+> 寻址：连字会在上游重命名图标时静默失效（本轮重写就因此丢失过两个图标）。
 
 ### 2. 添加你的 AI 模型
 无论在 Web 面板还是终端命令行，只需简单三步：
@@ -125,16 +184,20 @@ codex-mp provider fetch-models newapi --add qwen3.8
 # 3. 同步至 Codex
 codex-mp sync
 
-# 旧 thread 的显式迁移（不会改写 rollout/history 文件）
-codex-mp resume --through-omnibridge <SESSION_ID>
-
-# 4. 安装远端常驻 Router（仅安装 unit；按需设置 CODEX_MP_ENABLE_SERVICE=1 启动）
+# 4. 启动（或安装）Router —— resume 与自定义模型都需要它先运行
+codex-mp launch                      # 随 Codex 启动一个临时 Router
+# 或：安装远端常驻 Router（仅安装 unit；按需设置 CODEX_MP_ENABLE_SERVICE=1 启动）
 codex-mp-router-service-install
+
+# 5. 旧 thread 的显式迁移（不会改写 rollout/history 文件）
+#    前置条件：上一步的 Router 必须已经在 config.toml 指定的端口上监听，
+#    否则 `resume` 会直接报错并提示如何启动（不会静默连到空端口）。
+codex-mp resume --through-omnibridge <SESSION_ID>
 ```
 
 Linux 远端常驻 Router：先在远端完成 `codex-mp sync`，再执行
 `codex-mp-router-service-install`。服务使用稳定 loopback 端口和 registry
-派生的 capability/config，不复制或修改 `auth.json`。Remote Control 必须连接
+派生的 capability/config，不读写 `auth.json`。Remote Control 必须连接
 这台远端 stock app-server；本地 Desktop 不安装旧 Core patch。
 
 `installer/install-router-service.sh` 与

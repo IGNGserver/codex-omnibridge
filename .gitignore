@@ -1,8 +1,13 @@
 /target
-/apps/panel/src-tauri/target
 /dist
 /node_modules
 .env
 *.tmp
 *.json.tmp
 *.toml.tmp
+
+# Local agent-tooling state; not part of the product.
+/.commandcode/
+
+# Screenshots produced by tools/panel-verify/run.mjs
+/panel-verify-shots/
