@@ -1,6 +1,10 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
-use super::codex_chat_common::{is_empty_value, response_item_call_id};
+use super::codex_chat_common::{is_absent_value, response_item_call_id};
 use crate::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -8,6 +12,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Callback invoked with each response id the bridge observes.
+pub(crate) type ResponseIdCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 const MAX_CACHED_RESPONSES: usize = 512;
 
@@ -151,10 +158,10 @@ impl CodexChatHistoryStore {
             match item.get("type").and_then(|value| value.as_str()) {
                 Some(item_type) if is_call_item_type(item_type) => {
                     if let Some(call_id) = response_item_call_id(&item) {
-                        if let Some(cached) = lookup.call(&call_id) {
-                            if enrich_call_item_from_cache(&mut item, cached) {
-                                enriched += 1;
-                            }
+                        if let Some(cached) = lookup.call(&call_id)
+                            && enrich_call_item_from_cache(&mut item, cached)
+                        {
+                            enriched += 1;
                         }
                         seen_call_ids.insert(call_id);
                     }
@@ -169,16 +176,14 @@ impl CodexChatHistoryStore {
                         }
                     }
 
-                    if let Some(call_id) = response_item_call_id(&item) {
-                        if !seen_call_ids.contains(&call_id)
-                            && !restore_group_ids.contains(&call_id)
-                        {
-                            if let Some(cached) = lookup.call(&call_id).cloned() {
-                                seen_call_ids.insert(call_id);
-                                new_items.push(cached);
-                                restored += 1;
-                            }
-                        }
+                    if let Some(call_id) = response_item_call_id(&item)
+                        && !seen_call_ids.contains(&call_id)
+                        && !restore_group_ids.contains(&call_id)
+                        && let Some(cached) = lookup.call(&call_id).cloned()
+                    {
+                        seen_call_ids.insert(call_id);
+                        new_items.push(cached);
+                        restored += 1;
                     }
                     new_items.push(item);
                 }
@@ -187,7 +192,11 @@ impl CodexChatHistoryStore {
         }
 
         let changed = restored + enriched;
-        if changed == 0 && original_was_object && new_items.len() == 1 {
+        // Keep the caller's shape.  Rewriting a single-object `input` into a
+        // one-element array mutates the request shape Codex sent, and callers
+        // that re-read `input` as an object then see an array.  Only a change
+        // that actually adds items forces the array form.
+        if original_was_object && new_items.len() == 1 {
             *input = new_items.into_iter().next().unwrap_or(Value::Null);
         } else {
             *input = Value::Array(new_items);
@@ -376,7 +385,7 @@ pub fn record_responses_sse_stream(
 pub fn record_responses_sse_stream_with_callback(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     history: Arc<CodexChatHistoryStore>,
-    callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    callback: Option<ResponseIdCallback>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -409,7 +418,7 @@ async fn inspect_sse_block(
     block: &str,
     current_response_id: &mut Option<String>,
     history: &CodexChatHistoryStore,
-    callback: Option<&Arc<dyn Fn(&str) + Send + Sync>>,
+    callback: Option<&ResponseIdCallback>,
 ) {
     if block.trim().is_empty() {
         return;
@@ -497,10 +506,10 @@ fn enrich_call_item_from_cache(item: &mut Value, cached: &Value) -> bool {
         "reasoning_content",
         "reasoning",
     ] {
-        if item.get(key).is_some_and(|value| !is_empty_value(value)) {
+        if item.get(key).is_some_and(|value| !is_absent_value(value)) {
             continue;
         }
-        let Some(value) = cached.get(key).filter(|value| !is_empty_value(value)) else {
+        let Some(value) = cached.get(key).filter(|value| !is_absent_value(value)) else {
             continue;
         };
         if let Some(object) = item.as_object_mut() {
@@ -878,5 +887,102 @@ mod tests {
 
         assert_eq!(history.enrich_request(&mut request).await, 1);
         assert_eq!(request["input"][0]["reasoning_content"], "Need a file.");
+    }
+
+    /// Hydration must keep the caller's `input` shape: an object that only had
+    /// fields enriched in place is still one object, not a one-element array.
+    #[tokio::test]
+    async fn enrich_request_keeps_object_input_shape_when_enriching_in_place() {
+        let history = CodexChatHistoryStore::default();
+        history
+            .record_response(&json!({
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                ]
+            }))
+            .await;
+
+        let mut request = json!({
+            "previous_response_id": "resp_1",
+            "input": {"type": "function_call", "call_id": "call_1"}
+        });
+
+        assert_eq!(history.enrich_request(&mut request).await, 1);
+        assert!(
+            request["input"].is_object(),
+            "single-object input must stay an object, got {}",
+            request["input"]
+        );
+        assert_eq!(request["input"]["name"], "read_file");
+        assert_eq!(request["input"]["arguments"], "{\"path\":\"README.md\"}");
+    }
+
+    /// A value the client actually sent is not "missing": `arguments: {}` and
+    /// `input: []` must survive hydration instead of being replaced from cache.
+    #[tokio::test]
+    async fn enrich_request_does_not_overwrite_explicit_empty_values() {
+        let history = CodexChatHistoryStore::default();
+        history
+            .record_response(&json!({
+                "id": "resp_1",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}",
+                        "reasoning_content": "Need to inspect the file."
+                    }
+                ]
+            }))
+            .await;
+
+        let mut request = json!({
+            "previous_response_id": "resp_1",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "arguments": {},
+                    "reasoning_content": "",
+                    "input": []
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        // `name` is genuinely absent, so it is still filled from cache and the
+        // call counts as one enrichment. What must NOT happen is the explicitly
+        // supplied empty values being treated as absent and overwritten.
+        assert_eq!(history.enrich_request(&mut request).await, 1);
+        let input = request["input"].as_array().unwrap();
+        assert_eq!(
+            input[0]["name"], "read_file",
+            "a genuinely missing field must still be hydrated"
+        );
+        assert_eq!(
+            input[0]["arguments"],
+            json!({}),
+            "explicitly empty arguments must not be replaced from cache"
+        );
+        assert_eq!(
+            input[0]["reasoning_content"], "",
+            "explicitly empty reasoning_content must not be replaced from cache"
+        );
+        assert_eq!(
+            input[0]["input"],
+            json!([]),
+            "explicitly empty input must not be replaced from cache"
+        );
     }
 }

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 codex-mp-core = { path = "../core" }
 directories.workspace = true
 serde.workspace = true

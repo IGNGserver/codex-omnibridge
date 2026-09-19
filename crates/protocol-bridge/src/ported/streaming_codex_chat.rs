@@ -1,4 +1,8 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
 //! OpenAI Chat Completions SSE → OpenAI Responses SSE conversion.
 
@@ -9,8 +13,9 @@ use super::{
     },
     transform_codex_chat::{
         CodexToolContext, chat_usage_to_responses_usage, custom_tool_input_from_chat_arguments,
-        response_id_from_chat_id, response_status_from_finish_reason,
-        response_tool_call_item_from_chat_name, response_tool_call_item_id_from_chat_name,
+        incomplete_reason_from_finish_reason, response_id_from_chat_id,
+        response_status_from_finish_reason, response_tool_call_item_from_chat_name,
+        response_tool_call_item_id_from_chat_name,
     },
 };
 use crate::json_canonical::canonicalize_tool_arguments_str;
@@ -122,10 +127,15 @@ impl ChatToResponsesState {
         if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
             self.response_id = response_id_from_chat_id(Some(id));
         }
-        if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
-            if !model.is_empty() {
-                self.model = model.to_string();
-            }
+        // `self.model` is seeded with the *logical* model id the client asked
+        // for, so an upstream chunk may only refine it while that seed is empty.
+        // Overwriting it unconditionally leaked the provider's private upstream
+        // model name into events Codex correlates by requested model id.
+        if self.model.is_empty()
+            && let Some(model) = chunk.get("model").and_then(|v| v.as_str())
+            && !model.is_empty()
+        {
+            self.model = model.to_string();
         }
         if let Some(created) = chunk.get("created").and_then(|v| v.as_u64()) {
             self.created_at = created;
@@ -151,10 +161,10 @@ impl ChatToResponsesState {
                 self.append_reasoning_to_active_tools(&reasoning);
             }
 
-            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-                if !content.is_empty() {
-                    events.extend(self.push_content_delta(content));
-                }
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                && !content.is_empty()
+            {
+                events.extend(self.push_content_delta(content));
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -405,24 +415,23 @@ impl ChatToResponsesState {
 
         {
             let state = self.tools.entry(chat_index).or_default();
-            if let Some(ref id) = id_delta {
-                if !id.is_empty() {
-                    state.call_id.clone_from(id);
-                }
+            if let Some(ref id) = id_delta
+                && !id.is_empty()
+            {
+                state.call_id.clone_from(id);
             }
-            if let Some(ref name) = name_delta {
-                if !name.is_empty() {
-                    state.name.clone_from(name);
-                }
+            if let Some(ref name) = name_delta
+                && !name.is_empty()
+            {
+                state.name.clone_from(name);
             }
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
             }
-            if state.reasoning_content.is_empty() {
-                if let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty())
-                {
-                    state.reasoning_content = reasoning.to_string();
-                }
+            if state.reasoning_content.is_empty()
+                && let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty())
+            {
+                state.reasoning_content = reasoning.to_string();
             }
 
             if state.added {
@@ -435,14 +444,15 @@ impl ChatToResponsesState {
         let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&current_name);
         let mut events = Vec::new();
 
-        if !args_delta.is_empty() && !is_custom_tool {
-            if let Some(output_index) = output_index {
-                events.push(sse::function_call_arguments_delta(
-                    output_index,
-                    &item_id,
-                    &args_delta,
-                ));
-            }
+        if !args_delta.is_empty()
+            && !is_custom_tool
+            && let Some(output_index) = output_index
+        {
+            events.push(sse::function_call_arguments_delta(
+                output_index,
+                &item_id,
+                &args_delta,
+            ));
         }
 
         events.extend(self.flush_ready_tool_calls());
@@ -577,8 +587,8 @@ impl ChatToResponsesState {
         }
 
         let mut response = self.base_response(status, self.completed_output_items());
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        if let Some(reason) = incomplete_reason_from_finish_reason(self.finish_reason.as_deref()) {
+            response["incomplete_details"] = json!({ "reason": reason });
         }
 
         events.push(sse::response_completed(&response));
@@ -811,23 +821,26 @@ fn leading_think_prefix_decision(buffer: &str) -> ThinkPrefixDecision {
 }
 
 /// Create a stream that converts Chat Completions SSE chunks into Responses SSE events.
-#[allow(dead_code)]
-pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'static>(
-    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
-    create_responses_sse_stream_from_chat_with_context(stream, CodexToolContext::default())
-}
-
 /// Create a stream that converts Chat Completions SSE chunks into Responses SSE
 /// events while restoring Codex tool namespace/custom/tool_search metadata.
-pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error + Send + 'static>(
+/// Seed the response `model` with the logical model id the client requested.
+/// response `model` with the logical model id the client requested.  Without
+/// that seed the state machine falls back to the upstream model name carried by
+/// the Chat chunks, which is not what Codex correlates on.
+pub(crate) fn create_responses_sse_stream_from_chat_with_model<
+    E: std::error::Error + Send + 'static,
+>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
+    logical_model: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut state = ChatToResponsesState::with_tool_context(tool_context);
+        if let Some(logical_model) = logical_model {
+            state.model = logical_model;
+        }
         let mut stream_failed = false;
 
         tokio::pin!(stream);
@@ -867,10 +880,29 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
 
                         let chunk: Value = match serde_json::from_str(&data) {
                             Ok(value) => value,
-                            Err(_) => continue,
+                            Err(error) => {
+                                // Dropping the frame silently used to let a turn
+                                // "complete" with content missing and no
+                                // diagnostic anywhere. Surface it instead.
+                                yield Ok(state.failed_event(
+                                    format!(
+                                        "Upstream sent a malformed SSE data frame: {error}; \
+                                         payload began with {:?}",
+                                        data.chars().take(120).collect::<String>()
+                                    ),
+                                    Some("upstream_sse_malformed".to_string()),
+                                ));
+                                stream_failed = true;
+                                break;
+                            }
                         };
 
-                        if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
+                        // `chunk.get("error").is_some()` is true for an explicit
+                        // `"error": null`, which used to abort the whole stream on
+                        // a benign placeholder field.
+                        if event_name.as_deref() == Some("error")
+                            || chunk.get("error").is_some_and(|value| !value.is_null())
+                        {
                             let (message, error_type) = extract_chat_sse_error(&chunk);
                             yield Ok(state.failed_event(message, error_type));
                             stream_failed = true;
@@ -954,7 +986,8 @@ mod tests {
             .map(|chunk| Ok(Bytes::copy_from_slice(chunk.as_bytes())))
             .collect();
         let upstream = stream::iter(chunks);
-        let converted = create_responses_sse_stream_from_chat_with_context(upstream, tool_context);
+        let converted =
+            create_responses_sse_stream_from_chat_with_model(upstream, tool_context, None);
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         String::from_utf8(bytes.concat()).unwrap()
     }
@@ -1442,7 +1475,11 @@ mod tests {
         let upstream = stream::iter(vec![Err::<Bytes, std::io::Error>(std::io::Error::other(
             "boom",
         ))]);
-        let converted = create_responses_sse_stream_from_chat(upstream);
+        let converted = create_responses_sse_stream_from_chat_with_model(
+            upstream,
+            CodexToolContext::default(),
+            None,
+        );
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         let output = String::from_utf8(bytes.concat()).unwrap();
 

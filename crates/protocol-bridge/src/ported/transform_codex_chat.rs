@@ -1,4 +1,8 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
 //! Codex Responses ↔ OpenAI Chat Completions conversion.
 //!
@@ -8,7 +12,7 @@
 
 use super::codex_chat_common::{
     append_reasoning_content, extract_reasoning_field_text, extract_reasoning_summary_text,
-    response_function_call_item, response_function_call_item_with_namespace,
+    response_function_call_item, response_function_call_item_with_namespace, response_item_call_id,
     split_leading_think_block,
 };
 use crate::CodexChatReasoningConfig;
@@ -32,7 +36,6 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "logit_bias",
     "logprobs",
     "metadata",
-    "n",
     "parallel_tool_calls",
     "presence_penalty",
     "response_format",
@@ -43,6 +46,47 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "top_logprobs",
     "user",
 ];
+
+/// Read a field from a request body, treating an explicit JSON `null` as absent.
+///
+/// `Value::get` returns `Some(&Value::Null)` for `"field": null`, so a plain
+/// `if let Some(v) = body.get(key)` forwards nulls verbatim. Strict
+/// OpenAI-compatible gateways reject `null` for numeric/enum fields.
+fn non_null<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
+    body.get(key).filter(|value| !value.is_null())
+}
+
+/// Map the Responses `text` object onto Chat Completions `response_format`.
+///
+/// The Responses API expresses structured output as
+/// `text: { format: { type: "json_schema", name, schema, strict } }`, while Chat
+/// Completions expects
+/// `response_format: { type: "json_schema", json_schema: { name, schema, strict } }`.
+/// Anything unrecognised returns `None` rather than emitting a malformed field.
+fn responses_text_format_to_chat(text: Option<&Value>) -> Option<Value> {
+    let format = text?.get("format")?;
+    let format_type = format.get("type").and_then(Value::as_str)?;
+    match format_type {
+        "json_schema" => {
+            // Tolerate both the nested (`json_schema: {...}`) and flat shapes.
+            let schema_body = format.get("json_schema").cloned().or_else(|| {
+                let name = format.get("name")?;
+                let schema = format.get("schema")?;
+                let mut body = serde_json::Map::new();
+                body.insert("name".into(), name.clone());
+                body.insert("schema".into(), schema.clone());
+                if let Some(strict) = format.get("strict") {
+                    body.insert("strict".into(), strict.clone());
+                }
+                Some(Value::Object(body))
+            })?;
+            Some(json!({ "type": "json_schema", "json_schema": schema_body }))
+        }
+        "json_object" => Some(json!({ "type": "json_object" })),
+        "text" => None,
+        _ => None,
+    }
+}
 
 const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
 const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
@@ -256,11 +300,6 @@ pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolCo
 }
 
 /// Convert an OpenAI Responses request into an OpenAI Chat Completions request.
-#[allow(dead_code)]
-pub fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
-    responses_to_chat_completions_with_reasoning(body, None)
-}
-
 /// Convert an OpenAI Responses request into an OpenAI Chat Completions request,
 /// using provider-declared Codex Chat reasoning capabilities when available.
 pub fn responses_to_chat_completions_with_reasoning(
@@ -292,22 +331,25 @@ pub fn responses_to_chat_completions_with_reasoning(
     result["messages"] = json!(messages);
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(max_tokens) = body.get("max_output_tokens") {
+    // `body.get(key)` is `Some(Value::Null)` for an explicit JSON null, and strict
+    // OpenAI-compatible gateways reject `"max_tokens": null` / `"temperature":
+    // null` on a numeric field. Only forward a field that actually has a value.
+    if let Some(max_tokens) = non_null(&body, "max_output_tokens") {
         if super::transform::is_openai_o_series(model) {
             result["max_completion_tokens"] = max_tokens.clone();
         } else {
             result["max_tokens"] = max_tokens.clone();
         }
     }
-    if let Some(max_tokens) = body.get("max_tokens") {
+    if let Some(max_tokens) = non_null(&body, "max_tokens") {
         result["max_tokens"] = max_tokens.clone();
     }
-    if let Some(max_tokens) = body.get("max_completion_tokens") {
+    if let Some(max_tokens) = non_null(&body, "max_completion_tokens") {
         result["max_completion_tokens"] = max_tokens.clone();
     }
 
     for key in ["temperature", "top_p", "stream"] {
-        if let Some(value) = body.get(key) {
+        if let Some(value) = non_null(&body, key) {
             result[key] = value.clone();
         }
     }
@@ -319,14 +361,43 @@ pub fn responses_to_chat_completions_with_reasoning(
         result["tools"] = json!(tools);
     }
 
-    if let Some(tool_choice) = body.get("tool_choice") {
+    if let Some(tool_choice) = non_null(&body, "tool_choice") {
         result["tool_choice"] = responses_tool_choice_to_chat(tool_choice, &tool_context);
     }
 
+    // Responses carries structured output under `text.format`; `response_format`
+    // does not exist on the Responses API, so without this mapping a JSON-schema
+    // request silently reached the provider with no output constraint at all.
+    if let Some(response_format) = responses_text_format_to_chat(body.get("text")) {
+        result["response_format"] = response_format;
+    }
+
     for key in EXTRA_CHAT_PASSTHROUGH_FIELDS {
-        if let Some(value) = body.get(*key) {
+        if let Some(value) = non_null(&body, key) {
             result[*key] = value.clone();
         }
+    }
+
+    // `n` is deliberately not a passthrough field.  A Responses object holds one
+    // assistant output, and every consumer of this bridge reads only
+    // `choices[0]` (`chat_completion_to_response_with_context` and the streaming
+    // state machine both call `.first()`), so honouring `n > 1` would require
+    // inventing a multi-output envelope Codex does not understand.  Forwarding
+    // `n` unchanged was the worst option: the provider billed for N completions
+    // while the bridge silently returned only the first.  Reject it loudly.
+    // `n == 1` and `n == 0` (the OpenAI default) stay accepted.
+    if let Some(n) = non_null(&body, "n") {
+        let unsupported = n.as_u64().is_some_and(|n| n > 1)
+            || n.as_i64().is_some_and(|n| n > 1)
+            || n.as_f64().is_some_and(|n| n > 1.0);
+        if unsupported {
+            return Err(ProxyError::TransformError(
+                "n > 1 is not supported when bridging Responses to Chat Completions: \
+                 the bridge converts only choices[0], so extra choices would be dropped"
+                    .to_string(),
+            ));
+        }
+        result["n"] = n.clone();
     }
 
     // Strict OpenAI-compatible upstreams (vLLM, enterprise gateways) reject
@@ -336,11 +407,9 @@ pub fn responses_to_chat_completions_with_reasoning(
     let has_tools = result
         .get("tools")
         .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
-    if !has_tools {
-        if let Some(obj) = result.as_object_mut() {
-            obj.remove("tool_choice");
-            obj.remove("parallel_tool_calls");
-        }
+    if !has_tools && let Some(obj) = result.as_object_mut() {
+        obj.remove("tool_choice");
+        obj.remove("parallel_tool_calls");
     }
     // OpenAI 兼容上游在流式下默认不在 SSE 里返回 usage，必须显式声明
     // include_usage 才会在末尾吐 usage chunk。Codex CLI 用 Responses 协议、
@@ -359,10 +428,10 @@ fn apply_reasoning_options(
     config: Option<&CodexChatReasoningConfig>,
 ) {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
-            if let Some(effort) = body.pointer("/reasoning/effort") {
-                result["reasoning_effort"] = effort.clone();
-            }
+        if super::transform::supports_reasoning_effort(model)
+            && let Some(effort) = body.pointer("/reasoning/effort")
+        {
+            result["reasoning_effort"] = effort.clone();
         }
         return;
     };
@@ -553,29 +622,74 @@ fn zen_effort_rank(effort: &str) -> Option<u8> {
 /// 否则返回 `invalid params, chat content has invalid message role: system (2013)`。
 /// 把所有 system 消息合并到首位，避免中间 system（如 Codex 的 `developer` 指令）触发该约束；
 /// 该重排对 OpenAI / DeepSeek 等宽松兼容层也是无损的。
+///
+/// 只接受字符串 `content` 是不够的：多模态 system 消息（图片、文件、音频）的
+/// `content` 是 parts 数组，旧实现会把它原样留在对话中段，恰好触发该约束。
+/// 因此数组形态也一并合并，并把各 part 推进首条 system 的 parts 数组里。
 fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     let mut system_chunks: Vec<String> = Vec::new();
+    let mut system_parts: Vec<Value> = Vec::new();
     let mut rest: Vec<Value> = Vec::with_capacity(messages.len());
 
     for msg in messages {
         if msg.get("role").and_then(|v| v.as_str()) == Some("system") {
-            if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    system_chunks.push(text.to_string());
+            match msg.get("content") {
+                Some(Value::String(text)) => {
+                    if !text.trim().is_empty() {
+                        system_chunks.push(text.clone());
+                    }
+                    continue;
                 }
-                continue;
+                Some(Value::Array(parts)) if !parts.is_empty() => {
+                    system_parts.extend(parts.iter().cloned());
+                    continue;
+                }
+                // `content: []` / `content: null`: nothing to hoist, and leaving
+                // the message in place would still violate the single-system-head
+                // constraint for no benefit.
+                Some(Value::Array(_)) | Some(Value::Null) => continue,
+                // Missing or unrecognised content shape: keep the message as-is
+                // rather than silently discarding content we cannot represent.
+                _ => {}
             }
         }
         rest.push(msg);
     }
 
     let mut out: Vec<Value> = Vec::with_capacity(rest.len() + 1);
-    if !system_chunks.is_empty() {
-        out.push(json!({
-            "role": "system",
-            "content": system_chunks.join("\n\n")
-        }));
+    // Text-only conversations keep the historical plain-string head. That applies
+    // to every text part, not just a lone one: a parts array carrying nothing but
+    // text means the same thing as the joined string, and emitting the string form
+    // keeps requests identical for upstreams that accept only one shape. An array
+    // is kept only when some part is something a string cannot express (an image,
+    // a file reference, ...).
+    if !system_parts.is_empty()
+        && system_parts.iter().all(|part| {
+            part.get("type").and_then(|v| v.as_str()) == Some("text")
+                && part.get("text").and_then(|v| v.as_str()).is_some()
+        })
+    {
+        for part in &system_parts {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                system_chunks.push(text.to_string());
+            }
+        }
+        system_parts.clear();
+    }
+    if !system_chunks.is_empty() || !system_parts.is_empty() {
+        let content = if system_parts.is_empty() {
+            Value::String(system_chunks.join("\n\n"))
+        } else {
+            let mut content = Vec::with_capacity(system_parts.len() + system_chunks.len());
+            for text in system_chunks {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            content.extend(system_parts);
+            Value::Array(content)
+        };
+        out.push(json!({ "role": "system", "content": content }));
     }
     out.extend(rest);
     out
@@ -700,13 +814,21 @@ fn append_responses_item_as_chat_message(
                 pending_reasoning,
                 last_assistant_index,
             );
-            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+            // `response_item_call_id` trims, rejects an empty value and falls back
+            // to `id`. Reading `call_id` raw emitted `"tool_call_id": ""` for a
+            // tool output that carried no id, which strict OpenAI-compatible
+            // gateways reject and which cannot be correlated with its call.
+            let call_id = response_item_call_id(item);
             let media_plan = item
                 .get("output")
                 .cloned()
                 .and_then(plan_chat_tool_output_media);
             let output = if let Some(media_plan) = media_plan {
-                queue_chat_tool_output_media(pending_media, call_id, media_plan.media_parts);
+                queue_chat_tool_output_media(
+                    pending_media,
+                    call_id.as_deref().unwrap_or_default(),
+                    media_plan.media_parts,
+                );
                 media_plan.tool_content
             } else {
                 // Cache-sensitive no-media fallback: keep these expressions
@@ -717,11 +839,7 @@ fn append_responses_item_as_chat_message(
                     None => String::new(),
                 }
             };
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": output
-            }));
+            messages.push(tool_message(call_id.as_deref(), output));
         }
         Some("custom_tool_call_output") | Some("tool_search_output") => {
             flush_pending_tool_calls(
@@ -731,7 +849,11 @@ fn append_responses_item_as_chat_message(
                 pending_reasoning,
                 last_assistant_index,
             );
-            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+            // `response_item_call_id` trims, rejects an empty value and falls back
+            // to `id`. Reading `call_id` raw emitted `"tool_call_id": ""` for a
+            // tool output that carried no id, which strict OpenAI-compatible
+            // gateways reject and which cannot be correlated with its call.
+            let call_id = response_item_call_id(item);
             let mut transformed_item = item.clone();
             let replacement_block = json!({
                 "type": "text",
@@ -751,17 +873,17 @@ fn append_responses_item_as_chat_message(
                 })
                 .unwrap_or(0);
             let output = if replaced > 0 {
-                queue_chat_tool_output_media(pending_media, call_id, media_parts);
+                queue_chat_tool_output_media(
+                    pending_media,
+                    call_id.as_deref().unwrap_or_default(),
+                    media_parts,
+                );
                 canonical_json_string(&transformed_item)
             } else {
                 // Preserve the legacy whole-item representation exactly.
                 canonical_json_string(item)
             };
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": output
-            }));
+            messages.push(tool_message(call_id.as_deref(), output));
         }
         Some("reasoning") => {
             // reasoning 一律先进入 pending_reasoning，前向附挂到其后的
@@ -1218,23 +1340,23 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
         let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match part_type {
             "input_text" | "output_text" | "text" => {
-                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        chat_parts.push(json!({
-                            "type": "text",
-                            "text": text
-                        }));
-                    }
+                if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    chat_parts.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
                 }
             }
             "refusal" => {
-                if let Some(text) = part.get("refusal").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        chat_parts.push(json!({
-                            "type": "text",
-                            "text": text
-                        }));
-                    }
+                if let Some(text) = part.get("refusal").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    chat_parts.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
                 }
             }
             "input_image" => {
@@ -1298,11 +1420,11 @@ fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContex
             }
         }
         Value::Object(obj) => {
-            if obj.get("type").and_then(|v| v.as_str()) == Some("tool_search_output") {
-                if let Some(tools) = obj.get("tools").and_then(|v| v.as_array()) {
-                    for tool in tools {
-                        context.add_response_tool(tool);
-                    }
+            if obj.get("type").and_then(|v| v.as_str()) == Some("tool_search_output")
+                && let Some(tools) = obj.get("tools").and_then(|v| v.as_array())
+            {
+                for tool in tools {
+                    context.add_response_tool(tool);
                 }
             }
             for value in obj.values() {
@@ -1419,68 +1541,67 @@ fn responses_function_tool_to_chat_tool(tool: &Value, chat_name: &str) -> Option
     }))
 }
 
+/// Build a Chat `tool_calls[]` entry.
+///
+/// `id` is omitted when the Responses item carried no usable call id. Emitting
+/// `"id": null` (what a bare `Option<String>` produces in `json!`) or a blank
+/// string made strict OpenAI-compatible gateways reject the request, and left the
+/// call unpaired with its `tool` message.
+fn chat_tool_call(id: Option<&str>, function: Value) -> Value {
+    let mut call = serde_json::Map::new();
+    if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) {
+        call.insert("id".into(), Value::String(id.to_owned()));
+    }
+    call.insert("type".into(), Value::String("function".into()));
+    call.insert("function".into(), function);
+    Value::Object(call)
+}
+
 fn responses_function_call_to_chat_tool_call(
     item: &Value,
     tool_context: &CodexToolContext,
 ) -> Value {
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // `response_item_call_id` trims and rejects a blank id; the hand-rolled form
+    // here accepted `"   "` verbatim, so a replayed assistant tool call kept a
+    // whitespace id while its matching output (which uses the strict helper) had
+    // none — the two no longer paired.
+    let call_id = response_item_call_id(item);
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let namespace = item.get("namespace").and_then(|v| v.as_str());
     let chat_name = tool_context.chat_name_for_response_function(name, namespace);
     let arguments = canonicalize_tool_arguments(item.get("arguments"));
 
-    json!({
-        "id": call_id,
-        "type": "function",
-        "function": {
-            "name": chat_name,
-            "arguments": arguments
-        }
-    })
+    chat_tool_call(
+        call_id.as_deref(),
+        json!({ "name": chat_name, "arguments": arguments }),
+    )
 }
 
 fn responses_custom_tool_call_to_chat_tool_call(item: &Value) -> Value {
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let call_id = response_item_call_id(item);
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
 
-    json!({
-        "id": call_id,
-        "type": "function",
-        "function": {
+    chat_tool_call(
+        call_id.as_deref(),
+        json!({
             "name": name,
             "arguments": canonical_json_string(&json!({ CUSTOM_TOOL_INPUT_FIELD: input }))
-        }
-    })
+        }),
+    )
 }
 
 fn responses_tool_search_call_to_chat_tool_call(item: &Value) -> Value {
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let call_id = response_item_call_id(item);
     let arguments = item
         .get("arguments")
         .map(canonical_json_string)
         .unwrap_or_else(|| "{}".to_string());
 
-    json!({
-        "id": call_id,
-        "type": "function",
-        "function": {
-            "name": TOOL_SEARCH_PROXY_NAME,
-            "arguments": arguments
-        }
-    })
+    chat_tool_call(
+        call_id.as_deref(),
+        json!({ "name": TOOL_SEARCH_PROXY_NAME, "arguments": arguments }),
+    )
 }
 
 fn responses_tool_choice_to_chat(tool_choice: &Value, tool_context: &CodexToolContext) -> Value {
@@ -1518,11 +1639,6 @@ fn responses_tool_choice_to_chat(tool_choice: &Value, tool_context: &CodexToolCo
 }
 
 /// Convert a non-streaming Chat Completions response into a Responses response.
-#[allow(dead_code)]
-pub fn chat_completion_to_response(body: Value) -> Result<Value, ProxyError> {
-    chat_completion_to_response_with_context(body, &CodexToolContext::default())
-}
-
 /// Convert a non-streaming Chat Completions response into a Responses response,
 /// restoring Codex-specific tool names using the original Responses request.
 pub(crate) fn chat_completion_to_response_with_context(
@@ -1588,8 +1704,8 @@ pub(crate) fn chat_completion_to_response_with_context(
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if finish_reason == Some("length") {
-        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let Some(reason) = incomplete_reason_from_finish_reason(finish_reason) {
+        response["incomplete_details"] = json!({ "reason": reason });
     }
 
     Ok(response)
@@ -1619,12 +1735,11 @@ fn chat_reasoning_text(message: &Value) -> Option<String> {
         return Some(reasoning);
     }
 
-    if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
-        if let Some((reasoning, _answer)) = split_leading_think_block(content) {
-            if !reasoning.is_empty() {
-                return Some(reasoning);
-            }
-        }
+    if let Some(content) = message.get("content").and_then(|v| v.as_str())
+        && let Some((reasoning, _answer)) = split_leading_think_block(content)
+        && !reasoning.is_empty()
+    {
+        return Some(reasoning);
     }
 
     None
@@ -1649,24 +1764,24 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
             let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match part_type {
                 "text" | "output_text" => {
-                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            content.push(json!({
-                                "type": "output_text",
-                                "text": text,
-                                "annotations": []
-                            }));
-                        }
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        content.push(json!({
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        }));
                     }
                 }
                 "refusal" => {
-                    if let Some(text) = part.get("refusal").and_then(|v| v.as_str()) {
-                        if !text.is_empty() {
-                            content.push(json!({
-                                "type": "refusal",
-                                "refusal": text
-                            }));
-                        }
+                    if let Some(text) = part.get("refusal").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        content.push(json!({
+                            "type": "refusal",
+                            "refusal": text
+                        }));
                     }
                 }
                 _ => {}
@@ -1674,13 +1789,13 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
         }
     }
 
-    if let Some(refusal) = message.get("refusal").and_then(|v| v.as_str()) {
-        if !refusal.is_empty() {
-            content.push(json!({
-                "type": "refusal",
-                "refusal": refusal
-            }));
-        }
+    if let Some(refusal) = message.get("refusal").and_then(|v| v.as_str())
+        && !refusal.is_empty()
+    {
+        content.push(json!({
+            "type": "refusal",
+            "refusal": refusal
+        }));
     }
 
     if content.is_empty() {
@@ -1936,6 +2051,22 @@ pub(crate) fn custom_tool_input_from_chat_arguments(arguments: &str) -> String {
     }
 }
 
+/// Build a Chat `tool` message.
+///
+/// `tool_call_id` is omitted entirely when the Responses item carried no usable
+/// id. Emitting `""` (or `null`) produced a message that strict
+/// OpenAI-compatible gateways reject and that no call can be matched against;
+/// leaving the field out lets such a gateway apply its own validation.
+fn tool_message(call_id: Option<&str>, content: String) -> Value {
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), Value::String("tool".into()));
+    if let Some(call_id) = call_id.map(str::trim).filter(|id| !id.is_empty()) {
+        message.insert("tool_call_id".into(), Value::String(call_id.to_owned()));
+    }
+    message.insert("content".into(), Value::String(content));
+    Value::Object(message)
+}
+
 pub(crate) fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     let Some(usage) = usage.filter(|value| value.is_object() && !value.is_null()) else {
         return json!({
@@ -2039,8 +2170,22 @@ pub(crate) fn response_id_from_chat_id(id: Option<&str>) -> String {
 
 pub(crate) fn response_status_from_finish_reason(finish_reason: Option<&str>) -> &'static str {
     match finish_reason {
-        Some("length") => "incomplete",
+        // Truncation by the token budget or by the provider's safety filter is
+        // not a normal completion; reporting it as `completed` hid policy
+        // refusals and truncations from the caller.
+        Some("length") | Some("content_filter") => "incomplete",
         _ => "completed",
+    }
+}
+
+/// `incomplete_details.reason` for a finish reason that ended the turn early.
+pub(crate) fn incomplete_reason_from_finish_reason(
+    finish_reason: Option<&str>,
+) -> Option<&'static str> {
+    match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
     }
 }
 
@@ -2053,74 +2198,92 @@ pub(crate) fn response_status_from_finish_reason(finish_reason: Option<&str>) ->
 ///
 /// 输出统一为 `{"error": {"message", "type", "code", "param"}}`，与 OpenAI Responses
 /// API 错误响应一致；Codex 客户端的错误处理只识别这个形状。
-#[allow(dead_code)]
-pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
-    let Some(value) = body else {
-        return json!({
-            "error": {
-                "message": "Upstream returned an empty error response",
-                "type": "upstream_error",
-                "code": serde_json::Value::Null,
-                "param": serde_json::Value::Null,
-            }
-        });
-    };
+// Test-only convenience wrappers. These used to be public functions guarded by
+// `#[allow(dead_code)]`, which hid the fact that only the test module used them.
+// Keeping them inside the test module (and free of any blanket allowance) means
+// the compiler now reports it directly if one stops being used.
+#[cfg(test)]
+mod test_helpers {
+    use super::*;
 
-    if let Some(text) = value.as_str() {
-        return json!({
-            "error": {
-                "message": text,
-                "type": "upstream_error",
-                "code": serde_json::Value::Null,
-                "param": serde_json::Value::Null,
-            }
-        });
+    /// Convert a Responses body to Chat Completions using default reasoning.
+    pub(super) fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
+        responses_to_chat_completions_with_reasoning(body, None)
     }
 
-    let source = value.get("error").unwrap_or(value);
+    /// Convert a Chat completion to a Responses body without request context.
+    pub(super) fn chat_completion_to_response(body: Value) -> Result<Value, ProxyError> {
+        chat_completion_to_response_with_context(body, &CodexToolContext::default())
+    }
 
-    let message = source
-        .get("message")
-        .or_else(|| source.get("detail"))
-        .or_else(|| source.get("status_msg"))
-        .or_else(|| source.pointer("/base_resp/status_msg"))
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or_else(|| source.as_str().map(ToString::to_string))
-        .unwrap_or_else(|| {
-            // 没法从字段提取出文本，就把整个 JSON 序列化回去，方便用户排查。
-            serde_json::to_string(source).unwrap_or_else(|_| "Upstream error".to_string())
-        });
+    pub(super) fn chat_error_to_response_error(body: Option<&Value>) -> Value {
+        let Some(value) = body else {
+            return json!({
+                "error": {
+                    "message": "Upstream returned an empty error response",
+                    "type": "upstream_error",
+                    "code": serde_json::Value::Null,
+                    "param": serde_json::Value::Null,
+                }
+            });
+        };
 
-    let error_type = source
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "upstream_error".to_string());
-
-    let code = source
-        .get("code")
-        .cloned()
-        .or_else(|| source.pointer("/base_resp/status_code").cloned())
-        .unwrap_or(serde_json::Value::Null);
-
-    let param = source
-        .get("param")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
-    json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "code": code,
-            "param": param,
+        if let Some(text) = value.as_str() {
+            return json!({
+                "error": {
+                    "message": text,
+                    "type": "upstream_error",
+                    "code": serde_json::Value::Null,
+                    "param": serde_json::Value::Null,
+                }
+            });
         }
-    })
-}
 
+        let source = value.get("error").unwrap_or(value);
+
+        let message = source
+            .get("message")
+            .or_else(|| source.get("detail"))
+            .or_else(|| source.get("status_msg"))
+            .or_else(|| source.pointer("/base_resp/status_msg"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .or_else(|| source.as_str().map(ToString::to_string))
+            .unwrap_or_else(|| {
+                // 没法从字段提取出文本，就把整个 JSON 序列化回去，方便用户排查。
+                serde_json::to_string(source).unwrap_or_else(|_| "Upstream error".to_string())
+            });
+
+        let error_type = source
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "upstream_error".to_string());
+
+        let code = source
+            .get("code")
+            .cloned()
+            .or_else(|| source.pointer("/base_resp/status_code").cloned())
+            .unwrap_or(serde_json::Value::Null);
+
+        let param = source
+            .get("param")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+                "param": param,
+            }
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::*;
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -2691,6 +2854,79 @@ mod tests {
         assert_eq!(result["reasoning_effort"], "max");
     }
 
+    /// Regression: the assistant-side tool call kept a whitespace-only `id`
+    /// (`"   "`) because its extraction was hand-rolled, while the matching tool
+    /// output used the strict helper and dropped the id — so the call and its
+    /// result no longer paired. Neither side may emit a blank or `null` id.
+    #[test]
+    fn a_blank_call_id_is_omitted_from_both_sides_of_a_tool_call() {
+        let request = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "   ", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "   ", "output": "x"}
+            ]
+        });
+        let out = responses_to_chat_completions_with_reasoning(request, None).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+
+        let call = &messages[0]["tool_calls"][0];
+        assert!(
+            call.get("id").is_none(),
+            "a blank call id must be omitted, not emitted as blank or null: {call}"
+        );
+        assert!(
+            messages[1].get("tool_call_id").is_none(),
+            "the matching output must omit its id too: {}",
+            messages[1]
+        );
+
+        // A real id is still carried through and pairs the two sides.
+        let request = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_9", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_9", "output": "x"}
+            ]
+        });
+        let out = responses_to_chat_completions_with_reasoning(request, None).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_9");
+        assert_eq!(messages[1]["tool_call_id"], "call_9");
+    }
+
+    /// Regression: a `function_call_output` with no usable `call_id` produced
+    /// `"tool_call_id": ""`, which strict OpenAI-compatible gateways reject and
+    /// which cannot be correlated with its call. `id` is now accepted as a
+    /// fallback, and an id-less output no longer emits an empty identifier.
+    #[test]
+    fn tool_output_without_a_call_id_does_not_emit_an_empty_identifier() {
+        // `id` is used when `call_id` is missing.
+        let with_id = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "id": "call_from_id", "output": "ok"}]
+        });
+        let out = responses_to_chat_completions_with_reasoning(with_id, None).unwrap();
+        assert_eq!(out["messages"][0]["tool_call_id"], "call_from_id");
+
+        // A blank `call_id` is treated as absent rather than forwarded as "".
+        let blank = json!({
+            "model": "m",
+            "input": [{"type": "function_call_output", "call_id": "   ", "output": "ok"}]
+        });
+        let out = responses_to_chat_completions_with_reasoning(blank, None).unwrap();
+        let tool_call_id = out["messages"][0]["tool_call_id"].as_str().unwrap_or("");
+        assert!(
+            !tool_call_id.trim().is_empty()
+                || !out["messages"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("tool_call_id"),
+            "an empty tool_call_id must not be emitted: {}",
+            out["messages"][0]
+        );
+    }
+
     #[test]
     fn chat_usage_to_responses_usage_maps_deepseek_cache_hit_tokens() {
         // DeepSeek Chat 的文档化缓存命中字段也要进 Responses 的
@@ -3106,6 +3342,69 @@ mod tests {
         assert_eq!(out[1]["content"], "U1");
         assert_eq!(out[2]["content"], "A1");
         assert_eq!(out[3]["content"], "U2");
+    }
+
+    /// A mid-conversation system message whose `content` is a parts array must be
+    /// hoisted too: MiniMax rejects any `system` role past index 0 regardless of
+    /// the content shape, so leaving the parts form in place defeats the entire
+    /// reason this collapse exists.
+    #[test]
+    fn collapse_system_messages_hoists_system_messages_with_array_content() {
+        let input = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "S1"}]}),
+            json!({"role": "user", "content": "U1"}),
+            json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "S2 part one"},
+                    {"type": "text", "text": "S2 part two"}
+                ]
+            }),
+            json!({"role": "user", "content": "U2"}),
+        ];
+        let out = collapse_system_messages_to_head(input);
+
+        assert_eq!(out.len(), 3, "both system messages must collapse into one");
+        assert_eq!(out[0]["role"], "system");
+        let head = out[0]["content"].as_str().unwrap();
+        assert!(head.contains("S1"));
+        assert!(head.contains("S2 part one"));
+        assert!(head.contains("S2 part two"));
+        assert!(
+            out[1..].iter().all(|message| message["role"] != "system"),
+            "no system message may remain past index 0: {out:?}"
+        );
+    }
+
+    /// `n > 1` cannot be honoured: only `choices[0]` is convertible to a single
+    /// Responses object, so forwarding `n` would silently discard the extra
+    /// results. Reject it instead of pretending it worked.
+    #[test]
+    fn responses_request_to_chat_rejects_multiple_choices() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "n": 2,
+            "input": "hi"
+        });
+
+        let error = responses_to_chat_completions(input).unwrap_err();
+
+        assert!(
+            error.to_string().contains("n > 1"),
+            "error must name the unsupported field, got: {error}"
+        );
+    }
+
+    #[test]
+    fn responses_request_to_chat_keeps_n_when_single_choice() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "n": 1,
+            "input": "hi"
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        assert_eq!(result["n"], 1);
     }
 
     #[test]
@@ -4336,7 +4635,7 @@ mod tests {
             part.get("image_url")
                 .and_then(|value| value.get("url"))
                 .and_then(Value::as_str)
-                .is_some_and(|url| url == &data_url)
+                .is_some_and(|url| url == data_url)
         }));
         assert_eq!(messages[3]["content"], "Viewing the image now.");
         assert_eq!(messages[3]["tool_calls"][0]["id"], "call_next");

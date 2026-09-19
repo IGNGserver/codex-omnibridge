@@ -62,9 +62,20 @@ fn set_private_file_permissions(path: &std::path::Path) -> Result<(), std::io::E
     Ok(())
 }
 
+/// References already reported as served by an environment override.
+///
+/// Compares against nothing but its own contents, so it is only used to keep the
+/// one-line notice from repeating for the same reference.
+static OVERRIDE_WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
 fn file_backend_path() -> PathBuf {
-    directories::ProjectDirs::from("dev", "codex", "codexmultiprovider")
-        .map(|d| d.config_dir().join(".credentials"))
+    // Shares `codex_mp_core`'s application identity so the credential file always
+    // sits beside the registry it belongs to. Using a second `ProjectDirs` triple
+    // here resolved to the same directory on Linux by coincidence, but to a
+    // *different* one on macOS/Windows.
+    codex_mp_core::app_config_dir()
+        .map(|dir| dir.join(".credentials"))
         .unwrap_or_else(|| PathBuf::from(".credentials"))
 }
 
@@ -158,16 +169,49 @@ impl NativeCredentialStore {
         }
     }
 
-    /// Explicitly opt into the 0600 file backend for headless installations.
-    /// The default store never falls back to a plaintext credential file.
-    pub fn with_file_fallback(service: impl Into<String>) -> Self {
-        Self::new(service)
-    }
-
+    /// Whether the opt-in 0600 file backend is selected.
+    ///
+    /// Enabled only by `--secret-backend file`, which sets this variable. The
+    /// default store never falls back to a plaintext credential file.
     fn file_backend_enabled(&self) -> bool {
         std::env::var("CODEX_MP_SECRET_BACKEND").as_deref() == Ok("file")
     }
 
+    /// Persist a secret in the 0600 file store.
+    ///
+    /// The document is read-modify-written under the cross-process file lock so
+    /// two concurrent writers cannot drop each other's entries, and committed
+    /// through a private synced temporary file.
+    fn set_in_file(
+        &self,
+        reference: &str,
+        value: &SecretString,
+    ) -> Result<(), CredentialStoreError> {
+        set_in_file_at(&file_backend_path(), reference, value)
+    }
+}
+
+/// Persist a secret in a 0600 credential file, read-modify-written under the
+/// cross-process lock so concurrent writers cannot drop each other's entries.
+fn set_in_file_at(
+    path: &std::path::Path,
+    reference: &str,
+    value: &SecretString,
+) -> Result<(), CredentialStoreError> {
+    let _guard = codex_mp_core::FileLock::acquire(path)
+        .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+    let mut map: HashMap<String, String> = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.insert(reference.to_owned(), value.expose_secret().to_owned());
+    let json_str = serde_json::to_string(&map)
+        .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+    write_private_json_atomic(path, &json_str)
+        .map_err(|error| CredentialStoreError::Backend(error.to_string()))
+}
+
+impl NativeCredentialStore {
     fn entry(&self, reference: &str) -> Result<Entry, CredentialStoreError> {
         if reference.trim().is_empty() {
             return Err(CredentialStoreError::EmptyReference);
@@ -190,9 +234,31 @@ impl CredentialStore for NativeCredentialStore {
                 })
                 .collect::<String>()
         );
+        // An explicit environment override takes precedence over every stored
+        // backend. That is a deliberate operator escape hatch (12-factor style),
+        // but it used to be entirely silent: a stray variable from a shell
+        // profile, container or CI job would replace a provider's upstream
+        // credential with nothing in the UI or logs to say so.
+        //
+        // Warn once per reference so the behaviour is discoverable without
+        // spamming (the Router resolves each reference once per generation).
         if let Ok(val) = std::env::var(&env_var)
             && !val.trim().is_empty()
         {
+            let first_time = OVERRIDE_WARNED
+                .lock()
+                .map(|mut warned| {
+                    warned
+                        .get_or_insert_with(std::collections::HashSet::new)
+                        .insert(env_var.clone())
+                })
+                .unwrap_or(true);
+            if first_time {
+                eprintln!(
+                    "codex-mp: using the `{env_var}` environment override for `{reference}`; \
+                     this takes precedence over any stored credential"
+                );
+            }
             return Ok(SecretString::from(val));
         }
 
@@ -220,49 +286,114 @@ impl CredentialStore for NativeCredentialStore {
     }
 
     fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
-        match self.entry(reference)?.set_password(value.expose_secret()) {
-            Ok(()) => Ok(()),
-            Err(e) if self.file_backend_enabled() => {
-                // File persistence is an explicit operator choice. It is
-                // still protected to 0600 and committed through a private,
-                // synced temporary file so a keyring failure cannot silently
-                // persist a partial secret document.
-                let fallback_file = file_backend_path();
-                let mut map: HashMap<String, String> = fs::read_to_string(&fallback_file)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-                map.insert(reference.to_owned(), value.expose_secret().to_owned());
-                if let Ok(json_str) = serde_json::to_string(&map) {
-                    if let Err(error) = write_private_json_atomic(&fallback_file, &json_str) {
-                        return Err(CredentialStoreError::Backend(error.to_string()));
-                    }
-                    return Ok(());
-                }
-                Err(CredentialStoreError::Backend(e.to_string()))
-            }
-            Err(e) => Err(CredentialStoreError::Backend(format!(
-                "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
-            ))),
+        // `--secret-backend file` selects the 0600 file as the store, so it must
+        // be written **first** and be authoritative.
+        //
+        // Writing the keyring first (as this used to) made the two stores
+        // disagree: `get` reads the file first, so a rotated key was written to
+        // the keyring while reads kept returning the file's stale value. Verified
+        // end-to-end: after `provider edit --api-key-stdin` the upstream still
+        // received the previous key.
+        if self.file_backend_enabled() {
+            return self.set_in_file(reference, value);
         }
+        self.entry(reference)?
+            .set_password(value.expose_secret())
+            .map_err(|e| {
+                CredentialStoreError::Backend(format!(
+                    "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
+                ))
+            })
     }
 
     fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
-        let _ = self.entry(reference)?.delete_credential();
+        // A failure here used to be discarded and `Ok(())` returned, so a caller
+        // that removed a provider believed the key was gone while it stayed live
+        // in the keyring. `NoEntry` is the one benign case: already absent.
+        if let Err(error) = self.entry(reference)?.delete_credential()
+            && !matches!(error, keyring::Error::NoEntry)
+        {
+            let fallback_enabled = self.file_backend_enabled();
+            // When the 0600 file backend is explicitly enabled, the key may only
+            // ever have lived there, so a keyring miss is not fatal.
+            if !fallback_enabled {
+                return Err(CredentialStoreError::Backend(format!(
+                    "keyring delete failed for `{reference}`: {error}"
+                )));
+            }
+        }
         if !self.file_backend_enabled() {
             return Ok(());
         }
+        // In file mode the file **is** the store, so the removal must be
+        // serialized and durable there. Without the lock two concurrent deletes
+        // could each rewrite the map from a stale read.
         let fallback_file = file_backend_path();
+        let _guard = codex_mp_core::FileLock::acquire(&fallback_file)
+            .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
         if let Ok(s) = fs::read_to_string(&fallback_file)
             && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
+            && map.remove(reference).is_some()
         {
-            map.remove(reference);
-            if let Ok(json_str) = serde_json::to_string(&map) {
-                let _ = write_private_json_atomic(&fallback_file, &json_str);
-            }
+            let json_str = serde_json::to_string(&map)
+                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+            write_private_json_atomic(&fallback_file, &json_str)
+                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
         }
         Ok(())
     }
+}
+
+/// Run a synchronous credential-store operation without blocking the async
+/// runtime that is driving the caller.
+///
+/// This is not a nicety. On Linux the `keyring` crate reaches the Secret Service
+/// over D-Bus via `zbus`, and `zbus` bridges back to a *synchronous* API by
+/// calling `tokio::runtime::Runtime::block_on` internally. Invoking a store
+/// operation directly from inside a `#[tokio::main]` async context therefore
+/// panics with "Cannot start a runtime from within a runtime" — which made
+/// `codex-mp provider add` and `provider edit` abort before writing anything.
+/// Moving the call to a blocking thread both fixes that panic and keeps a slow
+/// or wedged keyring daemon from stalling the runtime's worker threads.
+///
+/// When called outside a runtime the closure simply runs inline.
+pub async fn run_blocking<T, F>(operation: F) -> Result<T, CredentialStoreError>
+where
+    F: FnOnce() -> Result<T, CredentialStoreError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .spawn_blocking(operation)
+            .await
+            .map_err(|error| CredentialStoreError::Backend(error.to_string()))?,
+        Err(_) => operation(),
+    }
+}
+
+/// Resolve a credential from an async context.
+pub async fn get_blocking(
+    store: Arc<dyn CredentialStore>,
+    reference: String,
+) -> Result<SecretString, CredentialStoreError> {
+    run_blocking(move || store.get(&reference)).await
+}
+
+/// Store a credential from an async context.
+pub async fn set_blocking(
+    store: Arc<dyn CredentialStore>,
+    reference: String,
+    value: SecretString,
+) -> Result<(), CredentialStoreError> {
+    run_blocking(move || store.set(&reference, &value)).await
+}
+
+/// Delete a credential from an async context.
+pub async fn delete_blocking(
+    store: Arc<dyn CredentialStore>,
+    reference: String,
+) -> Result<(), CredentialStoreError> {
+    run_blocking(move || store.delete(&reference)).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -319,6 +450,124 @@ mod tests {
             store.get("provider:test"),
             Err(CredentialStoreError::NotFound(_))
         ));
+    }
+
+    /// Regression: `--secret-backend file` is documented as selecting *file*
+    /// storage, but `set` wrote the keyring first and only fell back to the file
+    /// when the keyring failed. On any machine with a working keyring the flag
+    /// silently stored secrets in the keyring instead.
+    ///
+    /// Worse, `get` reads the file first: with both stores populated, a rotated
+    /// key was written to the keyring while reads kept returning the file's stale
+    /// value. Verified end-to-end before the fix — after
+    /// `provider edit --api-key-stdin` the upstream still received the old key.
+    ///
+    /// Drives `set_in_file_at` (the function `set_in_file` delegates to) against a
+    /// temporary path, so the test owns its file and never touches the operator's
+    /// real config directory.
+    #[test]
+    fn the_file_backend_accumulates_entries_and_keeps_them_private() {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-mp-credentials-filemode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(".credentials");
+
+        set_in_file_at(&path, "provider:a", &SecretString::from("first".to_owned())).unwrap();
+        // A second write must not drop the first: the document is read-modify-written.
+        set_in_file_at(
+            &path,
+            "provider:b",
+            &SecretString::from("second".to_owned()),
+        )
+        .unwrap();
+        // Replacing an existing entry must overwrite it, not duplicate it.
+        set_in_file_at(
+            &path,
+            "provider:a",
+            &SecretString::from("rotated".to_owned()),
+        )
+        .unwrap();
+
+        let map: HashMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "entries must accumulate, not overwrite the map"
+        );
+        assert_eq!(
+            map.get("provider:a").map(String::as_str),
+            Some("rotated"),
+            "an update must replace the previous value"
+        );
+        assert_eq!(map.get("provider:b").map(String::as_str), Some("second"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "the credential file must stay private"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The `CODEX_MP_KEY_<REFERENCE>` environment override is a deliberate
+    /// operator escape hatch, but it was undocumented, untested, and completely
+    /// silent — a stray variable from a shell profile, container or CI job would
+    /// replace a provider's upstream credential with nothing anywhere to say so.
+    ///
+    /// This pins the documented behaviour: the override wins over stored values.
+    #[test]
+    fn the_environment_override_takes_precedence() {
+        let reference = "provider:env-override-test";
+        let var = "CODEX_MP_KEY_PROVIDER_ENV_OVERRIDE_TEST";
+        // SAFETY: this test owns the variable.
+        let previous = std::env::var_os(var);
+        unsafe { std::env::set_var(var, "from-env") };
+
+        let store = NativeCredentialStore::default();
+        let resolved = store
+            .get(reference)
+            .map(|s| s.expose_secret().to_owned())
+            .map_err(|e| e.to_string());
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+
+        assert_eq!(
+            resolved.ok().as_deref(),
+            Some("from-env"),
+            "the environment override must win over any stored backend"
+        );
+    }
+
+    /// A blank override must be ignored rather than stored as an empty secret.
+    #[test]
+    fn a_blank_environment_override_is_ignored() {
+        let var = "CODEX_MP_KEY_PROVIDER_BLANK_TEST";
+        let previous = std::env::var_os(var);
+        unsafe { std::env::set_var(var, "   ") };
+
+        let store = NativeCredentialStore::default();
+        let resolved = store.get("provider:blank-test");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(var, value) },
+            None => unsafe { std::env::remove_var(var) },
+        }
+
+        assert!(
+            resolved.is_err(),
+            "a whitespace-only override must not be treated as a credential"
+        );
     }
 
     #[test]

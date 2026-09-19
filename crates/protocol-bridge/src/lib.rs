@@ -89,10 +89,7 @@ pub mod ported {
 }
 
 pub use ported::codex_chat_history::CodexChatHistoryStore;
-pub use ported::transform_codex_chat::{
-    chat_completion_to_response, responses_to_chat_completions,
-    responses_to_chat_completions_with_reasoning,
-};
+pub use ported::transform_codex_chat::responses_to_chat_completions_with_reasoning;
 
 /// Convert a Responses request for a Chat-only upstream and bind the selected
 /// upstream model.  The bridge never carries provider selection in the body;
@@ -120,6 +117,19 @@ pub fn responses_to_chat(
     Ok(result)
 }
 
+/// The logical model id carried by the original client request.
+///
+/// The bridge rewrites `model` to the upstream id only on the request it
+/// forwards upstream, so the untouched client request stays the authoritative
+/// source for the model Codex actually asked for.
+fn request_model(request: &Value) -> Option<String> {
+    request
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Convert one non-streaming Chat response to a real Responses response.
 pub fn chat_to_responses(response: Value, context: &BridgeContext) -> Result<Value, BridgeError> {
     chat_to_responses_with_request(response, context, &Value::Null)
@@ -141,7 +151,13 @@ pub fn chat_to_responses_with_request(
             "Chat response must be an object".into(),
         ));
     }
-    response["model"] = Value::String(context.upstream_model.clone());
+    // Echo the logical model the client asked for.  Overwriting this with the
+    // upstream model leaked the provider's private model name back to Codex,
+    // which correlates the reply against the model id it requested.  The
+    // original client request still carries that id; fall back to the upstream
+    // name only when the request has no model to offer.
+    response["model"] =
+        Value::String(request_model(request).unwrap_or_else(|| context.upstream_model.clone()));
     let tool_context = ported::transform_codex_chat::build_codex_tool_context_from_request(request);
     ported::transform_codex_chat::chat_completion_to_response_with_context(response, &tool_context)
         .map_err(|error| BridgeError::InvalidResponse(error.to_string()))
@@ -164,11 +180,11 @@ pub async fn chat_sse_to_responses(
     }
     let tool_context = ported::transform_codex_chat::build_codex_tool_context_from_request(request);
     let stream = futures::stream::iter(input.into_iter().map(Ok::<_, std::io::Error>));
-    let converted =
-        ported::streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
-            Box::pin(stream),
-            tool_context,
-        );
+    let converted = ported::streaming_codex_chat::create_responses_sse_stream_from_chat_with_model(
+        Box::pin(stream),
+        tool_context,
+        request_model(request),
+    );
     use futures::StreamExt;
     futures::pin_mut!(converted);
     let mut output = Vec::new();
@@ -199,9 +215,10 @@ where
     let tool_context =
         ported::transform_codex_chat::build_codex_tool_context_from_request(&request);
     Ok(
-        ported::streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
+        ported::streaming_codex_chat::create_responses_sse_stream_from_chat_with_model(
             input,
             tool_context,
+            request_model(&request),
         ),
     )
 }
@@ -355,6 +372,48 @@ mod tests {
         assert_eq!(output["messages"][0]["role"], "system");
         assert_eq!(output["tools"][0]["function"]["name"], "shell");
         assert_eq!(output["stream"], true);
+    }
+
+    #[test]
+    fn chat_to_responses_echoes_logical_model_instead_of_upstream_model() {
+        let context = context();
+        let request = json!({"model": "custom/logical"});
+        let response = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "provider-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let output = chat_to_responses_with_request(response, &context, &request).unwrap();
+        assert_eq!(
+            output["model"], "custom/logical",
+            "Codex correlates on the logical model id it requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_echo_logical_model_instead_of_upstream_model() {
+        let input = vec![Bytes::from_static(
+            b"data: {\"id\":\"chatcmpl_1\",\"model\":\"provider-model\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )];
+
+        let output = chat_sse_to_responses(input, &context(), &json!({"model": "custom/logical"}))
+            .await
+            .unwrap();
+        let text = String::from_utf8(output.concat()).unwrap();
+        assert!(
+            text.contains("\"model\":\"custom/logical\""),
+            "streamed responses must echo the logical model id: {text}"
+        );
+        assert!(
+            !text.contains("\"model\":\"provider-model\""),
+            "streamed responses must not leak the upstream model id: {text}"
+        );
     }
 
     #[test]

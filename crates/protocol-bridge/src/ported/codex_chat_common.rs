@@ -1,4 +1,8 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
 use serde_json::{Map, Value, json};
 
@@ -9,27 +13,27 @@ const THINK_CLOSE_TAG: &str = "</think>";
 // 不依赖 provider meta 的 outputFormat 声明，因此对各家 Chat 兼容接口都能兜底提取。
 pub(crate) fn extract_reasoning_field_text(value: &Value) -> Option<String> {
     for key in ["reasoning_content", "reasoning"] {
-        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
     if let Some(reasoning) = value.get("reasoning") {
         for key in ["content", "text", "summary"] {
-            if let Some(text) = reasoning.get(key).and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
+            if let Some(text) = reasoning.get(key).and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                return Some(text.to_string());
             }
         }
     }
 
-    if let Some(details) = value.get("reasoning_details") {
-        if let Some(text) = extract_reasoning_details_text(details) {
-            return Some(text);
-        }
+    if let Some(details) = value.get("reasoning_details")
+        && let Some(text) = extract_reasoning_details_text(details)
+    {
+        return Some(text);
     }
 
     None
@@ -54,10 +58,10 @@ fn extract_reasoning_details_text(value: &Value) -> Option<String> {
 
 fn extract_reasoning_detail_part_text(value: &Value) -> Option<String> {
     for key in ["text", "content", "summary"] {
-        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
@@ -76,10 +80,10 @@ fn extract_reasoning_detail_part_text(value: &Value) -> Option<String> {
 
 pub(crate) fn extract_reasoning_summary_text(value: &Value) -> Option<String> {
     for key in ["reasoning_content", "content", "text"] {
-        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
@@ -183,10 +187,10 @@ pub(crate) fn response_function_call_item_with_namespace(
 ) -> Value {
     let mut item =
         response_function_call_item(item_id, status, call_id, name, arguments, reasoning);
-    if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
-        if let Some(obj) = item.as_object_mut() {
-            obj.insert("namespace".to_string(), json!(namespace));
-        }
+    if let Some(namespace) = namespace.filter(|value| !value.is_empty())
+        && let Some(obj) = item.as_object_mut()
+    {
+        obj.insert("namespace".to_string(), json!(namespace));
     }
     item
 }
@@ -200,14 +204,14 @@ pub(crate) fn response_item_call_id(item: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn is_empty_value(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(value) => value.trim().is_empty(),
-        Value::Array(value) => value.is_empty(),
-        Value::Object(value) => value.is_empty(),
-        _ => false,
-    }
+/// Whether a field carries no value at all.
+///
+/// Only a missing key or an explicit `null` counts as absent.  An empty string,
+/// array or object is a value the client actually sent (`arguments: {}`,
+/// `output: []`, `input: ""`), so history hydration must preserve it instead of
+/// overwriting it with a cached non-empty value.
+pub(crate) fn is_absent_value(value: &Value) -> bool {
+    value.is_null()
 }
 
 pub(crate) fn split_leading_think_block(text: &str) -> Option<(String, String)> {

@@ -5,32 +5,27 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-async-stream = "0.3"
-async-trait.workspace = true
 axum.workspace = true
-bytes = "1.0"
 brotli.workspace = true
+bytes = "1.0"
 codex-mp-core = { path = "../core" }
 codex-mp-credentials = { path = "../credentials" }
 codex-mp-protocol-bridge = { path = "../protocol-bridge" }
 flate2.workspace = true
 futures = "0.3"
-http.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
-tower.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-sha2.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = "3.23"
+tower.workspace = true
