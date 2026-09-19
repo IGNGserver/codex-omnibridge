@@ -54,7 +54,7 @@ pub fn spawn_tray(config: TrayConfig) -> Option<TrayHandle> {
         thread::spawn(move || {
             windows_tray::run_windows_tray(config, stop_clone);
         });
-        return Some(TrayHandle { stop_signal });
+        Some(TrayHandle { stop_signal })
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -192,76 +192,81 @@ mod windows_tray {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        match msg {
-            WM_TRAYICON => {
-                match lparam as u32 {
-                    WM_LBUTTONDBLCLK => {
-                        if let Some(config) = GLOBAL_CONFIG.get() {
-                            let _ = open::that(&config.web_url);
+        // Edition 2024 (unsafe_op_in_unsafe_fn) requires unsafe operations inside
+        // an `unsafe fn` to be wrapped in an explicit `unsafe` block. The Win32
+        // menu/tray calls below are all unsafe, so the whole body is one block.
+        unsafe {
+            match msg {
+                WM_TRAYICON => {
+                    match lparam as u32 {
+                        WM_LBUTTONDBLCLK => {
+                            if let Some(config) = GLOBAL_CONFIG.get() {
+                                let _ = open::that(&config.web_url);
+                            }
                         }
-                    }
-                    WM_RBUTTONUP => {
-                        let mut pt = POINT { x: 0, y: 0 };
-                        GetCursorPos(&mut pt);
-                        let menu = CreatePopupMenu();
+                        WM_RBUTTONUP => {
+                            let mut pt = POINT { x: 0, y: 0 };
+                            GetCursorPos(&mut pt);
+                            let menu = CreatePopupMenu();
 
-                        let open_str: Vec<u16> = "打开控制面板\0".encode_utf16().collect();
-                        let exit_str: Vec<u16> = "退出 OmniBridge\0".encode_utf16().collect();
-                        let url_str: Vec<u16> = format!(
-                            "访问: {}\0",
-                            GLOBAL_CONFIG
-                                .get()
-                                .map(|c| c.web_url.as_str())
-                                .unwrap_or("")
-                        )
-                        .encode_utf16()
-                        .collect();
+                            let open_str: Vec<u16> = "打开控制面板\0".encode_utf16().collect();
+                            let exit_str: Vec<u16> = "退出 OmniBridge\0".encode_utf16().collect();
+                            let url_str: Vec<u16> = format!(
+                                "访问: {}\0",
+                                GLOBAL_CONFIG
+                                    .get()
+                                    .map(|c| c.web_url.as_str())
+                                    .unwrap_or("")
+                            )
+                            .encode_utf16()
+                            .collect();
 
-                        AppendMenuW(menu, MF_STRING, IDM_OPEN, open_str.as_ptr());
-                        AppendMenuW(
-                            menu,
-                            MF_STRING | MF_DISABLED | MF_GRAYED,
-                            IDM_URL,
-                            url_str.as_ptr(),
-                        );
-                        AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-                        AppendMenuW(menu, MF_STRING, IDM_EXIT, exit_str.as_ptr());
+                            AppendMenuW(menu, MF_STRING, IDM_OPEN, open_str.as_ptr());
+                            AppendMenuW(
+                                menu,
+                                MF_STRING | MF_DISABLED | MF_GRAYED,
+                                IDM_URL,
+                                url_str.as_ptr(),
+                            );
+                            AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+                            AppendMenuW(menu, MF_STRING, IDM_EXIT, exit_str.as_ptr());
 
-                        SetForegroundWindow(hwnd);
-                        TrackPopupMenu(
-                            menu,
-                            TPM_LEFTALIGN | TPM_BOTTOMALIGN,
-                            pt.x,
-                            pt.y,
-                            0,
-                            hwnd,
-                            null_mut(),
-                        );
-                        DestroyMenu(menu);
-                    }
-                    _ => {}
-                }
-                0
-            }
-            WM_COMMAND => {
-                match wparam {
-                    IDM_OPEN => {
-                        if let Some(config) = GLOBAL_CONFIG.get() {
-                            let _ = open::that(&config.web_url);
+                            SetForegroundWindow(hwnd);
+                            TrackPopupMenu(
+                                menu,
+                                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                                pt.x,
+                                pt.y,
+                                0,
+                                hwnd,
+                                null_mut(),
+                            );
+                            DestroyMenu(menu);
                         }
+                        _ => {}
                     }
-                    IDM_EXIT => {
-                        std::process::exit(0);
-                    }
-                    _ => {}
+                    0
                 }
-                0
+                WM_COMMAND => {
+                    match wparam {
+                        IDM_OPEN => {
+                            if let Some(config) = GLOBAL_CONFIG.get() {
+                                let _ = open::that(&config.web_url);
+                            }
+                        }
+                        IDM_EXIT => {
+                            std::process::exit(0);
+                        }
+                        _ => {}
+                    }
+                    0
+                }
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    0
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 
