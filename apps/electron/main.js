@@ -4,12 +4,15 @@ const { fileURLToPath } = require("url");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
+const http = require("http");
 
 let mainWindow = null;
 let tray = null;
 let rustProcess = null;
 let isQuitting = false;
 let restartAttempts = 0;
+let quitCleanupStarted = false;
+const pendingBackendEvents = [];
 
 // 动态生成本次运行专属的本地特权 Token（免密通道）
 const localToken = crypto.randomUUID();
@@ -30,6 +33,7 @@ try {
 
 const PANEL_DIR = path.resolve(__dirname, "../panel");
 const MAX_RESTART_DELAY_MS = 30000;
+const BACKEND_READY_TIMEOUT_MS = 8000;
 
 // 寻找 codex-mp 二进制路径
 function getBinaryPath() {
@@ -77,12 +81,69 @@ function getBinaryPath() {
 }
 
 function reportToRenderer(kind, payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isLoading()) {
+    if (pendingBackendEvents.length >= 50) pendingBackendEvents.shift();
+    pendingBackendEvents.push({ kind, ...payload });
     return;
   }
   // Structured payload instead of string-interpolated script: an error message
   // containing quotes or backticks must not be able to alter the executed code.
   mainWindow.webContents.send("backend-event", { kind, ...payload });
+}
+
+function flushPendingBackendEvents() {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isLoading()) return;
+  while (pendingBackendEvents.length) {
+    mainWindow.webContents.send("backend-event", pendingBackendEvents.shift());
+  }
+}
+
+function requestBackend(pathname, { method = "GET", headers = {}, body = null, timeoutMs = 1000 } = {}) {
+  return new Promise((resolve) => {
+    const request = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: defaultPort,
+        path: pathname,
+        method,
+        headers: {
+          ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
+          ...headers,
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve({ statusCode: response.statusCode || 0 }));
+      },
+    );
+    request.setTimeout(timeoutMs, () => request.destroy());
+    request.on("error", () => resolve({ statusCode: 0 }));
+    if (body) request.write(body);
+    request.end();
+  });
+}
+
+async function waitForBackendReady() {
+  const deadline = Date.now() + BACKEND_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const response = await requestBackend("/healthz", { timeoutMs: 700 });
+    if (response.statusCode >= 200 && response.statusCode < 300) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+async function requestRouterStop() {
+  await requestBackend("/api/v1/router/stop", {
+    method: "POST",
+    timeoutMs: 1200,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${localToken}`,
+      "X-Local-Token": localToken,
+    },
+    body: "{}",
+  });
 }
 
 // 启动 Rust 后台 Web & 路由服务
@@ -241,6 +302,7 @@ function createWindow() {
   });
 
   const localFile = path.resolve(PANEL_DIR, "index.html");
+  mainWindow.webContents.on("did-finish-load", flushPendingBackendEvents);
 
   // 优先直接加载本地打包的控制中心页面（永不黑屏，即开即显）。
   // localToken 通过 preload 的同步 IPC 注入，不再出现在 URL 里。
@@ -409,10 +471,16 @@ if (!gotTheLock) {
     }
   });
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     startRustBackend();
+    const backendReady = await waitForBackendReady();
     createWindow();
     createTray();
+    if (!backendReady) {
+      reportToRenderer("error", {
+        message: "后台控制服务未能在规定时间内就绪，请检查 Router/后台诊断。",
+      });
+    }
 
     // Keep the pre-paint window colour aligned with the OS theme. The panel
     // itself follows the stored preference (which may be explicit light/dark),
@@ -435,17 +503,25 @@ if (!gotTheLock) {
   });
 }
 
-// 应用完全退出时清理 Rust 后台进程
-app.on("before-quit", () => {
+// 应用完全退出时先让 Web 侧的 Supervisor 停止它拥有的 Router，再清理
+// Rust Web 进程。这样 Electron 托盘退出与 Router 的生命周期是同一条链。
+app.on("before-quit", (event) => {
+  if (quitCleanupStarted) return;
+  event.preventDefault();
+  quitCleanupStarted = true;
   isQuitting = true;
-  if (rustProcess) {
-    try {
-      console.log("[Electron Main] 正在停止 Rust 后台守护进程...");
-      rustProcess.kill("SIGTERM");
-    } catch (e) {
-      // 忽略
+  void (async () => {
+    console.log("[Electron Main] 正在停止 Router 与 Rust 后台守护进程...");
+    await requestRouterStop();
+    if (rustProcess) {
+      try {
+        rustProcess.kill("SIGTERM");
+      } catch {
+        // 忽略：进程可能已经退出。
+      }
     }
-  }
+    app.quit();
+  })();
 });
 
 app.on("window-all-closed", () => {

@@ -16,8 +16,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_mp_core::{
-    ModelCapabilities, ModelEdit, ProviderProtocol, ProviderRegistry, clean_verbatim_path,
-    resolve_executable,
+    AuthStrategy, ModelCapabilities, ModelEdit, ProviderProtocol, ProviderRegistry,
+    clean_verbatim_path, resolve_executable,
 };
 use codex_mp_desktop::{DesktopInstallOptions, DesktopPaths, status_for};
 use codex_mp_integration::{IntegrationPaths, build_and_install};
@@ -392,6 +392,7 @@ pub fn create_web_router(state: WebState) -> Router {
         // 状态相关
         .route("/router/status", get(api_router_status))
         .route("/router/restart", post(api_router_restart))
+        .route("/router/stop", post(api_router_stop))
         .route("/desktop/status", get(api_desktop_status))
         .route("/desktop/install", post(api_desktop_install))
         .route("/desktop/restore", post(api_desktop_restore))
@@ -428,6 +429,7 @@ pub fn create_web_router(state: WebState) -> Router {
 
     // 无需鉴权的接口（登录和静态资源）
     Router::new()
+        .route("/healthz", get(api_web_healthz))
         .route("/api/v1/security/status", get(api_security_status))
         .route("/api/v1/security/login", post(api_security_login))
         // Logout only removes the token that was presented, so it is safe to
@@ -1043,6 +1045,14 @@ async fn api_router_status(State(state): State<WebState>) -> Response {
     }
 }
 
+async fn api_web_healthz() -> Response {
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "web",
+    }))
+    .into_response()
+}
+
 async fn api_router_restart(State(state): State<WebState>) -> Response {
     let mut supervisor = state.supervisor.lock().await;
     match supervisor.restart().await {
@@ -1056,6 +1066,18 @@ async fn api_router_restart(State(state): State<WebState>) -> Response {
             Json(serde_json::json!({
                 "error": e.to_string(),
             })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_router_stop(State(state): State<WebState>) -> Response {
+    let mut supervisor = state.supervisor.lock().await;
+    match supervisor.stop().await {
+        Ok(()) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response(),
     }
@@ -1330,6 +1352,30 @@ struct AddProviderReq {
     base_url: String,
     protocol: ProviderProtocol,
     api_key: Option<String>,
+    #[serde(default)]
+    auth_strategy: Option<AuthStrategy>,
+}
+
+fn normalize_optional_auth_strategy(
+    strategy: Option<AuthStrategy>,
+) -> Result<Option<AuthStrategy>, String> {
+    match strategy {
+        None => Ok(None),
+        Some(AuthStrategy::Header { name }) => {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return Err("自定义认证方式需要填写请求头名称".to_owned());
+            }
+            header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("无效的请求头名称：{name}"))?;
+            Ok(Some(AuthStrategy::Header { name }))
+        }
+        Some(other) => Ok(Some(other)),
+    }
+}
+
+fn normalize_auth_strategy(strategy: Option<AuthStrategy>) -> Result<AuthStrategy, String> {
+    Ok(normalize_optional_auth_strategy(strategy)?.unwrap_or_default())
 }
 
 async fn api_add_provider(
@@ -1340,11 +1386,21 @@ async fn api_add_provider(
     let base_url = payload.base_url;
     let protocol = payload.protocol;
     let api_key = payload.api_key.map(SecretString::from);
+    let auth_strategy = match normalize_auth_strategy(payload.auth_strategy) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
     // Offloaded: this writes the API key to the OS keyring, which panics if run
     // on an async worker thread (see `run_blocking_providers`).
     match run_blocking_providers(&state, move |providers| {
         providers
-            .add_provider(&name, &base_url, protocol, api_key)
+            .add_provider_with_auth(&name, &base_url, protocol, auth_strategy, api_key)
             .map_err(|e| e.to_string())
     })
     .await
@@ -1369,6 +1425,8 @@ struct EditProviderReq {
     protocol: Option<ProviderProtocol>,
     enabled: Option<bool>,
     api_key: Option<String>,
+    #[serde(default)]
+    auth_strategy: Option<AuthStrategy>,
 }
 
 async fn api_edit_provider(
@@ -1381,10 +1439,28 @@ async fn api_edit_provider(
     let protocol = payload.protocol;
     let enabled = payload.enabled;
     let api_key = payload.api_key.map(SecretString::from);
+    let auth_strategy = match normalize_optional_auth_strategy(payload.auth_strategy) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+        }
+    };
     // Offloaded: may write the API key to the OS keyring.
     match run_blocking_providers(&state, move |providers| {
         providers
-            .edit_provider(&id, name, base_url, protocol, enabled, api_key)
+            .edit_provider_with_auth(
+                &id,
+                name,
+                base_url,
+                protocol,
+                enabled,
+                auth_strategy,
+                api_key,
+            )
             .map_err(|e| e.to_string())
     })
     .await
@@ -2428,6 +2504,12 @@ mod tests {
             request
         };
 
+        let response =
+            tower::ServiceExt::oneshot(create_web_router(state.clone()), get("/healthz"))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         // An unknown API path must be a JSON 404, not an HTML 200.
         let response =
             tower::ServiceExt::oneshot(create_web_router(state.clone()), get("/api/v1/nope"))
@@ -2655,7 +2737,8 @@ mod tests {
                     "name": "Probe",
                     "base_url": "https://example.test/v1",
                     "api_key": "sk-probe",
-                    "protocol": "responses"
+                    "protocol": "responses",
+                    "auth_strategy": {"header": {"name": "X-Tenant-Key"}}
                 })
                 .to_string(),
             ))
@@ -2681,6 +2764,18 @@ mod tests {
             StatusCode::OK,
             "providers/add must succeed when the keyring work is offloaded; body: {}",
             String::from_utf8_lossy(&body)
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            summary["auth_strategy"],
+            serde_json::json!({"header": {"name": "X-Tenant-Key"}})
+        );
+        let registry = ProviderRegistry::load(&registry_path).unwrap();
+        assert_eq!(
+            registry.provider("probe").unwrap().auth_strategy,
+            codex_mp_core::AuthStrategy::Header {
+                name: "X-Tenant-Key".into()
+            }
         );
     }
 

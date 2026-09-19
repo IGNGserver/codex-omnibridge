@@ -198,6 +198,7 @@ function readRoute(route) {
 
 // Mutating routes the panel calls. Each returns a plausible success payload.
 const MUTATIONS = new Set([
+  "/api/v1/router/restart",
   "/api/v1/security/login",
   "/api/v1/security/logout",
   "/api/v1/security/update",
@@ -219,13 +220,97 @@ const MUTATIONS = new Set([
   "/api/v1/desktop/restore",
 ]);
 
-function mockResponse(route) {
+function mockResponse(route, payload = {}) {
+  if (route === "/api/v1/router/restart") return { healthy: true, running: true, port: 31828 };
   if (route === "/api/v1/security/login") return { token: "mock-session-token" };
   if (route === "/api/v1/security/update") return { token: "mock-session-token" };
   if (route === "/api/v1/accounts/restart-codex") return { terminated_pids: [11, 22, 33] };
   if (route === "/api/v1/accounts/capture") return { name: "新收纳账号" };
   if (route === "/api/v1/accounts/import") return { name: "导入的账号" };
   if (route === "/api/v1/accounts/switch") return { account: { name: "已切换账号" } };
+  if (route === "/api/v1/providers/add") {
+    const id = String(payload.name || "provider")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "provider";
+    const provider = {
+      id,
+      name: String(payload.name || id),
+      base_url: String(payload.base_url || ""),
+      protocol: payload.protocol || "responses",
+      auth_strategy: payload.auth_strategy || "bearer",
+      models: [],
+    };
+    providers.push(provider);
+    return provider;
+  }
+  if (route === "/api/v1/providers/edit") {
+    const provider = providers.find((item) => item.id === payload.id);
+    if (provider) {
+      if (payload.name) provider.name = payload.name;
+      if (payload.base_url) provider.base_url = payload.base_url;
+      if (payload.protocol) provider.protocol = payload.protocol;
+      if (payload.auth_strategy) provider.auth_strategy = payload.auth_strategy;
+      return provider;
+    }
+  }
+  if (route === "/api/v1/providers/remove") {
+    const index = providers.findIndex((item) => item.id === payload.id);
+    if (index >= 0) providers.splice(index, 1);
+    return { ok: true };
+  }
+  if (route === "/api/v1/models/add") {
+    const provider = providers.find((item) => item.id === payload.provider_id);
+    const model = {
+      logical_model_id: payload.provider_id + "/" + payload.upstream_model_id,
+      upstream_model_id: payload.upstream_model_id,
+      display_name: payload.display_name || (provider?.name || payload.provider_id) + " / " + payload.upstream_model_id,
+      context_window: payload.context_window || null,
+      enabled: true,
+      capabilities: { images: !!payload.images, tools: !!payload.tools },
+    };
+    provider?.models.push(model);
+    return model;
+  }
+  if (route === "/api/v1/models/import") {
+    const provider = providers.find((item) => item.id === payload.provider_id);
+    const selected = new Set(payload.selected_ids || []);
+    for (const item of discovered) {
+      if (!selected.has(item.upstream_model_id)) continue;
+      provider?.models.push({
+        logical_model_id: payload.provider_id + "/" + item.upstream_model_id,
+        upstream_model_id: item.upstream_model_id,
+        display_name: item.display_name,
+        context_window: item.context_window || null,
+        enabled: true,
+        capabilities: { images: false, tools: false },
+      });
+    }
+    return provider?.models || [];
+  }
+  if (route === "/api/v1/models/enabled") {
+    for (const provider of providers) {
+      const model = provider.models.find((item) => item.logical_model_id === payload.logical_model_id);
+      if (model) model.enabled = !!payload.enabled;
+    }
+  }
+  if (route === "/api/v1/models/edit") {
+    for (const provider of providers) {
+      const model = provider.models.find((item) => item.logical_model_id === payload.logical_model_id);
+      if (model) {
+        if (payload.display_name) model.display_name = payload.display_name;
+        if (payload.clear_context_window) model.context_window = null;
+        else if (payload.context_window) model.context_window = payload.context_window;
+        return model;
+      }
+    }
+  }
+  if (route === "/api/v1/models/remove") {
+    for (const provider of providers) {
+      provider.models = provider.models.filter((item) => item.logical_model_id !== payload.logical_model_id);
+    }
+  }
   return { ok: true };
 }
 
@@ -235,8 +320,15 @@ const server = http.createServer((req, res) => {
 
   if (route.startsWith("/api/")) {
     // Drain the body so the connection can be reused.
-    req.on("data", () => {});
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
+      let payload = {};
+      try {
+        payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {
+        payload = {};
+      }
       const headers = {
         "Content-Type": "application/json",
         "X-Content-Type-Options": "nosniff",
@@ -255,7 +347,7 @@ const server = http.createServer((req, res) => {
       const read = readRoute(route);
       if (read !== null) return send(200, read);
 
-      if (MUTATIONS.has(route)) return send(200, mockResponse(route));
+      if (MUTATIONS.has(route)) return send(200, mockResponse(route, payload));
 
       return send(500, { error: `mock: unhandled ${route}` });
     });

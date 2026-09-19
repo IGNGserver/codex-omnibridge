@@ -33,6 +33,25 @@ let sessionToken = (window.electronAPI && window.electronAPI.localToken)
   ? window.electronAPI.localToken
   : (queryToken || localStorage.getItem("codex_mp_token") || "");
 
+const CATALOG_STATE_KEY = "codex_mp_catalog_state";
+let catalogState = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CATALOG_STATE_KEY) || "null");
+    if (saved && typeof saved === "object") {
+      return {
+        pending: Boolean(saved.pending),
+        routerNeedsRestart: Boolean(saved.routerNeedsRestart),
+        reason: typeof saved.reason === "string" ? saved.reason : "",
+        catalogPath: typeof saved.catalogPath === "string" ? saved.catalogPath : "",
+      };
+    }
+  } catch {
+    // A corrupt preference must never stop the panel from loading.
+  }
+  return { pending: false, routerNeedsRestart: false, reason: "", catalogPath: "" };
+})();
+let lastRouterStatus = null;
+
 // ==========================================================================
 // 1. API 客户端与鉴权
 // ==========================================================================
@@ -90,7 +109,7 @@ async function api(path, options = {}) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error || data.message || `请求失败 (${response.status})`);
+    throw new Error(formatApiError(data, response.status));
   }
   // The backend saves a change before asking a running Router to reload it. If
   // that reload fails the change is on disk but the Router keeps serving the old
@@ -98,7 +117,11 @@ async function api(path, options = {}) {
   // as `router_reload_warning`; without surfacing it here the user only saw
   // "已更新" and had no way to learn the Router needed a restart.
   if (data && typeof data.router_reload_warning === "string" && data.router_reload_warning) {
-    notify(`已保存，但运行中的 Router 未重载：${data.router_reload_warning}`, true);
+    markRouterNeedsRestart(data.router_reload_warning);
+    notify("配置已保存，但后台路由仍在使用旧版本。", true, {
+      label: "重启后台",
+      onClick: () => restartRouter(),
+    });
   }
   return data;
 }
@@ -122,6 +145,92 @@ let snackbarVisible = false;
 function notify(text, error = false, action = null) {
   snackbarQueue.push({ text, error, action });
   if (!snackbarVisible) drainSnackbarQueue();
+}
+
+const API_ERROR_LABELS = {
+  WebAccessDisabled: "浏览器访问尚未开启，请到设置中开启并保存访问密码。",
+  PasswordRequired: "开启浏览器访问前，请先设置访问密码。",
+  Unauthorized: "登录状态已失效，请重新登录控制台。",
+  TooManyAttempts: "登录尝试过于频繁，请稍后再试。",
+  NotFound: "没有找到对应的操作，请刷新页面后重试。",
+};
+
+function formatApiError(data, status) {
+  const candidate = data && typeof data === "object" ? (data.message || data.error) : "";
+  const raw = typeof candidate === "string" && candidate.trim() ? candidate.trim() : `请求失败 (${status})`;
+  return API_ERROR_LABELS[raw] || raw;
+}
+
+function persistCatalogState() {
+  try {
+    localStorage.setItem(CATALOG_STATE_KEY, JSON.stringify(catalogState));
+  } catch {
+    // Storage is a convenience; the current view remains usable without it.
+  }
+}
+
+function renderCatalogState() {
+  const badge = document.querySelector("#catalog-state-badge");
+  const setupSummary = document.querySelector("#setup-guide-summary");
+  const applyButtons = [
+    document.querySelector("#topbar-sync-btn"),
+    document.querySelector("#setup-apply-btn"),
+  ].filter(Boolean);
+  let label = "Codex 列表已更新";
+  let className = "m3-chip m3-chip--success";
+  let summary = "模型已应用到 Codex，可在模型选择器或 /model 中使用。";
+  if (catalogState.pending) {
+    label = "有待应用变更";
+    className = "m3-chip m3-chip--warning";
+    summary = catalogState.reason || "模型配置已保存，还需要应用到 Codex。";
+  } else if (catalogState.routerNeedsRestart) {
+    label = "后台待重启";
+    className = "m3-chip m3-chip--warning";
+    summary = "模型列表已经更新，但后台路由需要重启后才会使用最新配置。";
+  }
+  if (badge) {
+    badge.textContent = label;
+    badge.className = className;
+  }
+  if (setupSummary && (catalogState.pending || catalogState.routerNeedsRestart)) {
+    setupSummary.textContent = summary;
+  }
+  applyButtons.forEach((button) => {
+    const text = button.querySelector(".m3-btn__label") || button.querySelector("span:last-child");
+    if (text) {
+      text.textContent = button.id === "setup-apply-btn"
+        ? (catalogState.pending || catalogState.routerNeedsRestart ? "应用到 Codex" : "重新应用")
+        : "应用到 Codex";
+    }
+    button.classList.toggle("m3-btn--attention", catalogState.pending || catalogState.routerNeedsRestart);
+  });
+  persistCatalogState();
+  refreshSetupGuide();
+}
+
+function markCatalogPending(reason = "模型配置已保存，还需要应用到 Codex。") {
+  catalogState.pending = true;
+  catalogState.reason = reason;
+  renderCatalogState();
+}
+
+function markCatalogApplied(catalogPath = "") {
+  catalogState.pending = false;
+  catalogState.reason = "";
+  if (catalogPath) catalogState.catalogPath = catalogPath;
+  renderCatalogState();
+}
+
+function markRouterNeedsRestart(reason = "") {
+  catalogState.routerNeedsRestart = true;
+  catalogState.reason = reason || catalogState.reason;
+  renderCatalogState();
+}
+
+function clearRouterRestartAttention() {
+  catalogState.routerNeedsRestart = false;
+  catalogState.reason = "";
+  renderCatalogState();
 }
 
 function drainSnackbarQueue() {
@@ -188,7 +297,7 @@ function openDialog(id) {
   } else {
     dialog.setAttribute("open", "");
   }
-  const autoFocus = dialog.querySelector("[autofocus], .m3-text-field__input, .m3-select");
+  const autoFocus = dialog.querySelector("[autofocus], .m3-text-field__input, .m3-select-button");
   if (autoFocus) requestAnimationFrame(() => autoFocus.focus());
   return dialog;
 }
@@ -211,6 +320,218 @@ function closeDialog(id) {
   }
   restoreDialogFocus(id);
 }
+
+// --- M3 select / listbox --------------------------------------------------
+// Keep a real <select> in the form so native validation, FormData and
+// no-script fallbacks remain intact. The visible control is a themed
+// listbox, which avoids handing the popup surface over to the OS/Electron
+// native menu (the source of the white, unstyled protocol menu).
+const m3SelectStates = new Set();
+let m3SelectSequence = 0;
+
+function syncM3Select(state) {
+  const selected = state.select.options[state.select.selectedIndex];
+  state.button.querySelector(".m3-select-button__label").textContent = selected
+    ? selected.textContent
+    : "请选择";
+  state.optionButtons.forEach((optionButton, index) => {
+    const isSelected = index === state.select.selectedIndex;
+    optionButton.setAttribute("aria-selected", String(isSelected));
+  });
+  const selectedButton = state.optionButtons[state.select.selectedIndex];
+  if (selectedButton) {
+    state.activeIndex = state.select.selectedIndex;
+    state.button.setAttribute("aria-activedescendant", selectedButton.id);
+  } else {
+    state.activeIndex = -1;
+    state.button.removeAttribute("aria-activedescendant");
+  }
+}
+
+function renderM3SelectOptions(state) {
+  state.menu.replaceChildren();
+  state.optionButtons = Array.from(state.select.options).map((option, index) => {
+    const optionButton = document.createElement("button");
+    optionButton.type = "button";
+    optionButton.className = "m3-select-option";
+    optionButton.id = `${state.id}-option-${index}`;
+    optionButton.setAttribute("role", "option");
+    optionButton.dataset.value = option.value;
+    optionButton.textContent = option.textContent;
+    optionButton.disabled = option.disabled;
+    state.menu.appendChild(optionButton);
+    return optionButton;
+  });
+  syncM3Select(state);
+}
+
+function closeM3Select(state) {
+  state.menu.hidden = true;
+  state.button.setAttribute("aria-expanded", "false");
+}
+
+function openM3Select(state) {
+  m3SelectStates.forEach((other) => {
+    if (other !== state) closeM3Select(other);
+  });
+  state.menu.hidden = false;
+  state.button.setAttribute("aria-expanded", "true");
+  state.activeIndex = state.select.selectedIndex;
+  const selectedButton = state.optionButtons[state.activeIndex];
+  selectedButton?.scrollIntoView({ block: "nearest" });
+}
+
+function chooseM3SelectOption(state, index) {
+  const option = state.select.options[index];
+  if (!option || option.disabled) return;
+  state.select.value = option.value;
+  state.select.dispatchEvent(new Event("change", { bubbles: true }));
+  closeM3Select(state);
+  state.button.focus();
+}
+
+function moveM3SelectActive(state, direction) {
+  if (!state.optionButtons.length) return;
+  let index = state.activeIndex;
+  do {
+    index = (index + direction + state.optionButtons.length) % state.optionButtons.length;
+  } while (state.optionButtons[index].disabled && index !== state.activeIndex);
+  state.activeIndex = index;
+  const active = state.optionButtons[index];
+  state.button.setAttribute("aria-activedescendant", active.id);
+  active.scrollIntoView({ block: "nearest" });
+}
+
+function initM3Select(select) {
+  if (!select || select.dataset.m3SelectReady === "true") {
+    return m3SelectStates.values().find((state) => state.select === select) || null;
+  }
+  const control = select.closest(".m3-text-field__control");
+  if (!control) return null;
+
+  const label = control.querySelector(".m3-text-field__label");
+  if (label && !label.id) label.id = `${select.id || "m3-select"}-label`;
+  const id = select.id || `m3-select-${++m3SelectSequence}`;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "m3-select m3-select-button";
+  button.setAttribute("role", "combobox");
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  if (label) button.setAttribute("aria-labelledby", label.id);
+  button.innerHTML = '<span class="m3-select-button__label"></span>';
+
+  const menu = document.createElement("div");
+  menu.className = "m3-select-menu";
+  menu.id = `${id}-menu`;
+  menu.setAttribute("role", "listbox");
+  menu.hidden = true;
+  button.setAttribute("aria-controls", menu.id);
+
+  const state = {
+    id,
+    select,
+    button,
+    menu,
+    optionButtons: [],
+    activeIndex: -1,
+    observer: null,
+  };
+  m3SelectStates.add(state);
+  select.dataset.m3SelectReady = "true";
+  select.classList.add("m3-select--native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+  select.setAttribute("aria-controls", menu.id);
+  control.insertBefore(button, select);
+  control.appendChild(menu);
+
+  renderM3SelectOptions(state);
+  select.addEventListener("change", () => syncM3Select(state));
+  button.addEventListener("click", () => {
+    if (state.menu.hidden) openM3Select(state);
+    else closeM3Select(state);
+  });
+  button.addEventListener("keydown", (event) => {
+    if (["ArrowDown", "ArrowUp", "Home", "End", "Enter", " ", "Escape"].includes(event.key)) {
+      event.preventDefault();
+    }
+    if (event.key === "Escape") {
+      closeM3Select(state);
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      if (state.menu.hidden) openM3Select(state);
+      moveM3SelectActive(state, 1);
+    } else if (event.key === "ArrowUp") {
+      if (state.menu.hidden) openM3Select(state);
+      moveM3SelectActive(state, -1);
+    } else if (event.key === "Home") {
+      if (state.menu.hidden) openM3Select(state);
+      const firstEnabled = state.optionButtons.findIndex((optionButton) => !optionButton.disabled);
+      if (firstEnabled >= 0) {
+        state.activeIndex = firstEnabled;
+        state.button.setAttribute("aria-activedescendant", state.optionButtons[firstEnabled].id);
+        state.optionButtons[firstEnabled].scrollIntoView({ block: "nearest" });
+      }
+    } else if (event.key === "End") {
+      if (state.menu.hidden) openM3Select(state);
+      let lastEnabled = -1;
+      for (let index = state.optionButtons.length - 1; index >= 0; index -= 1) {
+        if (!state.optionButtons[index].disabled) {
+          lastEnabled = index;
+          break;
+        }
+      }
+      if (lastEnabled >= 0) {
+        state.activeIndex = lastEnabled;
+        state.button.setAttribute("aria-activedescendant", state.optionButtons[lastEnabled].id);
+        state.optionButtons[lastEnabled].scrollIntoView({ block: "nearest" });
+      }
+    } else if (event.key === "Enter" || event.key === " ") {
+      if (state.menu.hidden) openM3Select(state);
+      else chooseM3SelectOption(state, state.activeIndex);
+    }
+  });
+  menu.addEventListener("click", (event) => {
+    const optionButton = event.target.closest(".m3-select-option");
+    if (!optionButton) return;
+    chooseM3SelectOption(state, state.optionButtons.indexOf(optionButton));
+  });
+  state.observer = new MutationObserver(() => renderM3SelectOptions(state));
+  state.observer.observe(select, { childList: true });
+  return state;
+}
+
+function setM3SelectValue(select, value) {
+  if (!select) return;
+  select.value = value == null ? "" : String(value);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function initM3Selects() {
+  document.querySelectorAll("select.m3-select").forEach(initM3Select);
+  document.querySelectorAll("form").forEach((form) => {
+    if (form.dataset.m3SelectResetReady === "true") return;
+    form.dataset.m3SelectResetReady = "true";
+    form.addEventListener("reset", () => {
+      requestAnimationFrame(() => {
+        form.querySelectorAll("select.m3-select").forEach((select) => {
+          const state = Array.from(m3SelectStates).find((item) => item.select === select);
+          if (state) syncM3Select(state);
+        });
+      });
+    });
+  });
+}
+
+document.addEventListener("pointerdown", (event) => {
+  m3SelectStates.forEach((state) => {
+    if (!state.menu.hidden && !state.menu.contains(event.target) && event.target !== state.button) {
+      closeM3Select(state);
+    }
+  });
+});
 
 document.querySelectorAll("dialog.m3-dialog").forEach((dialog) => {
   // Clicking the backdrop cancels, matching platform convention for
@@ -879,6 +1200,84 @@ function errorState({ title, body, retryId }) {
   `;
 }
 
+function refreshSetupGuide() {
+  const guide = document.querySelector("#setup-guide");
+  if (!guide) return;
+  const providers = Array.isArray(cachedProviders) ? cachedProviders : [];
+  const providerReady = providers.length > 0;
+  const modelReady = providers.some((provider) => (provider.models || []).some((model) => model.enabled !== false));
+  const routerReady = Boolean(lastRouterStatus?.healthy);
+  const steps = {
+    provider: guide.querySelector('[data-setup-step="provider"]'),
+    model: guide.querySelector('[data-setup-step="model"]'),
+    apply: guide.querySelector('[data-setup-step="apply"]'),
+  };
+  const markStep = (step, state) => {
+    if (!step) return;
+    step.classList.toggle("is-complete", state === "complete");
+    step.classList.toggle("is-current", state === "current");
+    step.classList.toggle("is-muted", state === "muted");
+    const number = step.querySelector(".m3-setup-step__number");
+    if (number) number.textContent = state === "complete" ? "✓" : number.dataset.stepNumber || number.textContent;
+  };
+  Object.values(steps).forEach((step) => {
+    if (step) {
+      const number = step.querySelector(".m3-setup-step__number");
+      if (number && !number.dataset.stepNumber) number.dataset.stepNumber = number.textContent;
+    }
+  });
+
+  markStep(steps.provider, providerReady ? "complete" : "current");
+  markStep(steps.model, !providerReady ? "muted" : modelReady ? "complete" : "current");
+  markStep(steps.apply, !modelReady ? "muted" : catalogState.pending || catalogState.routerNeedsRestart ? "current" : "complete");
+
+  const title = document.querySelector("#setup-guide-title");
+  const summary = document.querySelector("#setup-guide-summary");
+  const kicker = document.querySelector("#setup-guide-kicker");
+  const addProvider = document.querySelector("#setup-add-provider-btn");
+  const openModels = document.querySelector("#setup-open-models-btn");
+  const apply = document.querySelector("#setup-apply-btn");
+  if (!providerReady) {
+    if (kicker) kicker.textContent = "从这里开始";
+    if (title) title.textContent = "把第一个模型接入 Codex";
+    if (summary) summary.textContent = "添加一个模型服务商，选择模型，然后应用到 Codex。";
+    if (addProvider) addProvider.textContent = "添加服务商";
+    if (openModels) openModels.disabled = true;
+    if (apply) apply.disabled = true;
+  } else if (!modelReady) {
+    if (kicker) kicker.textContent = "还差一步";
+    if (title) title.textContent = "选择要显示在 Codex 里的模型";
+    if (summary) summary.textContent = "服务商已保存。打开模型页并点击发现模型，选择需要的模型。";
+    if (addProvider) addProvider.textContent = "再加一个服务商";
+    if (openModels) openModels.disabled = false;
+    if (apply) apply.disabled = true;
+  } else if (catalogState.pending || catalogState.routerNeedsRestart) {
+    if (kicker) kicker.textContent = "需要应用";
+    if (title) title.textContent = catalogState.routerNeedsRestart ? "后台需要重启" : "模型配置已准备好";
+    if (summary) summary.textContent = catalogState.routerNeedsRestart
+      ? "模型列表已更新，但后台路由仍在使用旧配置。"
+      : "点击应用，模型就会出现在 Codex 的模型选择列表中。";
+    if (addProvider) addProvider.textContent = "管理服务商";
+    if (openModels) openModels.disabled = false;
+    if (apply) {
+      apply.disabled = false;
+      apply.textContent = catalogState.routerNeedsRestart ? "重启后台并应用" : "应用到 Codex";
+    }
+  } else {
+    if (kicker) kicker.textContent = "已准备好";
+    if (title) title.textContent = "模型已可在 Codex 中使用";
+    if (summary) summary.textContent = routerReady
+      ? "打开 Codex 的模型选择器或输入 /model，即可切换模型。"
+      : "模型列表已应用；使用第三方模型前请确保后台路由正在运行。";
+    if (addProvider) addProvider.textContent = "管理服务商";
+    if (openModels) openModels.disabled = false;
+    if (apply) {
+      apply.disabled = false;
+      apply.textContent = "重新应用";
+    }
+  }
+}
+
 // ==========================================================================
 function cleanPath(p) {
   if (typeof p !== "string") return p;
@@ -887,56 +1286,124 @@ function cleanPath(p) {
   return p;
 }
 
+async function applyCatalog({ button = null, silent = false } = {}) {
+  const run = async () => {
+    const restartAfterApply = catalogState.routerNeedsRestart;
+    if (!silent) notify("正在应用模型列表到 Codex…");
+    try {
+      const res = await api("/api/v1/catalog/sync", { method: "POST" });
+      markCatalogApplied(res.catalog_path || "");
+      if (restartAfterApply || catalogState.routerNeedsRestart) {
+        if (!silent) notify("正在重启后台路由以载入最新模型…");
+        await api("/api/v1/router/restart", { method: "POST" });
+        clearRouterRestartAttention();
+      }
+      if (!silent) notify("模型列表已应用到 Codex");
+      await refreshRouterStatus();
+      return res;
+    } catch (error) {
+      markCatalogPending("模型配置已保存，但应用到 Codex 失败。请检查 Codex 路径后重试。");
+      if (!silent) notify(error.message, true);
+      throw error;
+    }
+  };
+  return button ? withBusy(button, run) : run();
+}
+
+async function restartRouter() {
+  const restartBtn = document.querySelector("#router-restart-btn");
+  return withBusy(restartBtn, async () => {
+    try {
+      notify("正在重启后台路由…");
+      await api("/api/v1/router/restart", { method: "POST" });
+      clearRouterRestartAttention();
+      notify("后台路由已重启并就绪");
+      await refreshRouterStatus();
+    } catch (error) {
+      notify(`后台路由重启失败：${error.message}`, true);
+      await refreshRouterStatus();
+      throw error;
+    }
+  });
+}
+
 // 6. 状态刷新：Router / Desktop / 安全
 // ==========================================================================
 
 let cachedProviders = [];
 let cachedAccounts = [];
+let modelFilterQuery = "";
+let modelFilterEnabledOnly = false;
+let routerStatusPollTimer = null;
+let routerStatusRequestInFlight = false;
+
+function scheduleRouterStatusPoll(delay = 1500) {
+  if (routerStatusPollTimer) clearTimeout(routerStatusPollTimer);
+  routerStatusPollTimer = setTimeout(() => {
+    routerStatusPollTimer = null;
+    void refreshRouterStatus();
+  }, delay);
+}
 
 async function refreshRouterStatus() {
+  if (routerStatusRequestInFlight) return;
+  routerStatusRequestInFlight = true;
   const badge = document.querySelector("#router-state-badge");
   const text = document.querySelector("#router-state-text");
   const metricVal = document.querySelector("#metric-router-val");
   const metricDesc = document.querySelector("#metric-router-desc");
   const restartBtn = document.querySelector("#router-restart-btn");
+  let pollAgain = false;
 
   try {
     const status = await api("/api/v1/router/status");
+    lastRouterStatus = status;
     if (status.healthy) {
       badge.className = "m3-chip m3-chip--success";
-      text.textContent = "Router 正常";
+      text.textContent = "后台路由正常";
       metricVal.textContent = "在线运行中";
-      metricDesc.textContent = "透传官方与自定义分流正常";
+      metricDesc.textContent = "官方与第三方模型分流正常";
       if (restartBtn) restartBtn.classList.remove("is-hidden");
+      pollAgain = false;
     } else if (status.running && status.starting) {
       badge.className = "m3-chip m3-chip--warning";
-      text.textContent = "Router 启动中";
+      text.textContent = "后台路由启动中";
       metricVal.textContent = "启动中…";
       metricDesc.textContent = "正在建立端点连接";
       if (restartBtn) restartBtn.classList.add("is-hidden");
+      pollAgain = true;
     } else if (status.running) {
       badge.className = "m3-chip m3-chip--warning";
-      text.textContent = "Router 异常";
+      text.textContent = "后台路由异常";
       metricVal.textContent = "运行异常";
       metricDesc.textContent = status.last_error
-        ? `异常原因: ${status.last_error}`
-        : "服务未通过健康检查";
+        ? `需要处理：${status.last_error}`
+        : "后台服务未通过健康检查";
       if (restartBtn) restartBtn.classList.remove("is-hidden");
+      pollAgain = !status.last_error;
     } else {
       badge.className = "m3-chip m3-chip--error";
-      text.textContent = "Router 未运行";
-      metricVal.textContent = "离线";
+      text.textContent = "后台路由未运行";
+      metricVal.textContent = status.last_error ? "启动失败" : "离线";
       metricDesc.textContent = status.last_error
-        ? `启动失败: ${status.last_error}`
-        : "后台服务未启动";
+        ? `启动失败：${status.last_error}`
+        : "后台服务未启动，点击重启即可尝试恢复";
       if (restartBtn) restartBtn.classList.remove("is-hidden");
+      pollAgain = !status.last_error;
     }
+    refreshSetupGuide();
   } catch {
+    lastRouterStatus = null;
     badge.className = "m3-chip m3-chip--warning";
-    text.textContent = "Router 状态未知";
+    text.textContent = "后台路由状态未知";
     metricVal.textContent = "未知";
-    metricDesc.textContent = "无法获取状态";
+    metricDesc.textContent = "无法获取后台状态";
     if (restartBtn) restartBtn.classList.remove("is-hidden");
+    refreshSetupGuide();
+    pollAgain = true;
+  } finally {
+    routerStatusRequestInFlight = false;
+    if (pollAgain) scheduleRouterStatusPoll();
   }
 }
 
@@ -1032,7 +1499,8 @@ function renderAccountCard(acc) {
   const card = document.createElement("div");
   card.className = `m3-card m3-card--large m3-account-card${acc.is_active ? " active" : ""}`;
 
-  const plan = acc.plan_type || "plus";
+  const plan = String(acc.plan_type || "").trim().toLowerCase();
+  const planLabel = knownPlanClasses.has(plan) ? plan.toUpperCase() : "方案未知";
   const planClass = sanitizePlanClass(plan);
   const usage = acc.usage;
 
@@ -1043,7 +1511,7 @@ function renderAccountCard(acc) {
         <span class="m3-body-small m3-text-variant">${escapeHtml(acc.email || "未知邮箱")}</span>
       </div>
       <div class="m3-account-badges">
-        <span class="m3-plan-chip ${planClass}">${escapeHtml(plan)}</span>
+        <span class="m3-plan-chip ${planClass}">${escapeHtml(planLabel)}</span>
         ${acc.is_active ? '<span class="m3-chip m3-chip--success m3-chip--sm">当前生效</span>' : ""}
       </div>
     </div>
@@ -1059,7 +1527,7 @@ function renderAccountCard(acc) {
         !acc.is_active
           ? `<button class="m3-btn m3-btn-filled m3-btn-xs switch-acc-btn" data-id="${escapeAttr(acc.id)}">
                <span class="material-symbols-outlined m3-i-swap-horiz" aria-hidden="true"></span>
-               <span>切换并重启</span>
+               <span>切换账号</span>
              </button>`
           : `<button class="m3-btn m3-btn-tonal m3-btn-xs" disabled>
                <span class="material-symbols-outlined m3-i-check" aria-hidden="true"></span>
@@ -1083,13 +1551,30 @@ function renderAccountCard(acc) {
   const switchBtn = card.querySelector(".switch-acc-btn");
   if (switchBtn) {
     switchBtn.onclick = () => withBusy(switchBtn, async () => {
+      const choice = await m3Confirm(
+        "切换官方账号",
+        `切换到【${acc.name}】后，现有 Codex 进程是否立即重启？不重启时，新账号会在下次启动 Codex 后生效。`,
+        {
+          destructive: false,
+          confirmLabel: "切换账号",
+          checkbox: {
+            label: "现在重启 Codex（推荐）",
+            defaultChecked: true,
+          },
+        },
+      );
+      if (!choice.confirmed) return;
       try {
-        notify(`正在切换至账号【${acc.name}】并重启 Codex…`);
+        notify(choice.checked
+          ? "正在切换至账号【" + acc.name + "】并重启 Codex…"
+          : "正在切换至账号【" + acc.name + "】…");
         const res = await api("/api/v1/accounts/switch", {
           method: "POST",
-          body: JSON.stringify({ account_id: acc.id, restart_codex: true }),
+          body: JSON.stringify({ account_id: acc.id, restart_codex: choice.checked }),
         });
-        notify(`已切换至【${res.account.name}】并重启 Codex 运行时`);
+        notify(choice.checked
+          ? "已切换至【" + res.account.name + "】并重启 Codex 运行时"
+          : "已切换至【" + res.account.name + "】，下次启动 Codex 时生效");
         await refreshAccounts();
       } catch (e) {
         notify(e.message, true);
@@ -1164,7 +1649,8 @@ async function refreshAccounts() {
     // 总览：当前生效账号
     if (active && active.is_logged_in && active.email) {
       metricVal.textContent = active.email;
-      metricPlan.textContent = `方案: ${(active.plan_type || "plus").toUpperCase()}`;
+      const activePlan = String(active.plan_type || "").trim().toLowerCase();
+      metricPlan.textContent = "方案: " + (knownPlanClasses.has(activePlan) ? activePlan.toUpperCase() : "未知");
     } else {
       metricVal.textContent = "当前未登录";
       metricPlan.textContent = "未检测到有效会话";
@@ -1175,7 +1661,7 @@ async function refreshAccounts() {
     if (activeAccObj && activeAccObj.usage) {
       overviewUsageContainer.innerHTML = `
         <div class="m3-usage-grid">
-          ${renderUsageMetric("5 小时窗口额度 (Plus)", activeAccObj.usage.primary_5h, { variant: "wavy" })}
+          ${renderUsageMetric("5 小时窗口额度", activeAccObj.usage.primary_5h, { variant: "wavy" })}
           ${renderUsageMetric("7 天周额度", activeAccObj.usage.secondary_weekly, { variant: "wavy" })}
           ${renderReserveMetric(activeAccObj.usage.reserve)}
         </div>
@@ -1183,7 +1669,7 @@ async function refreshAccounts() {
     } else if (active && active.is_logged_in) {
       overviewUsageContainer.innerHTML = `
         <p class="m3-body-medium m3-text-variant">
-          当前正生效账号：<strong>${escapeHtml(active.email)}</strong> (${escapeHtml((active.plan_type || "plus").toUpperCase())})。请点击“保存当前登录态”收纳并查看精准额度。
+          当前正生效账号：<strong>${escapeHtml(active.email)}</strong>（${escapeHtml(knownPlanClasses.has(String(active.plan_type || "").trim().toLowerCase()) ? String(active.plan_type).toUpperCase() : "方案未知")}）。请保存当前账号后查看精准额度。
         </p>
       `;
     } else {
@@ -1221,9 +1707,27 @@ async function refreshAccounts() {
 // 8. 服务商与模型页面
 // ==========================================================================
 
+async function finishCatalogMutation(message) {
+  markCatalogPending();
+  await refreshProviders();
+  try {
+    await applyCatalog({ silent: true });
+    notify(message + "，已应用到 Codex");
+  } catch {
+    notify(message + "，但尚未应用到 Codex；可点击“应用到 Codex”重试。", true);
+  }
+}
+
 function renderModelRow(model) {
   const row = document.createElement("div");
   row.className = "m3-model-row";
+  row.dataset.logicalModelId = model.logical_model_id;
+  row.dataset.modelSearch = [
+    model.display_name,
+    model.logical_model_id,
+    model.upstream_model_id,
+  ].filter(Boolean).join(" ").toLowerCase();
+  row.dataset.modelEnabled = String(model.enabled !== false);
 
   const contextText = model.context_window ? `${model.context_window} tokens` : "默认上下文";
   const capabilities = model.capabilities || {};
@@ -1237,7 +1741,7 @@ function renderModelRow(model) {
       <div class="m3-model-tags">
         <span class="m3-chip m3-chip--neutral m3-chip--sm m3-numeric">${escapeHtml(contextText)}</span>
         ${capabilities.images ? '<span class="m3-chip m3-chip--tertiary m3-chip--sm">图片</span>' : ""}
-        ${capabilities.tools ? '<span class="m3-chip m3-chip--assist m3-chip--sm">Tools</span>' : ""}
+        ${capabilities.tools ? '<span class="m3-chip m3-chip--assist m3-chip--sm">工具调用</span>' : ""}
       </div>
     </div>
     <div class="m3-model-actions">
@@ -1264,8 +1768,7 @@ function renderModelRow(model) {
         method: "POST",
         body: JSON.stringify({ logical_model_id: model.logical_model_id, enabled: toggleSwitch.checked }),
       });
-      notify(`模型【${model.logical_model_id}】已${toggleSwitch.checked ? "启用" : "停用"}`);
-      await refreshProviders();
+      await finishCatalogMutation("模型【" + model.logical_model_id + "】已" + (toggleSwitch.checked ? "启用" : "停用"));
     } catch (e) {
       notify(e.message, true);
       toggleSwitch.checked = !toggleSwitch.checked;
@@ -1273,36 +1776,16 @@ function renderModelRow(model) {
   };
 
   const editBtn = row.querySelector(".edit-model-btn");
-  editBtn.onclick = async () => {
-    const newName = await m3Prompt("编辑显示名称", "在 Codex 客户端列表中的友好名称：", model.display_name || "");
-    if (newName === null) return;
-    const ctxVal = await m3Prompt(
-      "编辑上下文窗口",
-      "上下文 Token 上限（输入 0 清除限制，留空保持现状）：",
-      model.context_window || "",
-    );
-    const args = {
-      logical_model_id: model.logical_model_id,
-      display_name: newName.trim(),
-      clear_context_window: false,
-      context_window: null,
-    };
-    if (ctxVal !== null && ctxVal.trim() === "0") {
-      args.clear_context_window = true;
-    } else if (ctxVal !== null && ctxVal.trim() !== "") {
-      const parsed = Number(ctxVal);
-      if (!Number.isSafeInteger(parsed) || parsed < 1) {
-        return notify("上下文必须是正整数或 0", true);
-      }
-      args.context_window = parsed;
-    }
-    try {
-      await api("/api/v1/models/edit", { method: "POST", body: JSON.stringify(args) });
-      notify("模型已更新");
-      await refreshProviders();
-    } catch (e) {
-      notify(e.message, true);
-    }
+  editBtn.onclick = () => {
+    const form = document.querySelector("#m3-edit-model-form");
+    if (!form) return;
+    form.reset();
+    form.logical_model_id.value = model.logical_model_id;
+    form.display_name.value = model.display_name || model.logical_model_id;
+    form.context_window.value = model.context_window || "";
+    form.clear_context_window.checked = false;
+    form.context_window.disabled = false;
+    openDialog("edit-model-dialog");
   };
 
   const deleteBtn = row.querySelector(".delete-model-btn");
@@ -1316,8 +1799,7 @@ function renderModelRow(model) {
         method: "POST",
         body: JSON.stringify({ logical_model_id: model.logical_model_id }),
       });
-      notify("模型已删除，请同步到 Codex。");
-      await refreshProviders();
+      await finishCatalogMutation("模型已删除");
     } catch (e) {
       notify(e.message, true);
     }
@@ -1330,6 +1812,7 @@ function renderDiscoveredBox(provider) {
   const wrapper = document.createElement("div");
   wrapper.className = "m3-discover";
   wrapper.dataset.open = "false";
+  wrapper.dataset.providerId = provider.id;
 
   wrapper.innerHTML = `
     <div class="m3-discover__inner">
@@ -1363,7 +1846,7 @@ function renderDiscoveredBox(provider) {
   const importBtn = wrapper.querySelector(".import-selected-btn");
   let discoveredList = [];
 
-  fetchBtn.onclick = () => withBusy(fetchBtn, async () => {
+  const scanModels = () => withBusy(fetchBtn, async () => {
     try {
       listContainer.innerHTML = `<span class="m3-body-small m3-text-primary">正在抓取上游模型清单…</span>`;
       discoveredList = await api(`/api/v1/providers/${encodeURIComponent(provider.id)}/discover`);
@@ -1394,6 +1877,8 @@ function renderDiscoveredBox(provider) {
       notify(e.message, true);
     }
   });
+  fetchBtn.onclick = scanModels;
+  wrapper.scan = scanModels;
 
   importBtn.onclick = () => withBusy(importBtn, async () => {
     const selected = [...listContainer.querySelectorAll("input:checked")].map((i) => i.value);
@@ -1407,8 +1892,7 @@ function renderDiscoveredBox(provider) {
           selected_ids: selected,
         }),
       });
-      notify(`已成功导入 ${selected.length} 个模型`);
-      await refreshProviders();
+      await finishCatalogMutation("已成功导入 " + selected.length + " 个模型");
     } catch (e) {
       notify(e.message, true);
     }
@@ -1420,6 +1904,7 @@ function renderDiscoveredBox(provider) {
 function renderProviderCard(provider) {
   const card = document.createElement("div");
   card.className = "m3-card m3-card--large m3-provider-card";
+  card.dataset.providerId = provider.id;
 
   card.innerHTML = `
     <div class="m3-provider-head">
@@ -1474,7 +1959,9 @@ function renderProviderCard(provider) {
 
   const addModelBtn = card.querySelector(".add-model-to-provider-btn");
   addModelBtn.onclick = () => {
-    document.querySelector("#add-model-provider-id").value = provider.id;
+    document.querySelector("#m3-model-form")?.reset();
+    populateProviderSelect(provider.id);
+    setM3SelectValue(document.querySelector("#add-model-provider-id"), provider.id);
     openDialog("add-model-dialog");
   };
 
@@ -1483,13 +1970,16 @@ function renderProviderCard(provider) {
   editBtn.onclick = () => {
     pendingProviderEdit = provider.id;
     const dialog = document.querySelector("#add-provider-dialog");
-    dialog.querySelector("#add-provider-title").textContent = "编辑 Provider";
-    dialog.querySelector("#add-provider-subtitle").textContent = "修改服务商名称、接入地址与协议";
+    dialog.querySelector("#add-provider-title").textContent = "编辑服务商";
+    dialog.querySelector("#add-provider-subtitle").textContent = "修改服务商名称、接入地址与高级连接方式";
     dialog.querySelector("#add-provider-submit").textContent = "保存修改";
     const form = dialog.querySelector("#m3-provider-form");
     form.name.value = provider.name;
     form.base_url.value = provider.base_url;
-    form.protocol.value = provider.protocol;
+    setM3SelectValue(form.protocol, provider.protocol);
+    setM3SelectValue(form.auth_strategy, authStrategyKind(provider.auth_strategy));
+    form.auth_header.value = authStrategyHeader(provider.auth_strategy);
+    syncProviderAuthField();
     form.api_key.value = "";
     // The API key is not returned by the list endpoint, so editing never
     // rewrites it; hide the field instead of inviting an accidental blank.
@@ -1502,10 +1992,10 @@ function renderProviderCard(provider) {
   const deleteBtn = card.querySelector(".delete-provider-btn");
   deleteBtn.onclick = async () => {
     const res = await m3Confirm(
-      "确认删除 Provider",
-      `即将删除【${provider.name} (${provider.id})】及其关联的所有模型。此操作不可撤销。`,
+      "确认删除服务商",
+      `即将删除【${provider.name}】及其关联的所有模型。此操作不可撤销。`,
       {
-        confirmLabel: "删除 Provider",
+        confirmLabel: "删除服务商",
         checkbox: {
           label: "同时在系统安全钥匙箱中清除该 Provider 存储的 API Key",
           defaultChecked: true,
@@ -1518,8 +2008,15 @@ function renderProviderCard(provider) {
         method: "POST",
         body: JSON.stringify({ id: provider.id, purge_credential: res.checked }),
       });
-      notify("Provider 已移除，请点击同步到 Codex。");
+      notify("服务商已移除，正在应用模型列表…");
       await refreshProviders();
+      try {
+        await applyCatalog({ silent: true });
+        notify("服务商已移除，模型列表已应用到 Codex");
+      } catch {
+        markCatalogPending("服务商已移除，但模型列表尚未应用到 Codex。");
+        notify("服务商已移除，但模型列表尚未应用到 Codex。", true);
+      }
     } catch (e) {
       notify(e.message, true);
     }
@@ -1538,6 +2035,8 @@ async function refreshProviders() {
     const providers = await api("/api/v1/providers");
     cachedProviders = providers || [];
 
+    populateProviderSelect();
+
     let totalModels = 0;
     for (const p of cachedProviders) totalModels += (p.models || []).length;
     metricProvVal.textContent = cachedProviders.length;
@@ -1547,13 +2046,17 @@ async function refreshProviders() {
       container.innerHTML = emptyState({
         icon: "neurology",
         title: "未添加任何模型服务商",
-        body: "点击上方“添加 Provider”，接入 NewAPI 或 OneAPI 等兼容代理即可开始。",
+        body: "点击“添加服务商”，填写地址和密钥；保存后即可发现可用模型。",
       });
+      applyModelFilter();
+      refreshSetupGuide();
       return;
     }
 
     container.innerHTML = "";
     for (const p of cachedProviders) container.appendChild(renderProviderCard(p));
+    applyModelFilter();
+    refreshSetupGuide();
   } catch (e) {
     container.innerHTML = errorState({
       title: "加载服务商失败",
@@ -1561,7 +2064,66 @@ async function refreshProviders() {
       retryId: "providers-retry-btn",
     });
     bindClick("#providers-retry-btn").onclick = () => refreshProviders();
+    applyModelFilter();
+    refreshSetupGuide();
   }
+}
+
+function populateProviderSelect(selectedId = "") {
+  const select = document.querySelector("#add-model-provider-id");
+  if (!select) return;
+  const current = selectedId || select.value;
+  select.innerHTML = '<option value="">请选择服务商</option>';
+  for (const provider of cachedProviders || []) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = `${provider.name}（${provider.id}）`;
+    select.appendChild(option);
+  }
+  const nextValue = current && [...select.options].some((option) => option.value === current)
+    ? current
+    : "";
+  setM3SelectValue(select, nextValue);
+  const state = [...m3SelectStates].find((item) => item.select === select);
+  if (state) renderM3SelectOptions(state);
+}
+
+function applyModelFilter() {
+  const query = modelFilterQuery.trim().toLowerCase();
+  let total = 0;
+  let visible = 0;
+  let visibleEnabled = 0;
+  let visibleDisabled = 0;
+  document.querySelectorAll(".m3-provider-card").forEach((card) => {
+    const rows = [...card.querySelectorAll(".m3-model-row")];
+    let cardVisible = false;
+    for (const row of rows) {
+      total += 1;
+      const matchesQuery = !query || row.dataset.modelSearch.includes(query);
+      const matchesEnabled = !modelFilterEnabledOnly || row.dataset.modelEnabled === "true";
+      const matches = matchesQuery && matchesEnabled;
+      row.classList.toggle("is-filtered", !matches);
+      if (matches) {
+        cardVisible = true;
+        visible += 1;
+        if (row.dataset.modelEnabled === "true") visibleEnabled += 1;
+        else visibleDisabled += 1;
+      }
+    }
+    card.classList.toggle("is-filtered", rows.length > 0 && !cardVisible);
+    if (!rows.length) card.classList.toggle("is-filtered", Boolean(query || modelFilterEnabledOnly));
+  });
+
+  const count = document.querySelector("#model-filter-count");
+  if (count) {
+    count.textContent = query || modelFilterEnabledOnly
+      ? visible + "/" + total + " 个模型"
+      : "共 " + total + " 个模型";
+  }
+  const enable = document.querySelector("#enable-visible-models-btn");
+  const disable = document.querySelector("#disable-visible-models-btn");
+  if (enable) enable.disabled = visibleDisabled === 0;
+  if (disable) disable.disabled = visibleEnabled === 0;
 }
 
 // ==========================================================================
@@ -1666,29 +2228,17 @@ logoutBtn.onclick = async () => {
 // ==========================================================================
 
 const syncBtn = bindClick("#topbar-sync-btn");
-syncBtn.onclick = () => withBusy(syncBtn, async () => {
-  try {
-    const res = await api("/api/v1/catalog/sync", { method: "POST" });
-    notify(`Codex Catalog 同步成功：${cleanPath(res.catalog_path)}`);
-  } catch (err) {
-    notify(err.message, true);
-  }
-});
+syncBtn.onclick = () => applyCatalog({ button: syncBtn });
 
 const routerRestartBtn = document.querySelector("#router-restart-btn");
 if (routerRestartBtn) {
-  routerRestartBtn.onclick = () => withBusy(routerRestartBtn, async () => {
-    try {
-      notify("正在重启 Router 服务…");
-      await api("/api/v1/router/restart", { method: "POST" });
-      notify("Router 已成功重启并就绪");
-      await refreshRouterStatus();
-    } catch (err) {
-      notify(`Router 重启失败: ${err.message}`, true);
-      await refreshRouterStatus();
-    }
-  });
+  routerRestartBtn.onclick = () => restartRouter();
 }
+
+bindClick("#setup-add-provider-btn").onclick = openAddProviderDialog;
+bindClick("#setup-open-models-btn").onclick = () => activateView("view-providers");
+bindClick("#setup-apply-btn").onclick = (event) => applyCatalog({ button: event.currentTarget });
+bindClick("#setup-save-account-btn").onclick = handleCaptureAccount;
 
 const overviewRefreshBtn = bindClick("#overview-refresh-btn");
 overviewRefreshBtn.onclick = () => withBusy(overviewRefreshBtn, async () => {
@@ -1724,7 +2274,7 @@ restartCodexBtn.onclick = () => withBusy(restartCodexBtn, async () => {
 });
 
 async function handleCaptureAccount() {
-  const name = await m3Prompt("保存当前登录态", "为当前 ~/.codex/auth.json 账号指定一个备注名称：", "");
+  const name = await m3Prompt("保存当前官方账号", "给当前登录的官方账号起个备注名称（可留空，系统会自动生成）：", "");
   if (name === null) return;
   try {
     const res = await api("/api/v1/accounts/capture", {
@@ -1746,14 +2296,15 @@ refreshAllUsageBtn.onclick = () => withBusy(refreshAllUsageBtn, async () => {
   try {
     notify("正在批量查询各账号实时额度…");
     const accounts = await api("/api/v1/accounts");
-    for (const acc of accounts) {
-      try {
-        await api(`/api/v1/accounts/${acc.id}/usage`);
-      } catch (err) {
-        console.warn(`刷新账号 ${acc.name} 额度失败:`, err);
-      }
+    const results = await Promise.allSettled(
+      accounts.map((acc) => api(`/api/v1/accounts/${acc.id}/usage`)),
+    );
+    const failed = results.filter((result) => result.status === "rejected");
+    if (failed.length) {
+      notify((accounts.length - failed.length) + "/" + accounts.length + " 个账号额度已更新，" + failed.length + " 个失败，请稍后重试。", true);
+    } else {
+      notify("所有托管账号额度已更新");
     }
-    notify("所有托管账号额度已刷新");
     await refreshAccounts();
   } catch (err) {
     notify(err.message, true);
@@ -1767,14 +2318,50 @@ refreshAllUsageBtn.onclick = () => withBusy(refreshAllUsageBtn, async () => {
 // Holds the provider id being edited, or null when the dialog is in add mode.
 let pendingProviderEdit = null;
 
+function authStrategyKind(strategy) {
+  if (typeof strategy === "string") return strategy;
+  if (strategy && typeof strategy === "object" && strategy.header) return "header";
+  return "bearer";
+}
+
+function authStrategyHeader(strategy) {
+  if (strategy && typeof strategy === "object" && strategy.header) {
+    return strategy.header.name || "";
+  }
+  return "";
+}
+
+function readProviderAuthStrategy(formData) {
+  const kind = String(formData.get("auth_strategy") || "bearer");
+  if (kind === "header") {
+    const name = String(formData.get("auth_header") || "").trim();
+    if (!name) throw new Error("自定义认证方式需要填写请求头名称");
+    return { header: { name } };
+  }
+  return kind;
+}
+
+function syncProviderAuthField() {
+  const form = document.querySelector("#m3-provider-form");
+  const strategy = form?.querySelector("[name='auth_strategy']");
+  const field = document.querySelector("#provider-auth-header-field");
+  if (!strategy || !field) return;
+  field.classList.toggle("is-hidden", strategy.value !== "header");
+  const input = field.querySelector("input");
+  if (input) input.required = strategy.value === "header";
+  const apiKey = form.querySelector("[name='api_key']");
+  if (apiKey) apiKey.required = strategy.value !== "none" && !pendingProviderEdit;
+}
+
 function resetProviderDialog() {
   const dialog = document.querySelector("#add-provider-dialog");
-  dialog.querySelector("#add-provider-title").textContent = "添加 Provider";
-  dialog.querySelector("#add-provider-subtitle").textContent = "接入第三方兼容模型提供商";
-  dialog.querySelector("#add-provider-submit").textContent = "保存 Provider";
+  dialog.querySelector("#add-provider-title").textContent = "添加服务商";
+  dialog.querySelector("#add-provider-subtitle").textContent = "填入服务商地址和密钥，下一步自动发现模型";
+  dialog.querySelector("#add-provider-submit").textContent = "保存并发现模型";
   const form = dialog.querySelector("#m3-provider-form");
   form.reset();
   form.api_key.closest(".m3-text-field").classList.remove("is-hidden");
+  syncProviderAuthField();
   pendingProviderEdit = null;
 }
 
@@ -1792,14 +2379,16 @@ bindClick("#close-add-provider-btn").onclick = () => {
 };
 
 const addProviderForm = document.querySelector("#m3-provider-form");
+addProviderForm.querySelector("[name='auth_strategy']")?.addEventListener("change", syncProviderAuthField);
 addProviderForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = new FormData(addProviderForm);
   const submitBtn = document.querySelector("#add-provider-submit");
   await withBusy(submitBtn, async () => {
     try {
+      const authStrategy = readProviderAuthStrategy(form);
       if (pendingProviderEdit) {
-        await api("/api/v1/providers/edit", {
+        const provider = await api("/api/v1/providers/edit", {
           method: "POST",
           body: JSON.stringify({
             id: pendingProviderEdit,
@@ -1808,24 +2397,43 @@ addProviderForm.addEventListener("submit", async (e) => {
             protocol: String(form.get("protocol")) || null,
             enabled: null,
             api_key: null,
+            auth_strategy: authStrategy,
           }),
         });
-        notify("Provider 已更新");
+        notify("服务商已更新，正在应用模型列表…");
+        closeDialog("add-provider-dialog");
+        resetProviderDialog();
+        await refreshProviders();
+        try {
+          await applyCatalog({ silent: true });
+          notify("服务商已更新，模型列表已应用到 Codex");
+        } catch {
+          markCatalogPending("服务商已更新，但模型列表尚未应用到 Codex。");
+          notify("服务商已更新，但模型列表尚未应用到 Codex。", true);
+        }
+        return provider;
       } else {
-        await api("/api/v1/providers/add", {
+        const provider = await api("/api/v1/providers/add", {
           method: "POST",
           body: JSON.stringify({
             name: form.get("name"),
             base_url: form.get("base_url"),
             protocol: form.get("protocol"),
             api_key: form.get("api_key") || null,
+            auth_strategy: authStrategy,
           }),
         });
-        notify("Provider 已保存至本地安全存储，请点击同步到 Codex。");
+        notify("服务商已保存，正在发现模型…");
+        closeDialog("add-provider-dialog");
+        resetProviderDialog();
+        await refreshProviders();
+        const card = [...document.querySelectorAll("[data-provider-id]")].find((item) => item.dataset.providerId === provider.id);
+        const discover = card?.querySelector(".discover-toggle-btn");
+        if (discover && discover.getAttribute("aria-expanded") !== "true") discover.click();
+        const discoverBox = card?.querySelector(".m3-discover");
+        if (discoverBox?.scan) await discoverBox.scan();
+        return provider;
       }
-      closeDialog("add-provider-dialog");
-      resetProviderDialog();
-      await refreshProviders();
     } catch (err) {
       notify(err.message, true);
     }
@@ -1833,6 +2441,7 @@ addProviderForm.addEventListener("submit", async (e) => {
 });
 
 bindClick("#open-add-model-dialog-btn").onclick = () => {
+  populateProviderSelect();
   document.querySelector("#m3-model-form").reset();
   openDialog("add-model-dialog");
 };
@@ -1843,27 +2452,74 @@ const addModelForm = document.querySelector("#m3-model-form");
 addModelForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = new FormData(addModelForm);
-  const context = form.get("context_window");
-  try {
-    await api("/api/v1/models/add", {
-      method: "POST",
-      body: JSON.stringify({
-        provider_id: form.get("provider_id"),
-        upstream_model_id: form.get("upstream_model_id"),
-        display_name: form.get("display_name"),
-        context_window: context ? Number(context) : null,
-        images: form.get("images") === "on",
-        tools: form.get("tools") === "on",
-      }),
-    });
-    addModelForm.reset();
-    closeDialog("add-model-dialog");
-    notify("模型已添加，请同步到 Codex。");
-    await refreshProviders();
-  } catch (err) {
-    notify(err.message, true);
-  }
+  const submitBtn = addModelForm.querySelector("button[type='submit']");
+  await withBusy(submitBtn, async () => {
+    try {
+      const providerId = String(form.get("provider_id") || "");
+      const upstreamModelId = String(form.get("upstream_model_id") || "").trim();
+      const provider = cachedProviders.find((item) => item.id === providerId);
+      if (!provider) throw new Error("请先选择模型服务商");
+      if (!upstreamModelId) throw new Error("请填写上游模型名称");
+      const context = form.get("context_window");
+      const displayName = String(form.get("display_name") || "").trim()
+        || provider.name + " / " + upstreamModelId;
+      await api("/api/v1/models/add", {
+        method: "POST",
+        body: JSON.stringify({
+          provider_id: providerId,
+          upstream_model_id: upstreamModelId,
+          display_name: displayName,
+          context_window: context ? Number(context) : null,
+          images: form.get("images") === "on",
+          tools: form.get("tools") === "on",
+        }),
+      });
+      addModelForm.reset();
+      closeDialog("add-model-dialog");
+      await finishCatalogMutation("模型已添加");
+    } catch (err) {
+      notify(err.message, true);
+    }
+  });
 });
+
+const editModelForm = document.querySelector("#m3-edit-model-form");
+if (editModelForm) {
+  const contextInput = editModelForm.querySelector("[name='context_window']");
+  const clearContext = editModelForm.querySelector("[name='clear_context_window']");
+  clearContext?.addEventListener("change", () => {
+    if (contextInput) contextInput.disabled = clearContext.checked;
+  });
+  editModelForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = new FormData(editModelForm);
+    const submitBtn = document.querySelector("#edit-model-submit");
+    await withBusy(submitBtn, async () => {
+      try {
+        const rawContext = String(form.get("context_window") || "").trim();
+        const parsedContext = rawContext ? Number(rawContext) : null;
+        if (rawContext && (!Number.isSafeInteger(parsedContext) || parsedContext < 1)) {
+          throw new Error("上下文长度必须是正整数");
+        }
+        await api("/api/v1/models/edit", {
+          method: "POST",
+          body: JSON.stringify({
+            logical_model_id: form.get("logical_model_id"),
+            display_name: String(form.get("display_name") || "").trim(),
+            context_window: clearContext?.checked ? null : parsedContext,
+            clear_context_window: Boolean(clearContext?.checked),
+          }),
+        });
+        closeDialog("edit-model-dialog");
+        await finishCatalogMutation("模型已更新");
+      } catch (err) {
+        notify(err.message, true);
+      }
+    });
+  });
+}
+
+bindClick("#close-edit-model-btn").onclick = () => closeDialog("edit-model-dialog");
 
 const importForm = document.querySelector("#m3-import-account-form");
 const importError = document.querySelector("#import-dialog-error");
@@ -1938,6 +2594,53 @@ providersRefreshBtn.onclick = () => withBusy(providersRefreshBtn, async () => {
   notify("服务商列表已刷新");
 });
 
+const modelFilterInput = document.querySelector("#model-filter-input");
+const modelFilterEnabledOnlyInput = document.querySelector("#model-filter-enabled-only");
+modelFilterInput?.addEventListener("input", () => {
+  modelFilterQuery = modelFilterInput.value;
+  applyModelFilter();
+});
+modelFilterEnabledOnlyInput?.addEventListener("change", () => {
+  modelFilterEnabledOnly = modelFilterEnabledOnlyInput.checked;
+  applyModelFilter();
+});
+
+async function bulkSetVisibleModels(enabled, button) {
+  const rows = [...document.querySelectorAll("#providers-container .m3-model-row:not(.is-filtered)")];
+  const ids = rows
+    .filter((row) => (row.dataset.modelEnabled === "true") !== enabled)
+    .map((row) => row.dataset.logicalModelId)
+    .filter(Boolean);
+  if (!ids.length) {
+    notify(enabled ? "没有需要启用的匹配模型" : "没有需要停用的匹配模型");
+    return;
+  }
+  if (!enabled) {
+    const ok = await m3Confirm(
+      "停用匹配模型",
+      `即将停用 ${ids.length} 个匹配模型；它们会从 Codex 的可用列表中隐藏。`,
+      { confirmLabel: "停用模型" },
+    );
+    if (!ok) return;
+  }
+  await withBusy(button, async () => {
+    const results = await Promise.allSettled(ids.map((logical_model_id) => api("/api/v1/models/enabled", {
+      method: "POST",
+      body: JSON.stringify({ logical_model_id, enabled }),
+    })));
+    const failed = results.filter((result) => result.status === "rejected");
+    if (failed.length) {
+      notify((ids.length - failed.length) + "/" + ids.length + " 个模型已更新，" + failed.length + " 个失败。", true);
+    }
+    await finishCatalogMutation(enabled ? "匹配模型已启用" : "匹配模型已停用");
+  });
+}
+
+bindClick("#enable-visible-models-btn").onclick = (event) =>
+  bulkSetVisibleModels(true, event.currentTarget);
+bindClick("#disable-visible-models-btn").onclick = (event) =>
+  bulkSetVisibleModels(false, event.currentTarget);
+
 // Live feedback for the password field.
 {
   const pwdInput = document.querySelector("#settings-web-password");
@@ -1982,6 +2685,23 @@ providersRefreshBtn.onclick = () => withBusy(providersRefreshBtn, async () => {
   }
 }
 
+const copyUninstallCommandBtn = bindClick("#copy-uninstall-command-btn");
+copyUninstallCommandBtn.onclick = async () => {
+  const command = document.querySelector("#uninstall-command")?.textContent?.trim();
+  if (!command) return;
+  try {
+    await navigator.clipboard.writeText(command);
+  } catch {
+    const input = document.createElement("input");
+    input.value = command;
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  notify("已复制卸载命令，请在终端执行");
+};
+
 bindClick("#settings-security-form").onsubmit = async (e) => {
   e.preventDefault();
   const password = document.querySelector("#settings-web-password").value;
@@ -2017,7 +2737,7 @@ const desktopInstallBtn = bindClick("#settings-desktop-install-btn");
 desktopInstallBtn.onclick = () => withBusy(desktopInstallBtn, async () => {
   try {
     await api("/api/v1/desktop/install", { method: "POST" });
-    notify("Desktop 适配已安装，请完全退出并重新启动 ChatGPT Desktop。");
+    notify("实验性 Desktop 适配已安装，请完全退出并重新启动 ChatGPT Desktop。");
     await refreshDesktopStatus();
   } catch (err) {
     notify(err.message, true);
@@ -2076,5 +2796,8 @@ if (window.electronAPI && window.electronAPI.isElectron) {
 
 // 启动自检：localToken 由 preload 通过 sendSync 同步注入，页面脚本运行到这里时
 // 已经可用，因此不需要轮询等待。
+initM3Selects();
 applyTooltips();
+renderCatalogState();
+populateProviderSelect();
 refreshAll();

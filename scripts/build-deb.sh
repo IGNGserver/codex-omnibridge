@@ -20,16 +20,16 @@ echo "==> 构建 Linux DEB 安装包: ${PKG_NAME}.deb"
 mkdir -p "${BUILD_DIR}/DEBIAN"
 mkdir -p "${BUILD_DIR}/usr/bin"
 mkdir -p "${BUILD_DIR}/usr/share/applications"
-mkdir -p "${BUILD_DIR}/usr/share/icons/hicolor/scalable/apps"
+mkdir -p "${BUILD_DIR}/usr/share/icons/hicolor/512x512/apps"
 mkdir -p "${OUTPUT_DIR}"
 
 # 1. 拷贝程序文件与图标
 cp "${PROJECT_DIR}/target/release/codex-mp" "${BUILD_DIR}/usr/bin/codex-mp"
 chmod 0755 "${BUILD_DIR}/usr/bin/codex-mp"
 
-if [[ -f "${PROJECT_DIR}/assets/icon.svg" ]]; then
-  cp "${PROJECT_DIR}/assets/icon.svg" "${BUILD_DIR}/usr/share/icons/hicolor/scalable/apps/codex-omnibridge.svg"
-fi
+# Remove the previous vector icon when reusing a packaging directory.
+rm -f "${BUILD_DIR}/usr/share/icons/hicolor/scalable/apps/codex-omnibridge.svg"
+cp "${PROJECT_DIR}/assets/icon.png" "${BUILD_DIR}/usr/share/icons/hicolor/512x512/apps/codex-omnibridge.png"
 
 # 2. 生成 desktop 快捷方式
 cat >"${BUILD_DIR}/usr/share/applications/codex-omnibridge.desktop" <<EOF

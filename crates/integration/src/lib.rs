@@ -712,22 +712,26 @@ fn validate_manifest_paths(
 /// Stock Codex dials the `base_url` recorded in `config.toml`; it never reads the
 /// Router's endpoint file. Anything that starts a Router for Codex to talk to must
 /// therefore bind *this* port, or every request is sent to a port nobody owns.
-/// Returns `0` (ephemeral) when the config is absent or unreadable, so callers
-/// that run before the first `sync` still work.
+/// When the managed config is absent or unreadable, use the configured Router
+/// base URL (8787 by default) so a first panel start remains reachable by the
+/// Codex integration instead of choosing an undiscoverable random port.
 pub fn router_port_for_registry(registry_path: impl AsRef<Path>) -> u16 {
     let paths = IntegrationPaths::for_registry(registry_path);
+    let fallback_port = port_from_base_url(&paths.router_base_url()).unwrap_or(8787);
     let Ok(content) = fs::read_to_string(&paths.codex_config) else {
-        return 0;
+        return fallback_port;
     };
     let Ok(document) = content.parse::<toml_edit::DocumentMut>() else {
-        return 0;
+        return fallback_port;
     };
     let base_url = document
         .get("model_providers")
         .and_then(|providers| providers.get(OMNIBRIDGE_PROVIDER_ID))
         .and_then(|bridge| bridge.get("base_url"))
         .and_then(|value| value.as_str());
-    base_url.and_then(port_from_base_url).unwrap_or(0)
+    base_url
+        .and_then(port_from_base_url)
+        .unwrap_or(fallback_port)
 }
 
 /// Extract a port from a `base_url` such as `http://127.0.0.1:8787/v1`.
@@ -2099,13 +2103,13 @@ name = \"My Own Provider\"\nbase_url = \"https://my-own.example/v1\"\nwire_api =
         assert_eq!(router_port_for_registry(&registry), 8787);
     }
 
-    /// A missing or malformed config must degrade to an ephemeral port rather than
-    /// guessing, so `launch` still works before the first `sync`.
+    /// A missing or malformed config must use the same configured/default port
+    /// as `sync`, so the first panel start is reachable before the first `sync`.
     #[test]
     fn router_port_degrades_when_the_config_is_unusable() {
         let dir = tempdir().unwrap();
         let registry = dir.path().join("providers.json");
-        assert_eq!(router_port_for_registry(&registry), 0);
+        assert_eq!(router_port_for_registry(&registry), 8787);
     }
 
     /// The port must be parsed out of an explicit base_url, including the scheme

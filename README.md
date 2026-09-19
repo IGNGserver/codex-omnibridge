@@ -35,8 +35,8 @@
 
 启动 Web 控制面板进行管理：
 ```bash
-# 启动本地 Web 面板（默认端口 31828）
-codex-mp web start
+# 启动本地 Web 面板（默认端口 31828），并自动打开浏览器
+codex-mp web start --open
 
 # 为 Web 面板设置访问密码（设置后支持开启外网/局域网访问）
 codex-mp web password "你的安全密码"
@@ -78,7 +78,7 @@ Electron 以 `file://` 加载面板，离线时 CDN 字体不可用，且自托�
 # 仅在图标集合或 CJK 覆盖范围变化时需要运行
 ./scripts/build-panel-fonts.sh
 
-# 重新渲染品牌图标（assets/icon.svg -> assets/icon.png 与面板 favicon）
+# 从选定原图 assets/icon-source.png 生成应用、面板、favicon、触屏图标及兼容 SVG
 node scripts/build-icons.mjs
 
 # 设计令牌纪律检查：语义层不得出现裸色值、基线字阶不得超过 500 字重、
@@ -99,10 +99,13 @@ node tools/panel-verify/run.mjs
 > 寻址：连字会在上游重命名图标时静默失效（本轮重写就因此丢失过两个图标）。
 
 ### 2. 添加你的 AI 模型
-无论在 Web 面板还是终端命令行，只需简单三步：
-1. **添加服务商**：填入你的提供商名称、API 基础地址（Base URL）及 API 密钥；
-2. **选择或添加模型**：自动抓取或手动指定模型名称；
-3. **同步到 Codex**：一键同步生成兼容的 Codex catalog。
+Web 面板的“开始使用”会把首次配置收敛为三步：
+1. **添加服务商**：填入服务商名称、API 地址及 API 密钥，保存后自动发现模型；
+2. **选择模型**：从发现清单勾选需要显示的模型；没有清单时才使用“手动添加（高级）”；
+3. **应用到 Codex**：面板会在改动后提示“有待应用变更”，点击一次即可生成并应用 catalog。
+
+“服务商”是第三方模型 API 的连接配置；“模型”是该服务商提供的上游模型。
+Provider ID、上游模型 ID、协议和自定义认证头属于高级路由信息，普通首次配置不需要记忆。
 
 ### 3. 在 Codex 中使用多模型
 打开 Codex（无论在 CLI 还是客户端），进入你的对话：
@@ -172,7 +175,10 @@ CODEX_MP_INSTALL_DESKTOP=1 ./installer/install-macos.sh
 启动器会复用同一用户目录下已有的健康 Router；如果没有，则启动 loopback
 Router。默认构建的是 stock Codex，官方 codex 可执行文件不会被覆盖。
 
-如果你在没有图形界面的 Linux 服务器或更喜欢用终端：
+如果你在没有图形界面的 Linux 服务器或更喜欢用终端，先运行下面两个只读命令了解当前状态：
+codex-mp setup 给出最短首次使用路径；codex-mp doctor 检查注册表、Codex catalog、Router 和可选官方账号环境。
+
+随后再执行：
 ```bash
 # 1. 安全添加服务商与 API Key（支持从管道安全传入，不在终端历史留痕）
 export NEWAPI_KEY='你的密钥'
@@ -257,7 +263,8 @@ Desktop picker、真实 Account、真实第三方 Provider E2E，以及 Desktop 
 
 ## 🛡️ 卸载与清理（零污染承诺）
 
-如果你不再需要本程序，可以在设置中点击卸载，或在终端执行：
+如果你不再需要本程序，可在设置页的“高级与实验性功能”中复制卸载命令，
+然后在终端执行（面板不会直接执行删除操作）：
 ```bash
 codex-mp-uninstall
 ```

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codex_mp_core::{
-    CoreError, CustomModel, ModelCapabilities, ModelEdit, ProviderConfig, ProviderProtocol,
-    ProviderRegistry,
+    AuthStrategy, CoreError, CustomModel, ModelCapabilities, ModelEdit, ProviderConfig,
+    ProviderProtocol, ProviderRegistry,
 };
 use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
 use codex_mp_router::{CAPABILITY_HEADER, RouterEndpoint, RouterError, load_router_endpoint};
@@ -22,7 +22,9 @@ use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -35,6 +37,9 @@ const STARTUP_LOCK_STALE: Duration = Duration::from_secs(120);
 /// Health/lifecycle probes must not block on a stale endpoint whose loopback
 /// port was since reallocated to a service that accepts and then stalls.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Keep startup diagnostics useful without allowing a broken Router to fill
+/// memory or leak a credential into the web status response.
+const MAX_ROUTER_STARTUP_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
@@ -79,6 +84,7 @@ pub struct ProviderSummary {
     pub name: String,
     pub base_url: String,
     pub protocol: ProviderProtocol,
+    pub auth_strategy: AuthStrategy,
     pub enabled: bool,
     pub models: Vec<ModelSummary>,
 }
@@ -170,6 +176,17 @@ impl ProviderManager {
         protocol: ProviderProtocol,
         api_key: Option<SecretString>,
     ) -> Result<ProviderSummary, ProviderManagerError> {
+        self.add_provider_with_auth(name, base_url, protocol, AuthStrategy::Bearer, api_key)
+    }
+
+    pub fn add_provider_with_auth(
+        &self,
+        name: &str,
+        base_url: &str,
+        protocol: ProviderProtocol,
+        auth_strategy: AuthStrategy,
+        api_key: Option<SecretString>,
+    ) -> Result<ProviderSummary, ProviderManagerError> {
         // Hold the cross-process lock across the whole read-modify-write. Using
         // the unlocked loader here lost concurrent updates: 20 simultaneous HTTP
         // `providers/add` calls all returned 200 while only one provider landed.
@@ -177,6 +194,7 @@ impl ProviderManager {
         let previous = registry.clone();
         let mut provider = ProviderConfig::new(name, base_url)?;
         provider.protocol = protocol;
+        provider.auth_strategy = auth_strategy;
         let provider_id = provider.id.clone();
         let reference = provider.credential_reference.clone();
         registry.add_provider(provider)?;
@@ -196,6 +214,19 @@ impl ProviderManager {
         enabled: Option<bool>,
         api_key: Option<SecretString>,
     ) -> Result<ProviderSummary, ProviderManagerError> {
+        self.edit_provider_with_auth(id, name, base_url, protocol, enabled, None, api_key)
+    }
+
+    pub fn edit_provider_with_auth(
+        &self,
+        id: &str,
+        name: Option<String>,
+        base_url: Option<String>,
+        protocol: Option<ProviderProtocol>,
+        enabled: Option<bool>,
+        auth_strategy: Option<AuthStrategy>,
+        api_key: Option<SecretString>,
+    ) -> Result<ProviderSummary, ProviderManagerError> {
         let (mut registry, _registry_lock) = self.load_registry_locked()?;
         let previous = registry.clone();
         let provider = registry
@@ -212,6 +243,9 @@ impl ProviderManager {
         }
         if let Some(enabled) = enabled {
             provider.enabled = enabled;
+        }
+        if let Some(auth_strategy) = auth_strategy {
+            provider.auth_strategy = auth_strategy;
         }
         let reference = provider.credential_reference.clone();
         // Everything mutated above (base_url, protocol, enabled) is routing state,
@@ -579,6 +613,7 @@ fn provider_summary(provider: &ProviderConfig) -> ProviderSummary {
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
         protocol: provider.protocol,
+        auth_strategy: provider.auth_strategy.clone(),
         enabled: provider.enabled,
         models: provider.models.iter().map(model_summary).collect(),
     }
@@ -674,8 +709,16 @@ pub enum ManagerError {
     Process(#[from] std::io::Error),
     #[error("router endpoint error: {0}")]
     Endpoint(#[from] RouterError),
-    #[error("router startup timed out waiting for `{0}`")]
-    StartupTimeout(PathBuf),
+    #[error(
+        "router startup failed ({reason}) waiting for `{endpoint}`; executable `{executable}`, \
+         expected loopback port {port}"
+    )]
+    StartupTimeout {
+        endpoint: PathBuf,
+        executable: PathBuf,
+        port: u16,
+        reason: String,
+    },
     #[error("router request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("router reload returned HTTP {status}: {message}")]
@@ -1002,31 +1045,113 @@ impl RouterSupervisor {
             .arg(&self.endpoint_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             // Without this, SIGTERM (or a panicking/aborting host) left the
             // Router running as an orphan holding its port and endpoint file.
             .kill_on_drop(true);
         configure_background_process(&mut child);
-        self.child = Some(child.spawn()?);
+        let mut spawned_child = child.spawn()?;
+        let stderr_task = spawned_child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let mut retained = Vec::with_capacity(MAX_ROUTER_STARTUP_DIAGNOSTIC_BYTES);
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if retained.len() < MAX_ROUTER_STARTUP_DIAGNOSTIC_BYTES {
+                                let remaining =
+                                    MAX_ROUTER_STARTUP_DIAGNOSTIC_BYTES - retained.len();
+                                retained.extend_from_slice(&buffer[..read.min(remaining)]);
+                            }
+                        }
+                    }
+                }
+                sanitize_router_startup_diagnostic(&retained)
+            })
+        });
+        self.child = Some(spawned_child);
         let endpoint_file = self.endpoint_file.clone();
-        let endpoint = timeout(STARTUP_TIMEOUT, async {
+        let executable = self.executable.clone();
+        let port = self.port;
+        let startup_result = timeout(STARTUP_TIMEOUT, async {
             loop {
                 if let Ok(endpoint) = load_router_endpoint(&endpoint_file) {
                     return Ok(endpoint);
                 }
-                if let Some(child) = self.child.as_mut()
-                    && child.try_wait()?.is_some()
-                {
-                    return Err(ManagerError::StartupTimeout(endpoint_file.clone()));
+                if let Some(child) = self.child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            return Err(format!("child exited with {status}"));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(format!("could not inspect child: {error}"));
+                        }
+                    }
                 }
                 sleep(POLL_INTERVAL).await;
             }
         })
-        .await
-        .map_err(|_| ManagerError::StartupTimeout(self.endpoint_file.clone()))??;
+        .await;
+        let endpoint = match startup_result {
+            Ok(Ok(endpoint)) => endpoint,
+            Ok(Err(reason)) => {
+                let diagnostic = self.abort_failed_start(stderr_task).await;
+                let reason = append_router_startup_diagnostic(reason, diagnostic);
+                return Err(ManagerError::StartupTimeout {
+                    endpoint: self.endpoint_file.clone(),
+                    executable,
+                    port,
+                    reason,
+                });
+            }
+            Err(_) => {
+                let diagnostic = self.abort_failed_start(stderr_task).await;
+                let reason = append_router_startup_diagnostic(
+                    format!("timed out after {} seconds", STARTUP_TIMEOUT.as_secs()),
+                    diagnostic,
+                );
+                return Err(ManagerError::StartupTimeout {
+                    endpoint: self.endpoint_file.clone(),
+                    executable,
+                    port,
+                    reason,
+                });
+            }
+        };
         self.owns_endpoint = true;
         self.active_endpoint = Some(endpoint.clone());
         Ok(endpoint)
+    }
+
+    /// Kill and reap a child that failed before it published a usable endpoint.
+    /// The normal `stop()` path cannot be used here because there is no trusted
+    /// endpoint to call, and leaving `self.child` populated makes the next
+    /// restart look like an already-running Router.
+    async fn abort_failed_start(&mut self, stderr_task: Option<JoinHandle<String>>) -> String {
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        self.owns_endpoint = false;
+        self.reused_endpoint = false;
+        self.active_endpoint = None;
+        let _ = remove_stale_endpoint(&self.endpoint_file);
+
+        let Some(task) = stderr_task else {
+            return String::new();
+        };
+        match timeout(Duration::from_millis(500), task).await {
+            Ok(Ok(diagnostic)) => diagnostic,
+            Ok(Err(error)) => format!("stderr reader failed: {error}"),
+            Err(_) => String::new(),
+        }
     }
 
     /// Classify a published endpoint relative to the current registry.
@@ -1252,6 +1377,34 @@ impl Drop for RouterSupervisor {
 /// conflict itself.
 fn port_is_available(port: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+fn sanitize_router_startup_diagnostic(raw: &[u8]) -> String {
+    let mut lines = Vec::new();
+    for line in String::from_utf8_lossy(raw).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if ["token", "authorization", "api-key", "api_key", "secret"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            lines.push("[sensitive Router diagnostic redacted]".to_owned());
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    lines.join(" | ")
+}
+
+fn append_router_startup_diagnostic(reason: String, diagnostic: String) -> String {
+    if diagnostic.is_empty() {
+        reason
+    } else {
+        format!("{reason}; child stderr: {diagnostic}")
+    }
 }
 
 fn remove_stale_endpoint(path: &Path) -> Result<(), std::io::Error> {

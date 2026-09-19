@@ -32,13 +32,13 @@ rm -rf "${APPDIR}"
 mkdir -p \
   "${APPDIR}/usr/bin" \
   "${APPDIR}/usr/share/applications" \
-  "${APPDIR}/usr/share/icons/hicolor/scalable/apps" \
+  "${APPDIR}/usr/share/icons/hicolor/512x512/apps" \
   "${OUTPUT_DIR}"
 
 install -m 0755 "${CLI_BINARY}" "${APPDIR}/usr/bin/codex-mp"
-install -m 0644 "${PROJECT_DIR}/assets/icon.svg" \
-  "${APPDIR}/usr/share/icons/hicolor/scalable/apps/codex-omnibridge.svg"
-install -m 0644 "${PROJECT_DIR}/assets/icon.svg" "${APPDIR}/codex-omnibridge.svg"
+install -m 0644 "${PROJECT_DIR}/assets/icon.png" \
+  "${APPDIR}/usr/share/icons/hicolor/512x512/apps/codex-omnibridge.png"
+install -m 0644 "${PROJECT_DIR}/assets/icon.png" "${APPDIR}/codex-omnibridge.png"
 
 cat >"${APPDIR}/AppRun" <<'EOF'
 #!/usr/bin/env sh

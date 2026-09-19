@@ -7,7 +7,7 @@
     "start": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
-    "check:panel": "node scripts/check-panel-tokens.js && node scripts/check-panel-auth.js && node scripts/check-csp-identical.js",
+    "check:panel": "node scripts/check-icons.js && node scripts/check-panel-tokens.js && node scripts/check-panel-auth.js && node scripts/check-csp-identical.js",
     "verify:panel": "node tools/panel-verify/run.mjs"
   },
   "author": {

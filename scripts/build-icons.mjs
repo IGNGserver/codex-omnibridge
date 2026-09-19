@@ -1,8 +1,7 @@
-// Rasterise the brand SVG into the PNG assets the packagers need.
+// Derive all brand assets from the approved raster artwork.
 //
-// assets/icon.svg is the single source of truth for the mark. electron-builder
-// wants a 512x512 PNG for the app icon, and the panel wants a small favicon;
-// both are generated here so they can never drift from the SVG.
+// assets/icon-source.png is the single source of truth. The SVG is a
+// self-contained raster wrapper for legacy consumers, not vector artwork.
 //
 // Run: node scripts/build-icons.mjs
 import fs from "node:fs";
@@ -35,39 +34,49 @@ function loadPlaywright() {
 }
 
 const { chromium } = loadPlaywright();
-const SVG = path.join(ROOT, "assets", "icon.svg");
-const OUT_ICON = path.join(ROOT, "assets", "icon.png");
-const OUT_FAVICON = path.join(ROOT, "apps", "panel", "favicon.png");
+const SOURCE = path.join(ROOT, "assets", "icon-source.png");
 
 const CHROME = process.env.CHROME_PATH || undefined;
 
 (async () => {
-  const svg = fs.readFileSync(SVG, "utf8");
+  const source = fs.readFileSync(SOURCE);
+  const dataUrl = `data:image/png;base64,${source.toString("base64")}`;
 
   const browser = await chromium.launch(
     CHROME ? { executablePath: CHROME } : {},
   );
-  const ctx = await browser.newContext({ deviceScaleFactor: 1 });
-  const page = await ctx.newPage();
-
-  async function render(size, outPath, background) {
-    await page.setViewportSize({ width: size, height: size });
-    await page.setContent(
-      `<!doctype html><html><head><meta charset="utf-8"><style>
-        html,body{margin:0;padding:0;width:${size}px;height:${size}px;
-          background:${background || "transparent"};}
-        svg{display:block;width:${size}px;height:${size}px}
-      </style></head><body>${svg}</body></html>`,
-      { waitUntil: "load" },
-    );
-    const buf = await page.screenshot({ omitBackground: !background, type: "png" });
-    fs.writeFileSync(outPath, buf);
-    console.log(`  ${path.relative(ROOT, outPath)}  ${size}x${size}  ${buf.length} bytes`);
+  try {
+    const page = await browser.newPage();
+    const outputs = [
+      [512, "assets/icon.png"],
+      [256, "apps/panel/app-icon.png"],
+      [64, "apps/panel/favicon.png"],
+      [180, "apps/panel/apple-touch-icon.png"],
+    ];
+    console.log("==> rendering brand icons");
+    for (const [size, relativePath] of outputs) {
+      const png = await page.evaluate(async ({ dataUrl, size }) => {
+        const img = new Image();
+        img.src = dataUrl;
+        await img.decode();
+        if (img.naturalWidth !== img.naturalHeight) {
+          throw new Error("Icon source must be square");
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, 0, 0, size, size);
+        return canvas.toDataURL("image/png").split(",")[1];
+      }, { dataUrl, size });
+      const buf = Buffer.from(png, "base64");
+      fs.writeFileSync(path.join(ROOT, relativePath), buf);
+      console.log(`  ${relativePath}  ${size}x${size}  ${buf.length} bytes`);
+    }
+    fs.writeFileSync(path.join(ROOT, "assets/icon.svg"),
+      `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 512 512" role="img" aria-label="Codex OmniBridge"><!-- Generated raster wrapper; source: icon-source.png --><image width="512" height="512" xlink:href="${dataUrl}" /></svg>\n`);
+  } finally {
+    await browser.close();
   }
-
-  console.log("==> rendering brand icons");
-  await render(512, OUT_ICON);
-  await render(64, OUT_FAVICON);
-
-  await browser.close();
 })();

@@ -81,14 +81,17 @@ for (const vp of WIDTHS) {
     // timeout measured the page mid-scroll on slower machines (Chromium headless
     // shell on CI reported a 40px overlap that never existed), so wait until the
     // scroll position actually stops changing instead of guessing a delay.
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.evaluate(() => {
+      const scroller = document.querySelector("#main-content");
+      scroller?.scrollTo(0, scroller.scrollHeight);
+    });
     // Poll `evaluate` rather than `waitForFunction`: the panel's CSP is
     // `script-src 'self'`, and `waitForFunction` serialises its predicate into a
     // string that is then evaluated as script, which the CSP blocks.
     {
       let previous = -1;
       for (let attempt = 0; attempt < 50; attempt += 1) {
-        const y = await page.evaluate(() => Math.round(window.scrollY));
+        const y = await page.evaluate(() => Math.round(document.querySelector("#main-content")?.scrollTop || 0));
         if (y === previous) break;
         previous = y;
         await page.waitForTimeout(100);
@@ -116,6 +119,7 @@ for (const vp of WIDTHS) {
   const DIALOGS = [
     { view: "view-providers", open: "#open-add-provider-dialog-btn", id: "#add-provider-dialog", name: "add-provider" },
     { view: "view-providers", open: "#open-add-model-dialog-btn", id: "#add-model-dialog", name: "add-model" },
+    { view: "view-providers", open: ".edit-model-btn", id: "#edit-model-dialog", name: "edit-model" },
     { view: "view-accounts", open: "#open-import-modal-action-btn", id: "#import-account-dialog", name: "import-account" },
   ];
 

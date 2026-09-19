@@ -20,8 +20,8 @@
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; form-action 'none'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'"
     />
     <title>Codex OmniBridge - 控制中心</title>
-    <link rel="icon" type="image/png" sizes="64x64" href="favicon.png?v=2" />
-    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="favicon.png?v=3" />
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?v=3" />
     <!-- Material Symbols 图标库（图标字形；字体本身自托管，见 fonts/） -->
     <link rel="stylesheet" href="tokens.css" />
     <link rel="stylesheet" href="base.css" />
@@ -38,7 +38,7 @@
       <header class="m3-top-app-bar window-drag-region" id="top-app-bar">
         <div class="m3-app-bar__leading window-no-drag">
           <div class="m3-brand-icon" aria-hidden="true">
-            <img src="app-icon.png" alt="" width="40" height="40" draggable="false" />
+            <img src="app-icon.png?v=3" alt="" width="40" height="40" draggable="false" />
           </div>
           <h1 class="m3-brand-title">Codex OmniBridge</h1>
           <span class="m3-brand-version m3-label-small">v0.1.0</span>
@@ -52,7 +52,7 @@
 
           <button class="m3-btn m3-btn-tonal m3-btn-sm" id="topbar-sync-btn">
             <span class="material-symbols-outlined m3-i-sync" aria-hidden="true"></span>
-            <span class="m3-btn__label">同步到 Codex</span>
+            <span class="m3-btn__label">应用到 Codex</span>
           </button>
 
           <div class="m3-menu-host" id="theme-menu-host">
@@ -108,19 +108,19 @@
         <nav class="m3-navigation" id="app-navigation" aria-label="主导航">
           <button class="m3-nav-item active" data-target="view-overview" aria-current="page">
             <span class="material-symbols-outlined m3-i-dashboard" aria-hidden="true"></span>
-            <span class="m3-nav-item__label">总览看板</span>
+            <span class="m3-nav-item__label">开始使用</span>
           </button>
           <button class="m3-nav-item" data-target="view-accounts">
             <span class="material-symbols-outlined m3-i-manage-accounts" aria-hidden="true"></span>
-            <span class="m3-nav-item__label">官方账号管理</span>
+            <span class="m3-nav-item__label">官方账号</span>
           </button>
           <button class="m3-nav-item" data-target="view-providers">
             <span class="material-symbols-outlined m3-i-neurology" aria-hidden="true"></span>
-            <span class="m3-nav-item__label">模型与服务商</span>
+            <span class="m3-nav-item__label">模型</span>
           </button>
           <button class="m3-nav-item" data-target="view-settings">
             <span class="material-symbols-outlined m3-i-tune" aria-hidden="true"></span>
-            <span class="m3-nav-item__label">安全与系统设置</span>
+            <span class="m3-nav-item__label">设置</span>
           </button>
 
           <div class="m3-nav-footer">
@@ -136,8 +136,8 @@
             <div class="m3-content-wide">
               <div class="m3-section-header">
                 <div class="m3-section-title-group">
-                  <h2 class="m3-headline-small" id="overview-heading">总览看板</h2>
-                  <p class="m3-body-medium">实时监控 Codex OmniBridge 路由器、活动账号与模型接入状态</p>
+                  <h2 class="m3-headline-small" id="overview-heading">开始使用</h2>
+                  <p class="m3-body-medium">完成一次设置后，模型会出现在 Codex 的模型选择列表中。官方账号管理是可选的。</p>
                 </div>
                 <div class="m3-section-actions">
                   <button class="m3-btn m3-btn-outlined" id="overview-refresh-btn">
@@ -147,12 +147,54 @@
                 </div>
               </div>
 
+              <!-- 首次使用 / 应用状态：把技术状态翻译成下一步行动 -->
+              <section class="m3-setup-guide m3-card m3-card-filled" id="setup-guide" aria-labelledby="setup-guide-title">
+                <div class="m3-setup-guide__head">
+                  <div class="m3-section-title-group">
+                    <span class="m3-label-medium m3-text-primary" id="setup-guide-kicker">接入进度</span>
+                    <h3 class="m3-title-large" id="setup-guide-title">把第一个模型接入 Codex</h3>
+                    <p class="m3-body-medium" id="setup-guide-summary">添加一个模型服务商，选择模型，然后应用到 Codex。</p>
+                  </div>
+                  <div class="m3-chip m3-chip--neutral" id="catalog-state-badge" role="status" aria-live="polite">尚未应用</div>
+                </div>
+                <ol class="m3-setup-steps" id="setup-steps">
+                  <li class="m3-setup-step" data-setup-step="provider">
+                    <span class="m3-setup-step__number">1</span>
+                    <span class="m3-setup-step__body">
+                      <strong>添加服务商</strong>
+                      <span>填写 API 地址和密钥，系统会自动检查连接。</span>
+                    </span>
+                    <button class="m3-btn m3-btn-tonal m3-btn-xs" id="setup-add-provider-btn" type="button">添加服务商</button>
+                  </li>
+                  <li class="m3-setup-step" data-setup-step="model">
+                    <span class="m3-setup-step__number">2</span>
+                    <span class="m3-setup-step__body">
+                      <strong>选择模型</strong>
+                      <span>从服务商返回的清单中勾选要显示在 Codex 里的模型。</span>
+                    </span>
+                    <button class="m3-btn m3-btn-text m3-btn-xs" id="setup-open-models-btn" type="button">查看模型</button>
+                  </li>
+                  <li class="m3-setup-step" data-setup-step="apply">
+                    <span class="m3-setup-step__number">3</span>
+                    <span class="m3-setup-step__body">
+                      <strong>应用到 Codex</strong>
+                      <span>应用完成后，在 Codex 的模型选择器或 <code>/model</code> 中使用。</span>
+                    </span>
+                    <button class="m3-btn m3-btn-filled m3-btn-xs" id="setup-apply-btn" type="button">应用到 Codex</button>
+                  </li>
+                </ol>
+                <div class="m3-setup-guide__footer">
+                  <span class="m3-body-small m3-text-variant" id="setup-advanced-note">高级用户仍可在模型页手动添加模型、编辑能力和查看原始 ID。</span>
+                  <button class="m3-btn m3-btn-text m3-btn-xs" id="setup-save-account-btn" type="button">保存当前官方账号（可选）</button>
+                </div>
+              </section>
+
               <div class="m3-metric-grid">
                 <div class="m3-metric-card m3-metric-card--primary">
                   <div class="m3-metric-top">
-                    <span class="m3-label-medium m3-metric-label">ROUTER 状态</span>
+                    <span class="m3-label-medium m3-metric-label">后台路由状态</span>
                     <div style="display:flex;align-items:center;gap:var(--md-sys-space-8)">
-                      <button class="m3-btn m3-btn-outlined m3-btn-sm is-hidden" id="router-restart-btn" type="button" title="重启 Router">
+                      <button class="m3-btn m3-btn-outlined m3-btn-sm is-hidden" id="router-restart-btn" type="button" title="重启后台">
                         <span class="material-symbols-outlined m3-i-refresh" aria-hidden="true"></span>
                         <span>重启</span>
                       </button>
@@ -189,7 +231,7 @@
 
                 <div class="m3-metric-card">
                   <div class="m3-metric-top">
-                    <span class="m3-label-medium m3-metric-label">DESKTOP 适配</span>
+                    <span class="m3-label-medium m3-metric-label">Desktop 实验性适配</span>
                     <div class="m3-metric-icon" aria-hidden="true">
                       <span class="material-symbols-outlined m3-i-desktop-windows"></span>
                     </div>
@@ -203,8 +245,8 @@
               <div class="m3-card m3-card-filled m3-card--large m3-quota-card">
                 <div class="m3-quota-head">
                   <div class="m3-section-title-group">
-                    <h3 class="m3-title-large">官方账号即时额度</h3>
-                    <p class="m3-body-medium m3-quota-note">无需进入 Codex 客户端即可快速查看当前生效账号的剩余用量</p>
+                    <h3 class="m3-title-large">当前官方账号额度</h3>
+                    <p class="m3-body-medium m3-quota-note">账号管理是可选功能；保存当前账号后可在这里查看额度并快速切换。</p>
                   </div>
                   <div class="m3-section-actions">
                     <button class="m3-btn m3-btn-tonal" id="overview-check-account-btn">
@@ -229,17 +271,17 @@
               <!-- 快捷管理指引卡片 -->
               <div class="m3-quick-grid">
                 <div class="m3-card m3-card-outlined m3-quick-card">
-                  <h4 class="m3-title-medium">快捷添加 AI 供应商</h4>
-                  <p class="m3-body-small m3-quick-card__body">支持快速添加 NewAPI、OneAPI、OpenRouter 等供应商并自动扫描模型</p>
+                  <h4 class="m3-title-medium">添加第三方模型</h4>
+                  <p class="m3-body-small m3-quick-card__body">支持 NewAPI、OneAPI、OpenRouter 等兼容服务商。保存后会自动进入模型发现。</p>
                   <button class="m3-btn m3-btn-filled" id="overview-open-add-provider-btn">
                     <span class="material-symbols-outlined m3-i-add" aria-hidden="true"></span>
-                    <span>新建 Provider</span>
+                    <span>添加服务商</span>
                   </button>
                 </div>
 
                 <div class="m3-card m3-card-outlined m3-quick-card">
-                  <h4 class="m3-title-medium">导入已有官方登录态</h4>
-                  <p class="m3-body-small m3-quick-card__body">一键将本地已登录的 ChatGPT/Codex 账号凭据保存到安全托管库</p>
+                  <h4 class="m3-title-medium">管理官方账号（可选）</h4>
+                  <p class="m3-body-small m3-quick-card__body">将当前 Codex 账号安全保存到本机，之后可以在多个官方账号之间切换。</p>
                   <button class="m3-btn m3-btn-tonal" id="overview-capture-account-btn">
                     <span class="material-symbols-outlined m3-i-save" aria-hidden="true"></span>
                     <span>保存当前登录态</span>
@@ -254,21 +296,21 @@
             <div class="m3-content-wide">
               <div class="m3-section-header">
                 <div class="m3-section-title-group">
-                  <h2 class="m3-headline-small" id="accounts-heading">官方账号与额度中心</h2>
-                  <p class="m3-body-medium">托管多套 Codex 官方账号凭据，一键秒级切换，实时掌握 5小时 / 周 / Reserve 额度</p>
+                  <h2 class="m3-headline-small" id="accounts-heading">官方账号</h2>
+                  <p class="m3-body-medium">可选的账号托管与额度页。当前登录账号不保存也可以继续使用 Codex。</p>
                 </div>
                 <div class="m3-section-actions">
                   <button class="m3-btn m3-btn-filled" id="capture-account-action-btn">
                     <span class="material-symbols-outlined m3-i-bookmark-add" aria-hidden="true"></span>
-                    <span>保存当前登录态为账号</span>
+                    <span>保存当前账号</span>
                   </button>
                   <button class="m3-btn m3-btn-tonal" id="open-import-modal-action-btn">
                     <span class="material-symbols-outlined m3-i-file-upload" aria-hidden="true"></span>
-                    <span>导入账号凭据</span>
+                    <span>高级导入凭据</span>
                   </button>
                   <button class="m3-btn m3-btn-outlined" id="refresh-all-accounts-usage-btn">
                     <span class="material-symbols-outlined m3-i-autorenew" aria-hidden="true"></span>
-                    <span>批量刷新所有额度</span>
+                    <span>刷新全部额度</span>
                   </button>
                 </div>
               </div>
@@ -297,22 +339,43 @@
             <div class="m3-content-wide">
               <div class="m3-section-header">
                 <div class="m3-section-title-group">
-                  <h2 class="m3-headline-small" id="providers-heading">模型与提供商管理</h2>
-                  <p class="m3-body-medium">配置第三方 AI 服务商（NewAPI/OneAPI/OpenRouter 等），一键发现并同步至 Codex</p>
+                  <h2 class="m3-headline-small" id="providers-heading">模型</h2>
+                  <p class="m3-body-medium">管理模型服务商和可用模型。添加或修改后，面板会自动应用到 Codex。</p>
                 </div>
                 <div class="m3-section-actions">
                   <button class="m3-btn m3-btn-filled" id="open-add-provider-dialog-btn">
                     <span class="material-symbols-outlined m3-i-add" aria-hidden="true"></span>
-                    <span>添加 Provider</span>
+                    <span>添加服务商</span>
                   </button>
                   <button class="m3-btn m3-btn-tonal" id="open-add-model-dialog-btn">
                     <span class="material-symbols-outlined m3-i-playlist-add" aria-hidden="true"></span>
-                    <span>手动添加模型</span>
+                    <span>手动添加（高级）</span>
                   </button>
                   <button class="m3-btn m3-btn-outlined" id="providers-refresh-btn">
                     <span class="material-symbols-outlined m3-i-refresh" aria-hidden="true"></span>
-                    <span>刷新服务商</span>
+                    <span>刷新列表</span>
                   </button>
+                </div>
+              </div>
+
+              <div class="m3-model-filter-bar" id="model-filter-bar">
+                <div class="m3-text-field m3-text-field--outlined m3-model-filter-field">
+                  <div class="m3-text-field__control">
+                    <span class="material-symbols-outlined m3-text-field__leading m3-i-search" aria-hidden="true"></span>
+                    <input class="m3-text-field__input" id="model-filter-input" type="search" placeholder=" " autocomplete="off" />
+                    <label class="m3-text-field__label" for="model-filter-input">搜索模型</label>
+                  </div>
+                  <div class="m3-text-field__support"><span>按显示名称、上游名称或内部 ID 搜索</span></div>
+                </div>
+                <label class="m3-checkbox m3-model-filter-enabled">
+                  <input type="checkbox" id="model-filter-enabled-only" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">只看已启用</span>
+                </label>
+                <div class="m3-model-filter-actions">
+                  <span class="m3-body-small m3-text-variant" id="model-filter-count">显示全部模型</span>
+                  <button class="m3-btn m3-btn-text m3-btn-xs" id="enable-visible-models-btn" type="button">启用匹配项</button>
+                  <button class="m3-btn m3-btn-text m3-btn-xs m3-btn--danger-text" id="disable-visible-models-btn" type="button">停用匹配项</button>
                 </div>
               </div>
 
@@ -333,8 +396,8 @@
             <div class="m3-content-wide">
               <div class="m3-section-header">
                 <div class="m3-section-title-group">
-                  <h2 class="m3-headline-small" id="settings-heading">安全与系统设置</h2>
-                  <p class="m3-body-medium">控制控制台访问权限、外网局域网监听，管理 Codex Desktop 独立运行时适配</p>
+                  <h2 class="m3-headline-small" id="settings-heading">设置</h2>
+                  <p class="m3-body-medium">调整外观、浏览器访问和高级 Codex 运行时。普通模型接入不需要修改这里。</p>
                 </div>
               </div>
 
@@ -393,8 +456,8 @@
                 <div class="m3-card m3-card-elevated m3-settings-card">
                   <div class="m3-quota-head">
                     <div class="m3-section-title-group">
-                      <h3 class="m3-title-large">网页端与网络访问控制</h3>
-                      <p class="m3-body-medium m3-quota-note">桌面应用内置免密访问。开启网页端或局域网/外网访问必须预先设置安全访问密码</p>
+                      <h3 class="m3-title-large">浏览器访问</h3>
+                      <p class="m3-body-medium m3-quota-note">桌面应用内置免密访问。只有需要从浏览器或其他设备管理时才需要开启。</p>
                     </div>
                     <div class="m3-chip m3-chip--success" id="settings-access-state-badge" role="status" aria-live="polite">检测中…</div>
                   </div>
@@ -409,10 +472,10 @@
                           autocomplete="new-password"
                           placeholder=" "
                         />
-                        <label class="m3-text-field__label" for="settings-web-password">网页端访问密码</label>
+                        <label class="m3-text-field__label" for="settings-web-password">访问密码</label>
                       </div>
                       <div class="m3-text-field__support">
-                        <span id="settings-password-support">留空则保持现状；输入新密码即进行修改或设置</span>
+                        <span id="settings-password-support">开启浏览器访问前设置；留空则保持现状。</span>
                         <span class="m3-text-field__counter" id="settings-password-counter"></span>
                       </div>
                     </div>
@@ -421,9 +484,9 @@
 
                     <div class="m3-switch-row">
                       <div class="m3-switch-row__text">
-                        <span class="m3-label-large" id="settings-web-enabled-label">启用浏览器网页访问</span>
+                        <span class="m3-label-large" id="settings-web-enabled-label">允许本机浏览器访问</span>
                         <span class="m3-body-small m3-quota-note" id="settings-web-enabled-desc"
-                          >允许通过浏览器访问本控制面板（桌面端内始终直接免密访问；开启网页端需验证密码）</span
+                          >允许通过浏览器访问本控制面板；桌面应用内始终可以直接访问。</span
                         >
                       </div>
                       <label class="m3-switch">
@@ -439,9 +502,9 @@
 
                     <div class="m3-switch-row">
                       <div class="m3-switch-row__text">
-                        <span class="m3-label-large" id="settings-allow-remote-label">允许外网 / 局域网访问</span>
+                        <span class="m3-label-large" id="settings-allow-remote-label">允许其他设备访问</span>
                         <span class="m3-body-small m3-quota-note" id="settings-allow-remote-desc"
-                          >将服务绑定到 0.0.0.0，使局域网其他设备或手机可通过浏览器远程配置</span
+                          >让局域网其他设备或手机访问。当前使用明文 HTTP，只应在可信内网中开启。</span
                         >
                       </div>
                       <label class="m3-switch">
@@ -470,37 +533,63 @@
                     <div class="m3-settings-actions">
                       <button type="submit" class="m3-btn m3-btn-filled">
                         <span class="material-symbols-outlined m3-i-security" aria-hidden="true"></span>
-                        <span>更新访问安全配置</span>
+                        <span>保存访问设置</span>
                       </button>
                     </div>
                   </form>
                 </div>
 
-                <!-- Desktop Runtime Adapter 设置 -->
-                <div class="m3-card m3-card-elevated m3-settings-card">
-                  <div class="m3-quota-head">
-                    <div class="m3-section-title-group">
-                      <h3 class="m3-title-large">Codex Desktop 独立适配</h3>
-                      <p class="m3-body-medium m3-quota-note">管理用户目录下的 standalone Codex 入口，不影响 ChatGPT 官方环境</p>
-                    </div>
-                    <div class="m3-chip m3-chip--neutral" id="settings-desktop-badge" role="status" aria-live="polite">检测中…</div>
-                  </div>
+                <!-- 高级运行时、诊断与清理 -->
+                <details class="m3-settings-advanced" id="settings-advanced-details">
+                  <summary class="m3-settings-advanced__summary">
+                    <span>
+                      <strong>高级与实验性功能</strong>
+                      <small>Desktop 适配、诊断、恢复和卸载</small>
+                    </span>
+                    <span class="material-symbols-outlined m3-i-expand-more" aria-hidden="true"></span>
+                  </summary>
+                  <div class="m3-settings-advanced__body">
+                    <div class="m3-card m3-card-elevated m3-settings-card">
+                      <div class="m3-quota-head">
+                        <div class="m3-section-title-group">
+                          <h3 class="m3-title-large">Codex Desktop 实验性适配</h3>
+                          <p class="m3-body-medium m3-quota-note">仅用于需要本地 standalone runtime 的场景；Remote Control 和普通 stock Codex 不需要它。</p>
+                        </div>
+                        <div class="m3-chip m3-chip--neutral" id="settings-desktop-badge" role="status" aria-live="polite">检测中…</div>
+                      </div>
 
-                  <p id="settings-desktop-detail" class="m3-body-medium m3-quota-note">正在检测 Desktop 运行时状态…</p>
+                      <p id="settings-desktop-detail" class="m3-body-medium m3-quota-note">正在检测 Desktop 运行时状态…</p>
 
-                  <div class="m3-settings-actions">
-                    <div class="m3-btn-group">
-                      <button class="m3-btn m3-btn-tonal" id="settings-desktop-install-btn">
-                        <span class="material-symbols-outlined m3-i-install-desktop" aria-hidden="true"></span>
-                        <span>安装适配</span>
-                      </button>
-                      <button class="m3-btn m3-btn-outlined" id="settings-desktop-restore-btn">
-                        <span class="material-symbols-outlined m3-i-restore" aria-hidden="true"></span>
-                        <span>恢复官方原版</span>
-                      </button>
+                      <div class="m3-settings-actions">
+                        <div class="m3-btn-group">
+                          <button class="m3-btn m3-btn-tonal" id="settings-desktop-install-btn">
+                            <span class="material-symbols-outlined m3-i-install-desktop" aria-hidden="true"></span>
+                            <span>安装实验性适配</span>
+                          </button>
+                          <button class="m3-btn m3-btn-outlined" id="settings-desktop-restore-btn">
+                            <span class="material-symbols-outlined m3-i-restore" aria-hidden="true"></span>
+                            <span>恢复官方入口</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="m3-card m3-card-elevated m3-settings-card">
+                      <div class="m3-section-title-group">
+                        <h3 class="m3-title-large">卸载与清理</h3>
+                        <p class="m3-body-medium m3-quota-note">卸载会停止后台路由、恢复 Codex 配置并清理本程序保存的服务商凭据；官方登录状态和历史记录会保留。</p>
+                      </div>
+                      <div class="m3-settings-row m3-settings-row--command">
+                        <code id="uninstall-command">codex-mp-uninstall</code>
+                        <button class="m3-btn m3-btn-outlined m3-btn-sm" id="copy-uninstall-command-btn" type="button">
+                          <span class="material-symbols-outlined m3-i-content-copy" aria-hidden="true"></span>
+                          <span>复制卸载命令</span>
+                        </button>
+                      </div>
+                      <p class="m3-body-small m3-settings-hint">为避免误删，卸载仍需在终端执行。执行前请完全退出 Codex Desktop。</p>
                     </div>
                   </div>
-                </div>
+                </details>
 
                 <!-- 关于与版本信息 -->
                 <div class="m3-card m3-card-elevated m3-settings-card">
@@ -555,21 +644,21 @@
     <dialog class="m3-dialog m3-dialog--md" id="add-provider-dialog" aria-labelledby="add-provider-title">
       <div class="m3-dialog__body">
         <div class="m3-dialog__head">
-          <h2 class="m3-headline-small" id="add-provider-title">添加 Provider</h2>
-          <p class="m3-body-medium" id="add-provider-subtitle">接入第三方兼容模型提供商</p>
+          <h2 class="m3-headline-small" id="add-provider-title">添加服务商</h2>
+          <p class="m3-body-medium" id="add-provider-subtitle">填入服务商地址和密钥，下一步自动发现模型</p>
         </div>
         <form id="m3-provider-form" class="m3-settings-form">
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
               <input class="m3-text-field__input" name="name" required placeholder=" " id="tf-1" />
-              <label class="m3-text-field__label" for="tf-1">供应商名称</label>
+              <label class="m3-text-field__label" for="tf-1">服务商名称</label>
             </div>
             <div class="m3-text-field__support"><span>例如：NewAPI、OneAPI 或 OpenRouter</span></div>
           </div>
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
               <input class="m3-text-field__input" name="base_url" required placeholder=" " id="tf-2" />
-              <label class="m3-text-field__label" for="tf-2">API Base URL</label>
+              <label class="m3-text-field__label" for="tf-2">API 地址</label>
             </div>
             <div class="m3-text-field__support"><span>上游服务的 API 根地址</span></div>
           </div>
@@ -579,9 +668,32 @@
                 <option value="responses">Responses（OpenAI Responses / Codex 增强协议）</option>
                 <option value="chat_completions">Chat Completions（标准 /v1/chat/completions）</option>
               </select>
-              <label class="m3-text-field__label" for="tf-3">协议类型</label>
+              <label class="m3-text-field__label" id="tf-3-label" for="tf-3">协议</label>
             </div>
           </div>
+          <details class="m3-form-advanced" id="provider-advanced-details">
+            <summary>高级连接选项 <span class="m3-body-small m3-text-variant">协议和认证方式通常无需修改</span></summary>
+            <div class="m3-form-advanced__body">
+              <div class="m3-text-field m3-text-field--outlined m3-text-field--select">
+                <div class="m3-text-field__control">
+                  <select class="m3-select" name="auth_strategy" id="tf-3-auth">
+                    <option value="bearer">Bearer（Authorization）</option>
+                    <option value="api_key">API Key（X-API-Key）</option>
+                    <option value="header">自定义请求头</option>
+                    <option value="none">不发送认证头</option>
+                  </select>
+                  <label class="m3-text-field__label" for="tf-3-auth">认证方式</label>
+                </div>
+              </div>
+              <div class="m3-text-field m3-text-field--outlined is-hidden" id="provider-auth-header-field">
+                <div class="m3-text-field__control">
+                  <input class="m3-text-field__input" name="auth_header" placeholder=" " id="tf-3-auth-header" />
+                  <label class="m3-text-field__label" for="tf-3-auth-header">自定义请求头名称</label>
+                </div>
+                <div class="m3-text-field__support"><span>例如 X-API-Key；只填写名称，不要填写密钥。</span></div>
+              </div>
+            </div>
+          </details>
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
               <input class="m3-text-field__input" name="api_key" type="password" autocomplete="off" placeholder=" " id="tf-4" />
@@ -592,11 +704,11 @@
                 </button>
               </span>
             </div>
-            <div class="m3-text-field__support"><span>将安全加密写入本地凭证存储</span></div>
+            <div class="m3-text-field__support"><span>只保存到本机安全凭证存储，不会写入普通配置文件。</span></div>
           </div>
           <div class="m3-dialog__actions">
             <button type="button" class="m3-btn m3-btn-text" id="close-add-provider-btn">取消</button>
-            <button type="submit" class="m3-btn m3-btn-filled" id="add-provider-submit">保存 Provider</button>
+            <button type="submit" class="m3-btn m3-btn-filled" id="add-provider-submit">保存并发现模型</button>
           </div>
         </form>
       </div>
@@ -607,34 +719,36 @@
       <div class="m3-dialog__body">
         <div class="m3-dialog__head">
           <h2 class="m3-headline-small" id="add-model-title">手动添加模型</h2>
-          <p class="m3-body-medium">将指定的上游模型注册到某个已存在的 Provider 下</p>
+          <p class="m3-body-medium">仅当服务商没有提供模型清单时使用。普通情况请先点击“发现模型”。</p>
         </div>
         <form id="m3-model-form" class="m3-settings-form">
-          <div class="m3-text-field m3-text-field--outlined">
+          <div class="m3-text-field m3-text-field--outlined m3-text-field--select">
             <div class="m3-text-field__control">
-              <input class="m3-text-field__input" name="provider_id" id="add-model-provider-id" required placeholder=" " />
-              <label class="m3-text-field__label" for="add-model-provider-id">Provider ID</label>
+              <select class="m3-select" name="provider_id" id="add-model-provider-id" required>
+                <option value="">请选择服务商</option>
+              </select>
+              <label class="m3-text-field__label" for="add-model-provider-id">服务商</label>
             </div>
-            <div class="m3-text-field__support"><span>目标服务商标识，例如 newapi</span></div>
+            <div class="m3-text-field__support"><span>服务商内部 ID 会自动处理。</span></div>
           </div>
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
               <input class="m3-text-field__input" name="upstream_model_id" required placeholder=" " id="tf-5" />
-              <label class="m3-text-field__label" for="tf-5">上游模型 ID (Upstream Model ID)</label>
+              <label class="m3-text-field__label" for="tf-5">上游模型名称</label>
             </div>
             <div class="m3-text-field__support"><span>例如 gemini-3.8-flash</span></div>
           </div>
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
-              <input class="m3-text-field__input" name="display_name" required placeholder=" " id="tf-6" />
+              <input class="m3-text-field__input" name="display_name" placeholder=" " id="tf-6" />
               <label class="m3-text-field__label" for="tf-6">在 Codex 中显示的名称</label>
             </div>
-            <div class="m3-text-field__support"><span>例如 NewAPI / Gemini 3.8 Flash</span></div>
+            <div class="m3-text-field__support"><span>可留空，系统会根据服务商和上游名称生成。</span></div>
           </div>
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
               <input class="m3-text-field__input" name="context_window" type="number" min="1" placeholder=" " id="tf-7" />
-              <label class="m3-text-field__label" for="tf-7">上下文窗口 (Context Window，可留空)</label>
+              <label class="m3-text-field__label" for="tf-7">上下文长度（可选）</label>
             </div>
             <div class="m3-text-field__support"><span>例如 131072；留空表示使用默认值</span></div>
           </div>
@@ -645,9 +759,9 @@
               <span class="m3-checkbox__label">图片与视觉输入</span>
             </label>
             <label class="m3-checkbox">
-              <input type="checkbox" name="tools" checked />
+              <input type="checkbox" name="tools" />
               <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
-              <span class="m3-checkbox__label">工具调用 (Tools)</span>
+              <span class="m3-checkbox__label">允许工具调用</span>
             </label>
           </div>
           <div class="m3-dialog__actions">
@@ -658,12 +772,47 @@
       </div>
     </dialog>
 
-    <!-- 4. 导入官方账号凭据对话框 -->
+    <!-- 4. 编辑模型属性对话框 -->
+    <dialog class="m3-dialog m3-dialog--md" id="edit-model-dialog" aria-labelledby="edit-model-title">
+      <div class="m3-dialog__body">
+        <div class="m3-dialog__head">
+          <h2 class="m3-headline-small" id="edit-model-title">编辑模型</h2>
+          <p class="m3-body-medium" id="edit-model-subtitle">修改 Codex 中的显示名称和上下文长度。</p>
+        </div>
+        <form id="m3-edit-model-form" class="m3-settings-form">
+          <input type="hidden" name="logical_model_id" />
+          <div class="m3-text-field m3-text-field--outlined">
+            <div class="m3-text-field__control">
+              <input class="m3-text-field__input" name="display_name" required placeholder=" " id="edit-model-display-name" />
+              <label class="m3-text-field__label" for="edit-model-display-name">在 Codex 中显示的名称</label>
+            </div>
+          </div>
+          <div class="m3-text-field m3-text-field--outlined">
+            <div class="m3-text-field__control">
+              <input class="m3-text-field__input" name="context_window" type="number" min="1" placeholder=" " id="edit-model-context-window" />
+              <label class="m3-text-field__label" for="edit-model-context-window">上下文长度（可选）</label>
+            </div>
+            <div class="m3-text-field__support"><span>留空保持当前值；勾选清除可恢复默认上下文。</span></div>
+          </div>
+          <label class="m3-checkbox">
+            <input type="checkbox" name="clear_context_window" id="edit-model-clear-context" />
+            <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+            <span class="m3-checkbox__label">清除自定义上下文长度</span>
+          </label>
+          <div class="m3-dialog__actions">
+            <button type="button" class="m3-btn m3-btn-text" id="close-edit-model-btn">取消</button>
+            <button type="submit" class="m3-btn m3-btn-filled" id="edit-model-submit">保存修改</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    <!-- 5. 导入官方账号凭据对话框 -->
     <dialog class="m3-dialog m3-dialog--lg" id="import-account-dialog" aria-labelledby="import-account-title">
       <div class="m3-dialog__body">
         <div class="m3-dialog__head">
-          <h2 class="m3-headline-small" id="import-account-title">导入官方账号凭据</h2>
-          <p class="m3-body-medium">粘贴官方 ~/.codex/auth.json 全文或提取的 tokens JSON</p>
+          <h2 class="m3-headline-small" id="import-account-title">高级导入官方账号</h2>
+          <p class="m3-body-medium">普通情况请使用“保存当前账号”。只有从其他设备迁移时才需要粘贴 auth.json 或 tokens JSON。</p>
         </div>
         <form id="m3-import-account-form" class="m3-settings-form">
           <div class="m3-text-field m3-text-field--outlined">
