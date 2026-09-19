@@ -315,7 +315,9 @@ mod windows_tray {
             let len = title_units.len().min(127);
             tip[..len].copy_from_slice(&title_units[..len]);
 
-            let mut nid = NOTIFYICONDATAW {
+            // `Shell_NotifyIconW` takes `*const NOTIFYICONDATAW`; nothing here
+            // mutates it, so it is not declared `mut`.
+            let nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: hwnd,
                 uID: 1,
@@ -333,7 +335,7 @@ mod windows_tray {
                 hBalloonIcon: null_mut(),
             };
 
-            Shell_NotifyIconW(NIM_ADD, &mut nid);
+            Shell_NotifyIconW(NIM_ADD, &nid);
 
             // 消息循环
             let mut msg = MSG {
@@ -360,7 +362,7 @@ mod windows_tray {
                 thread::sleep(Duration::from_millis(50));
             }
 
-            Shell_NotifyIconW(NIM_DELETE, &mut nid);
+            Shell_NotifyIconW(NIM_DELETE, &nid);
             DestroyWindow(hwnd);
         }
     }
