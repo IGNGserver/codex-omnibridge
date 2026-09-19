@@ -114,6 +114,10 @@ await step("prompt cancel leaves data unchanged", async () => {
 
 await step("switch account", async () => {
   await page.click(".switch-acc-btn");
+  await page.waitForTimeout(500);
+  const open = await page.evaluate(() => document.querySelector("#confirm-dialog").open);
+  if (!open) throw new Error("switch confirmation did not open");
+  await page.click("#confirm-dialog-confirm");
   await page.waitForTimeout(1200);
 }, ["/api/v1/accounts/switch"]);
 
@@ -205,6 +209,19 @@ await step("toggle model enabled", async () => {
   await page.waitForTimeout(1200);
 }, ["/api/v1/models/enabled"]);
 
+await step("search and bulk-enable matching models", async () => {
+  await page.fill("#model-filter-input", "gpt-5.2-codex");
+  await page.waitForTimeout(400);
+  const visible = await page.evaluate(() =>
+    [...document.querySelectorAll("#providers-container .m3-model-row")]
+      .filter((row) => !row.classList.contains("is-filtered")).length,
+  );
+  if (visible !== 1) throw new Error("search should leave one model visible, got " + visible);
+  await page.click("#enable-visible-models-btn");
+  await page.waitForTimeout(1300);
+  await page.fill("#model-filter-input", "");
+}, ["/api/v1/models/enabled", "/api/v1/catalog/sync"]);
+
 await step("add provider", async () => {
   await page.click("#open-add-provider-dialog-btn");
   await page.waitForTimeout(500);
@@ -256,7 +273,7 @@ await step("delete provider uses ONE confirm with the credential opt-in", async 
 await step("add model manually", async () => {
   await page.click("#open-add-model-dialog-btn");
   await page.waitForTimeout(500);
-  await page.fill("input[name='provider_id']", "newapi-primary");
+  await page.selectOption("select[name='provider_id']", "newapi-primary");
   await page.fill("input[name='upstream_model_id']", "test-model");
   await page.fill("input[name='display_name']", "Test Model");
   await page.click("#m3-model-form button[type=submit]");
@@ -322,6 +339,8 @@ await step("security form submits", async () => {
 }, ["/api/v1/security/update"]);
 
 await step("desktop install", async () => {
+  await page.locator("#settings-advanced-details").evaluate((el) => { el.open = true; });
+  await page.waitForTimeout(300);
   await page.click("#settings-desktop-install-btn");
   await page.waitForTimeout(1000);
 }, ["/api/v1/desktop/install"]);

@@ -18,7 +18,9 @@ use codex_mp_desktop::{
     DESKTOP_LAUNCHER_CONFIG_FILE, DesktopInstallOptions, DesktopIntegrationState,
     DesktopLauncherConfig, DesktopPaths, DesktopStatus, status_for,
 };
-use codex_mp_integration::{IntegrationPaths, build_and_install, repair, restore_if_present};
+use codex_mp_integration::{
+    IntegrationPaths, build_and_install, load_manifest, repair, restore_if_present,
+};
 use codex_mp_manager::RouterSupervisor;
 use codex_mp_router::{RouterConfig, RouterState, serve};
 use secrecy::SecretString;
@@ -55,6 +57,10 @@ enum Command {
         command: ModelCommand,
     },
     Models,
+    /// Print the shortest first-use path for the Web panel.
+    Setup,
+    /// Check the local registry, Codex integration, Router and web access.
+    Doctor,
     Sync,
     Repair,
     /// Restore the Codex config and remove the generated catalog.
@@ -403,6 +409,8 @@ async fn main() -> Result<()> {
         Command::Provider { command } => provider_command(&registry_path, command).await,
         Command::Model { command } => model_command(&registry_path, command).await,
         Command::Models => list_models(&registry_path, &cli.codex_bin),
+        Command::Setup => setup_guide(),
+        Command::Doctor => doctor(&registry_path, &cli.codex_bin),
         Command::Sync => sync(&registry_path, &cli.codex_bin),
         Command::Repair => repair_integration(&registry_path, &cli.codex_bin),
         Command::Restore => restore_integration(&registry_path),
@@ -780,6 +788,127 @@ fn restore_integration(registry_path: &Path) -> Result<()> {
         println!("restored Codex config and removed the generated catalog");
     } else {
         println!("no MultiProvider integration manifest was found");
+    }
+    Ok(())
+}
+
+fn setup_guide() -> Result<()> {
+    println!("Codex OmniBridge 首次使用");
+    println!();
+    println!("1. 启动面板：codex-mp web start --open");
+    println!("2. 在“开始使用”中添加服务商，保存后面板会自动发现模型");
+    println!("3. 勾选要显示的模型，点击“应用到 Codex”");
+    println!();
+    println!("官方账号管理是可选的；需要迁移凭据时才使用“高级导入”。");
+    println!("遇到模型未出现或后台异常时运行：codex-mp doctor");
+    Ok(())
+}
+
+fn doctor(path: &Path, codex_bin: &Path) -> Result<()> {
+    let paths = IntegrationPaths::for_registry(path);
+    let mut issues = 0_u32;
+    println!("Codex OmniBridge doctor");
+    println!("registry: {}", path.display());
+
+    let registry = match ProviderRegistry::load(path) {
+        Ok(registry) => {
+            println!(
+                "PASS registry: {} providers, {} enabled custom models",
+                registry.providers().len(),
+                registry.enabled_custom_models().count()
+            );
+            let security = registry.web_security();
+            println!(
+                "INFO web access: {} / {}",
+                if security.web_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                if security.allow_remote {
+                    "remote LAN binding"
+                } else {
+                    "loopback only"
+                }
+            );
+            Some(registry)
+        }
+        Err(error) => {
+            issues += 1;
+            println!("FAIL registry: {error}");
+            None
+        }
+    };
+
+    if !paths.catalog.exists() {
+        issues += 1;
+        println!(
+            "WARN catalog: not found at {}; add a model and apply it from the panel",
+            paths.catalog.display()
+        );
+    } else {
+        println!("PASS catalog: {}", paths.catalog.display());
+    }
+
+    if paths.manifest.exists() {
+        match load_manifest(&paths.manifest) {
+            Ok(manifest) => println!(
+                "PASS Codex integration: {} -> {}",
+                manifest.managed_field, manifest.applied_value
+            ),
+            Err(error) => {
+                issues += 1;
+                println!("FAIL Codex integration manifest: {error}");
+            }
+        }
+    } else {
+        println!("INFO Codex integration: not applied yet");
+    }
+
+    if paths.codex_config.exists() {
+        println!("PASS Codex config: {}", paths.codex_config.display());
+    } else {
+        issues += 1;
+        println!(
+            "WARN Codex config: not found at {}; start Codex once, then apply the catalog",
+            paths.codex_config.display()
+        );
+    }
+
+    let endpoint = paths.config_dir.join("router-endpoint.json");
+    if endpoint.exists() {
+        println!("PASS Router endpoint: {}", endpoint.display());
+    } else {
+        println!("INFO Router endpoint: not running");
+    }
+
+    match catalog_binary_for(path, codex_bin) {
+        Ok(binary) if binary.exists() => println!("PASS Codex executable: {}", binary.display()),
+        Ok(binary) => {
+            issues += 1;
+            println!("WARN Codex executable: not found at {}", binary.display());
+        }
+        Err(error) => {
+            issues += 1;
+            println!("WARN Codex executable: {error}");
+        }
+    }
+
+    let auth_path = codex_mp_manager::default_codex_home()
+        .map(|home| home.join("auth.json"))
+        .unwrap_or_else(|| PathBuf::from("~/.codex/auth.json"));
+    if auth_path.exists() {
+        println!("INFO official account: auth.json detected (not read by doctor)");
+    } else {
+        println!("INFO official account: no auth.json detected (optional)");
+    }
+
+    if registry.is_none() {
+        println!("NEXT run: codex-mp setup");
+    } else if issues == 0 {
+        println!("doctor: OK");
+    } else {
+        println!("doctor: {issues} item(s) need attention; the panel can guide the next step");
     }
     Ok(())
 }
