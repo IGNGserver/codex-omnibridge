@@ -1,4 +1,8 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
 //! Shared media handling for tool outputs.
 //!
@@ -318,12 +322,12 @@ fn strip_media_from_tool_value_at_depth(
 
     match value {
         Value::String(text) => {
-            if scope.allows(ToolMediaKind::Image) {
-                if let Some(media_part) = whole_string_image_data_url(text) {
-                    media_parts.push(media_part);
-                    *text = replacement_text.to_string();
-                    return 1;
-                }
+            if scope.allows(ToolMediaKind::Image)
+                && let Some(media_part) = whole_string_image_data_url(text)
+            {
+                media_parts.push(media_part);
+                *text = replacement_text.to_string();
+                return 1;
             }
 
             let trimmed = text.trim();
@@ -463,19 +467,19 @@ fn typed_image_has_payload(part: &Value) -> bool {
         return false;
     };
 
-    if let Some(source) = object.get("source").and_then(Value::as_object) {
-        if source_media_type_is_image(source) {
-            let has_url = source
-                .get("url")
-                .and_then(Value::as_str)
-                .is_some_and(|url| !url.trim().is_empty());
-            let has_data = source
-                .get("data")
-                .and_then(Value::as_str)
-                .is_some_and(|data| !data.is_empty());
-            if has_url || has_data {
-                return true;
-            }
+    if let Some(source) = object.get("source").and_then(Value::as_object)
+        && source_media_type_is_image(source)
+    {
+        let has_url = source
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty());
+        let has_data = source
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|data| !data.is_empty());
+        if has_url || has_data {
+            return true;
         }
     }
 
@@ -573,10 +577,10 @@ fn chat_image_part_has_inline_data(part: &Value) -> bool {
 }
 
 fn merge_top_level_detail(part: &Value, image_url: &mut Map<String, Value>) {
-    if image_url.get("detail").is_none() {
-        if let Some(detail) = part.get("detail") {
-            image_url.insert("detail".to_string(), detail.clone());
-        }
+    if image_url.get("detail").is_none()
+        && let Some(detail) = part.get("detail")
+    {
+        image_url.insert("detail".to_string(), detail.clone());
     }
 }
 

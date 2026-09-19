@@ -4,13 +4,14 @@
 //! official model table and exact logical custom ids decide the route; neither
 //! a slash heuristic nor the inbound OAuth bearer is a routing signal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -20,7 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_mp_core::{
     AuthStrategy, LogicalModelRoute, ProviderConfig, ProviderProtocol, ProviderRegistry,
-    atomic_replace, default_registry_path, set_private_permissions,
+    default_registry_path,
 };
 use codex_mp_credentials::CredentialStore;
 use codex_mp_protocol_bridge::{
@@ -45,6 +46,13 @@ pub const CAPABILITY_HEADER: &str = "x-codex-omnibridge-token";
 pub const ROUTER_BUILD_PROFILE: &str = "stock-omnibridge-v1";
 const DEFAULT_OFFICIAL_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on a buffered (non-streaming) upstream response.
+///
+/// `MAX_REQUEST_BODY_BYTES` only bounds the client -> router direction. Without a
+/// matching cap here, a provider that returns one enormous JSON document could
+/// make the router allocate without bound and be OOM-killed, taking every local
+/// Codex session with it.
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -76,6 +84,102 @@ impl RouterConfig {
     }
 }
 
+/// Cap on remembered `previous_response_id` routes. The map is append-only, so
+/// without a bound a long-lived router grows one entry per response forever.
+const MAX_TRACKED_RESPONSE_ROUTES: usize = 4096;
+
+/// Upstream connect deadline.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upstream deadline covering the whole request *including* body streaming.
+///
+/// Applied per-request rather than on the client, because a client-wide timeout
+/// would abort long-lived streaming responses mid-turn.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Build the client used for every upstream call.
+///
+/// Redirects are disabled deliberately: `base_url` is operator-supplied, and a
+/// compromised or hostile endpoint could otherwise answer `302 Location:
+/// http://169.254.169.254/...` (or a loopback address) and turn the local router
+/// into an SSRF pivot, re-sending the user's conversation body to the redirect
+/// target. `Client::new()` follows up to ten redirects across arbitrary hosts and
+/// schemes and applies no timeout at all.
+fn build_upstream_client() -> Client {
+    match client_builder().build() {
+        Ok(client) => client,
+        Err(error) => {
+            // Never fall back to `Client::new()` here: that silently restores
+            // exactly the redirect-following, timeout-free policy this function
+            // exists to prevent, i.e. it fails *open* on a security control. A
+            // client without a TLS backend is still safe to build, so retry with
+            // the same hardening and only give up on the redirect/limit knobs if
+            // even that fails.
+            eprintln!(
+                "codex-mp: could not build the hardened upstream client ({error}); \
+                 retrying without connection pooling"
+            );
+            client_builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "codex-mp: upstream client construction failed ({error}); \
+                         redirects remain disabled and timeouts still apply"
+                    );
+                    Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                        .build()
+                        .unwrap_or_else(|_| {
+                            // Last resort. `Client::new()` is the only remaining
+                            // constructor; the router keeps working, and the
+                            // operator sees this line.
+                            eprintln!(
+                                "codex-mp: FATAL: no hardened upstream client available; \
+                                 upstream redirects will be followed"
+                            );
+                            Client::new()
+                        })
+                })
+        }
+    }
+}
+
+fn client_builder() -> reqwest::ClientBuilder {
+    // Deliberately no client-wide `.timeout(..)`: it would abort long-lived
+    // streaming turns mid-response. The deadline is applied per request with
+    // `UPSTREAM_READ_TIMEOUT` instead.
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+}
+
+/// A `previous_response_id` -> route map with a hard size bound and FIFO
+/// eviction. Insertion order is used as the recency signal, which is enough here
+/// because entries are only ever appended.
+#[derive(Default)]
+struct BoundedRouteMap {
+    entries: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl BoundedRouteMap {
+    fn insert(&mut self, key: String, value: String) {
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_TRACKED_RESPONSE_ROUTES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&String> {
+        self.entries.get(key)
+    }
+}
+
 #[derive(Clone)]
 pub struct RouterState {
     pub registry: Arc<RwLock<ProviderRegistry>>,
@@ -84,11 +188,52 @@ pub struct RouterState {
     capability_token: Option<Arc<SecretString>>,
     official_base_url: String,
     history: Arc<CodexChatHistoryStore>,
-    history_routes: Arc<StdMutex<HashMap<String, String>>>,
+    history_routes: Arc<StdMutex<BoundedRouteMap>>,
     shutdown: Arc<Notify>,
+    /// Process-local provider-credential cache.
+    ///
+    /// Resolving a credential costs an OS keyring round trip (on Linux a D-Bus
+    /// call to the Secret Service). Doing that on every custom-model request adds
+    /// latency to each turn and, worse, means a slow or wedged keyring daemon
+    /// stalls requests even though the secret has not changed. Entries are keyed
+    /// by credential reference and invalidated whenever the registry generation
+    /// moves, so a `provider edit` still takes effect immediately.
+    credential_cache: Arc<StdMutex<CredentialCache>>,
+}
+
+/// Credentials resolved during the current registry generation.
+#[derive(Default)]
+struct CredentialCache {
+    generation: Option<u64>,
+    entries: HashMap<String, Arc<SecretString>>,
+}
+
+impl CredentialCache {
+    /// Look up a reference, dropping the whole cache if the registry moved on.
+    fn get(&mut self, generation: u64, reference: &str) -> Option<Arc<SecretString>> {
+        if self.generation != Some(generation) {
+            self.entries.clear();
+            self.generation = Some(generation);
+            return None;
+        }
+        self.entries.get(reference).cloned()
+    }
+
+    fn insert(&mut self, generation: u64, reference: &str, secret: Arc<SecretString>) {
+        if self.generation != Some(generation) {
+            self.entries.clear();
+            self.generation = Some(generation);
+        }
+        self.entries.insert(reference.to_owned(), secret);
+    }
 }
 
 impl RouterState {
+    /// Build a state without a capability token.
+    ///
+    /// Only safe for in-process tests that never serve traffic: `authorize()`
+    /// fails closed when no token is configured, so a served state must be built
+    /// with [`RouterState::with_capability_token`].
     pub fn new(registry: ProviderRegistry, credentials: Arc<dyn CredentialStore>) -> Self {
         Self::with_optional_capability_token(registry, credentials, None)
     }
@@ -109,13 +254,14 @@ impl RouterState {
         Self {
             registry: Arc::new(RwLock::new(registry)),
             credentials,
-            http_client: Client::new(),
+            http_client: build_upstream_client(),
             capability_token: capability_token.map(Arc::new),
             official_base_url: std::env::var("CODEX_MP_OFFICIAL_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_OFFICIAL_BASE_URL.into()),
             history: Arc::new(CodexChatHistoryStore::default()),
-            history_routes: Arc::new(StdMutex::new(HashMap::new())),
+            history_routes: Arc::new(StdMutex::new(BoundedRouteMap::default())),
             shutdown: Arc::new(Notify::new()),
+            credential_cache: Arc::new(StdMutex::new(CredentialCache::default())),
         }
     }
 
@@ -127,11 +273,41 @@ impl RouterState {
         self
     }
 
+    /// Resolve a provider credential, using the per-generation cache.
+    async fn resolve_credential(
+        &self,
+        generation: u64,
+        reference: &str,
+    ) -> Result<Arc<SecretString>, RouterError> {
+        {
+            let mut cache = self
+                .credential_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(secret) = cache.get(generation, reference) {
+                return Ok(secret);
+            }
+        }
+        // Offloaded to a blocking thread: see `apply_custom_headers`.
+        let secret =
+            codex_mp_credentials::get_blocking(self.credentials.clone(), reference.to_owned())
+                .await
+                .map_err(|error| RouterError::Credential(error.to_string()))?;
+        let secret = Arc::new(secret);
+        self.credential_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(generation, reference, secret.clone());
+        Ok(secret)
+    }
+
     fn remember_response_route(&self, response: &Value, route_key: &str) {
         if let Some(response_id) = response.get("id").and_then(Value::as_str) {
+            // A poisoned lock must not take the router down; the route cache is
+            // a best-effort optimization, so recovering the inner value is fine.
             self.history_routes
                 .lock()
-                .expect("history route lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(response_id.to_owned(), route_key.to_owned());
         }
     }
@@ -139,7 +315,7 @@ impl RouterState {
     fn previous_route(&self, response_id: &str) -> Option<String> {
         self.history_routes
             .lock()
-            .expect("history route lock is not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(response_id)
             .cloned()
     }
@@ -176,6 +352,8 @@ pub enum RouterError {
     Credential(String),
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    #[error("could not bind {0}: {1}")]
+    Bind(std::net::SocketAddr, String),
     #[error("official model traffic is not handled by the third-party adapter")]
     OfficialPassthroughRequired,
     #[error("official route requires a valid ChatGPT OAuth Authorization bearer")]
@@ -281,16 +459,22 @@ fn write_router_endpoint(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
     }
-    let temp = path.with_extension(format!("{}.json.tmp", Uuid::new_v4()));
     let file = RouterEndpointFile {
         schema_version: ROUTER_ENDPOINT_SCHEMA_VERSION,
         base_url: format!("http://{addr}"),
         capability_token: capability_token.expose_secret().to_owned(),
     };
-    fs::write(&temp, serde_json::to_vec_pretty(&file).unwrap())
+    // This document carries the capability token, which authorises every Router
+    // endpoint. The previous version used `fs::write` (umask, typically 0664) and
+    // only chmodded to 0600 afterwards, leaving a window in which any local user
+    // could read the token. It also `unwrap()`ed the serialization; that cannot
+    // fail for this struct, but a panic in the writer is still the wrong shape.
+    // `write_private_atomic` creates the file with mode 0600 and reports errors.
+    let mut bytes = serde_json::to_vec_pretty(&file)
         .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
-    set_private_permissions(&temp).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
-    atomic_replace(temp, path).map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    bytes.push(b'\n');
+    codex_mp_core::write_private_atomic(path, &bytes)
+        .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
     Ok(())
 }
 
@@ -333,40 +517,6 @@ pub struct RouteDescription {
     pub generation: u64,
 }
 
-pub fn resolve_route(registry: &ProviderRegistry, logical_model_id: &str) -> RouteDescription {
-    match registry.resolve_logical_model_route(logical_model_id) {
-        Ok(LogicalModelRoute::Custom {
-            provider_id,
-            upstream_model_id,
-            protocol,
-            ..
-        }) => RouteDescription {
-            logical_model_id: logical_model_id.to_owned(),
-            route_class: RouteClass::Custom,
-            provider_id: Some(provider_id),
-            upstream_model_id: Some(upstream_model_id),
-            protocol: Some(protocol),
-            generation: registry.generation(),
-        },
-        Ok(LogicalModelRoute::Official { .. }) => RouteDescription {
-            logical_model_id: logical_model_id.to_owned(),
-            route_class: RouteClass::Official,
-            provider_id: None,
-            upstream_model_id: None,
-            protocol: None,
-            generation: registry.generation(),
-        },
-        Err(_) => RouteDescription {
-            logical_model_id: logical_model_id.to_owned(),
-            route_class: RouteClass::Custom,
-            provider_id: None,
-            upstream_model_id: None,
-            protocol: None,
-            generation: registry.generation(),
-        },
-    }
-}
-
 pub fn app(state: RouterState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -396,14 +546,17 @@ pub async fn serve(config: RouterConfig, state: RouterState) -> Result<(), Route
     if !state.is_capability_protected() {
         return Err(RouterError::MissingCapabilityToken);
     }
+    // A bind failure (port in use, permission denied) is *not* an upstream
+    // problem. Reporting it as "upstream request failed" sent the operator
+    // looking at the third-party provider instead of at the local port.
     let listener = tokio::net::TcpListener::bind(config.socket_addr())
         .await
-        .map_err(|error| RouterError::Upstream(error.to_string()))?;
+        .map_err(|error| RouterError::Bind(config.socket_addr(), error.to_string()))?;
     let endpoint_file = config.endpoint_file.clone();
     if let Some(endpoint_file) = endpoint_file.as_ref() {
         let addr = listener
             .local_addr()
-            .map_err(|error| RouterError::Upstream(error.to_string()))?;
+            .map_err(|error| RouterError::Bind(config.socket_addr(), error.to_string()))?;
         let token = state
             .capability_token
             .as_deref()
@@ -524,40 +677,72 @@ async fn models(State(state): State<RouterState>, headers: HeaderMap) -> Respons
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
-async fn responses(State(state): State<RouterState>, headers: HeaderMap, body: Body) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::Responses).await
+async fn responses(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Response {
+    forward_request_v2(state, headers, Some(uri), body, OmniEndpoint::Responses).await
 }
 
-async fn compact(State(state): State<RouterState>, headers: HeaderMap, body: Body) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::Compact).await
+async fn compact(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Response {
+    forward_request_v2(state, headers, Some(uri), body, OmniEndpoint::Compact).await
 }
 
-async fn search(State(state): State<RouterState>, headers: HeaderMap, body: Body) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::Search).await
+async fn search(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Response {
+    forward_request_v2(state, headers, Some(uri), body, OmniEndpoint::Search).await
 }
 
 async fn images_generations(
     State(state): State<RouterState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::ImagesGenerations).await
+    forward_request_v2(
+        state,
+        headers,
+        Some(uri),
+        body,
+        OmniEndpoint::ImagesGenerations,
+    )
+    .await
 }
 
 async fn images_edits(
     State(state): State<RouterState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::ImagesEdits).await
+    forward_request_v2(state, headers, Some(uri), body, OmniEndpoint::ImagesEdits).await
 }
 
 async fn chat_completions(
     State(state): State<RouterState>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
-    forward_request_v2(state, headers, body, OmniEndpoint::ChatCompletions).await
+    forward_request_v2(
+        state,
+        headers,
+        Some(uri),
+        body,
+        OmniEndpoint::ChatCompletions,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,21 +782,49 @@ impl OmniEndpoint {
 async fn forward_request_v2(
     state: RouterState,
     headers: HeaderMap,
+    uri: Option<axum::http::Uri>,
     body: Body,
     endpoint: OmniEndpoint,
 ) -> Response {
     if let Some(response) = authorize(&state, &headers) {
         return response;
     }
+    // `/v1/images/edits` is defined by OpenAI as `multipart/form-data`, so it
+    // cannot go through the JSON pipeline at all: the body carries no `model`
+    // field to parse and must reach the upstream byte-for-byte. Forcing JSON on
+    // every endpoint made the route unreachable for the very format it exists to
+    // serve — a conforming client got 415 before any provider was consulted.
+    if matches!(endpoint, OmniEndpoint::ImagesEdits) {
+        return forward_multipart_request(state, headers, uri, body).await;
+    }
+    let _ = uri;
     if let Some(response) = require_json_content_type(&headers) {
         return response;
     }
     let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
-        Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
+        // `to_bytes` fails precisely when the limit is exceeded, which is a 413,
+        // not a malformed-request 400.
+        Err(_) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                RouterError::RequestBodyTooLarge(MAX_REQUEST_BODY_BYTES).to_string(),
+            );
+        }
     };
     let decoded = match decode_request_body(&headers, &bytes) {
         Ok(decoded) => decoded,
+        Err(RouterError::RequestBodyTooLarge(limit)) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                RouterError::RequestBodyTooLarge(limit).to_string(),
+            );
+        }
+        // An unsupported `Content-Encoding` is a media-type problem, not a
+        // malformed body.
+        Err(error @ RouterError::UnsupportedContentEncoding(_)) => {
+            return error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, error.to_string());
+        }
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error.to_string()),
     };
     let mut request: Value = match serde_json::from_slice(&decoded) {
@@ -783,18 +996,30 @@ async fn forward_request_v2(
             (request, OmniEndpoint::ChatCompletions.path(), false)
         }
         (OmniEndpoint::ChatCompletions, RouteClass::Custom, Some(ProviderProtocol::Responses)) => {
-            let Some(route_model) = model.as_ref() else {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    RouterError::MissingModel.to_string(),
-                );
-            };
-            let converted =
-                match chat_request_to_responses(&request, &route_model.upstream_model_id) {
-                    Ok(converted) => converted,
-                    Err(error) => return bridge_error_response(error),
-                };
-            (converted, OmniEndpoint::Responses.path(), false)
+            // A Chat-Completions *client* whose provider speaks the Responses API.
+            //
+            // This combination was previously attempted and produced the wrong
+            // payload: the request was translated (chat_request_to_responses) but
+            // the reply was returned verbatim, so the caller received a
+            // `{"object":"response", "output":[...]}` body where it expected
+            // `{"object":"chat.completion", "choices":[...]}`. A conforming client
+            // sees a successful HTTP 200 with an unusable body — worse than a
+            // clear error.
+            //
+            // The bridge only converts *toward* the Responses API (Codex's native
+            // format); there is no Responses-response -> Chat-response converter.
+            // Reject the combination explicitly instead of returning a body the
+            // client cannot parse.
+            return error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                RouterError::UnsupportedEndpoint(
+                    "a Chat Completions client cannot use a provider that speaks the \
+                     Responses API; call /v1/responses instead, or give the provider a \
+                     chat-completions endpoint"
+                        .into(),
+                )
+                .to_string(),
+            );
         }
         (special, RouteClass::Official, _) => {
             if let Err(response) = validate_official_authorization(&headers) {
@@ -835,6 +1060,10 @@ async fn forward_request_v2(
     let mut builder = state
         .http_client
         .post(upstream_url)
+        // Per-request deadline rather than a client-wide one: a client timeout
+        // would cut off long streaming turns. This at least bounds how long a
+        // hung upstream can pin a request task.
+        .timeout(UPSTREAM_READ_TIMEOUT)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(accept) = headers.get(header::ACCEPT) {
         builder = builder.header(header::ACCEPT, accept.clone());
@@ -842,7 +1071,7 @@ async fn forward_request_v2(
     if route.route_class == RouteClass::Official {
         builder = apply_official_headers(builder, &headers);
     } else if let Some(provider) = provider.as_ref() {
-        builder = match apply_custom_headers(builder, provider, &state).await {
+        builder = match apply_custom_headers(builder, provider, &state, route.generation).await {
             Ok(builder) => builder,
             Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
         };
@@ -858,7 +1087,29 @@ async fn forward_request_v2(
     };
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    let is_stream = upstream_request.get("stream").and_then(Value::as_bool) == Some(true);
+    // Decide from what the upstream actually sent, not from the flag we asked
+    // for. Plenty of OpenAI-compatible gateways ignore `"stream": true` and reply
+    // with a single `application/json` body; piping those bytes into the Chat-SSE
+    // state machine produced `response.failed` for a perfectly valid completion.
+    let upstream_is_sse = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let requested_stream = upstream_request.get("stream").and_then(Value::as_bool) == Some(true);
+    let upstream_is_json = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
+    // An SSE body is streaming regardless of what we asked for; a JSON body is
+    // not streaming even if we asked for it. Only when the upstream gave us no
+    // usable content-type do we fall back to the request flag.
+    let is_stream = if upstream_is_sse {
+        true
+    } else if upstream_is_json {
+        false
+    } else {
+        requested_stream
+    };
 
     if !status.is_success() {
         return response_from_upstream(status, content_type, upstream.bytes_stream());
@@ -888,7 +1139,7 @@ async fn forward_request_v2(
         let callback: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |response_id| {
             route_map
                 .lock()
-                .expect("history route lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(response_id.to_owned(), route_key_for_stream.clone());
         });
         let converted = codex_mp_protocol_bridge::record_responses_sse_stream_with_callback(
@@ -917,7 +1168,7 @@ async fn forward_request_v2(
             let callback: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |response_id| {
                 route_map
                     .lock()
-                    .expect("history route lock is not poisoned")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(response_id.to_owned(), route_key_for_stream.clone());
             });
             Box::pin(
@@ -939,14 +1190,13 @@ async fn forward_request_v2(
         return response;
     }
 
-    let upstream_json: Value = match upstream.json().await {
+    // Bounded read: `Response::json()` buffers the whole body with no limit, so a
+    // buggy or hostile provider (or one that ignores `stream` and returns a huge
+    // document) could grow this process without bound. `content-length` is
+    // advisory, so the stream is also truncated defensively.
+    let upstream_json: Value = match read_bounded_json(upstream).await {
         Ok(value) => value,
-        Err(error) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                RouterError::Upstream(error.to_string()).to_string(),
-            );
-        }
+        Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
     };
     let output = if convert_chat_response {
         let Some(route_model) = model.as_ref() else {
@@ -967,8 +1217,21 @@ async fn forward_request_v2(
     } else {
         upstream_json
     };
-    record_portable_response(&state.history, &output).await;
-    state.remember_response_route(&output, &route_key);
+    // Image and search replies are not conversations: they can never be continued
+    // and carry no portable tool-call history. Recording them still cloned the
+    // entire response body (base64 image data included) only for the history
+    // store to discard it, and inserted a route entry for an id that can never be
+    // used as a `previous_response_id`. This is a denylist rather than an
+    // allowlist so a future conversation-bearing endpoint (e.g. `compact`) keeps
+    // being recorded by default.
+    let records_history = !matches!(
+        endpoint,
+        OmniEndpoint::Search | OmniEndpoint::ImagesGenerations | OmniEndpoint::ImagesEdits
+    );
+    if records_history {
+        record_portable_response(&state.history, &output).await;
+        state.remember_response_route(&output, &route_key);
+    }
     let mut response = Json(output).into_response();
     *response.status_mut() = status;
     response
@@ -979,19 +1242,24 @@ fn route_key(
     provider: Option<&ProviderConfig>,
     account_fingerprint: Option<&str>,
 ) -> String {
+    // Deliberately excludes `route.generation`. The generation counts *every*
+    // registry mutation, including ones that cannot change where a model routes
+    // (renaming a model, editing its context window, editing a different
+    // provider). Including it meant any such edit made every in-flight
+    // conversation look like a route change, which forces the portable replay
+    // path and strips `previous_response_id` — losing server-side continuation
+    // and reasoning state, and hard-failing on hosted-tool output. Identity is
+    // the provider endpoint plus the upstream model and wire protocol; a
+    // generation bump alone does not move a request anywhere else.
     match provider {
         Some(provider) => format!(
-            "custom:{}:{}:{}:{}",
+            "custom:{}:{}:{}:{:?}",
             provider.id,
-            route.generation,
             provider.base_url,
-            route.upstream_model_id.as_deref().unwrap_or_default()
+            route.upstream_model_id.as_deref().unwrap_or_default(),
+            route.protocol
         ),
-        None => format!(
-            "official:{}:{}",
-            route.generation,
-            account_fingerprint.unwrap_or("unknown")
-        ),
+        None => format!("official:{}", account_fingerprint.unwrap_or("unknown")),
     }
 }
 
@@ -1097,14 +1365,27 @@ async fn hydrate_history_boundary(
         });
     let is_chat =
         provider.is_some_and(|provider| provider.protocol == ProviderProtocol::ChatCompletions);
+    // The official ChatGPT backend understands `previous_response_id` natively and
+    // is the only party that issued those ids, so an id missing from our local
+    // ledger there just means "this router has not seen it" (a restart, or an
+    // id issued before this process started). Hard-failing treated that as a
+    // context-boundary violation and broke every subsequent turn of a live
+    // session until the user started a new thread. Only a *custom* route needs
+    // the local ledger: forwarding an official id to a third party would leak it
+    // and the provider could not resolve it anyway.
+    let is_official = provider.is_none();
     let previous_route = if let Some(id) = previous_id_owned.as_deref() {
         state.previous_route(id)
     } else {
         None
     };
-    if previous_id_owned.is_some() && previous_route.is_none() {
+    if previous_id_owned.is_some() && previous_route.is_none() && !is_official {
         return Err(BridgeError::ContextBoundary(
-            "previous response is not available in the route-aware history ledger".into(),
+            "this request continues a previous turn (`previous_response_id`), but that \
+                     turn is not in this router's history ledger, so the earlier context \
+                     cannot be reconstructed. This happens after a router restart, or when \
+                     the id came from a different route. Start a new thread to continue."
+                .into(),
         ));
     }
     let cross_route = previous_route
@@ -1114,7 +1395,11 @@ async fn hydrate_history_boundary(
         let restored = state.history.enrich_request(request).await;
         if previous_id_owned.is_some() && restored == 0 && has_tool_output {
             return Err(BridgeError::ContextBoundary(
-                "previous response is not available in the route-aware history ledger".into(),
+                "this request continues a previous turn (`previous_response_id`), but that \
+                     turn is not in this router's history ledger, so the earlier context \
+                     cannot be reconstructed. This happens after a router restart, or when \
+                     the id came from a different route. Start a new thread to continue."
+                    .into(),
             ));
         }
         *request = portable_request(request)?;
@@ -1122,54 +1407,11 @@ async fn hydrate_history_boundary(
     Ok(())
 }
 
-fn chat_request_to_responses(request: &Value, upstream_model: &str) -> Result<Value, BridgeError> {
-    let object = request.as_object().ok_or(BridgeError::NotObject)?;
-    let messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| BridgeError::ContextBoundary("Chat request has no messages".into()))?;
-    let input = messages
-        .iter()
-        .map(|message| {
-            json!({
-                "type": "message",
-                "role": message.get("role").and_then(Value::as_str).unwrap_or("user"),
-                "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut output = serde_json::Map::new();
-    output.insert("model".into(), Value::String(upstream_model.into()));
-    output.insert("input".into(), Value::Array(input));
-    for key in [
-        "stream",
-        "temperature",
-        "top_p",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "max_tokens",
-        "max_completion_tokens",
-        "max_output_tokens",
-    ] {
-        if let Some(value) = object.get(key) {
-            output.insert(key.into(), value.clone());
-        }
-    }
-    if !output.contains_key("max_output_tokens")
-        && let Some(tokens) = object
-            .get("max_completion_tokens")
-            .or_else(|| object.get("max_tokens"))
-    {
-        output.insert("max_output_tokens".into(), tokens.clone());
-    }
-    Ok(Value::Object(output))
-}
-
 async fn apply_custom_headers(
     mut builder: reqwest::RequestBuilder,
     provider: &ProviderConfig,
     state: &RouterState,
+    generation: u64,
 ) -> Result<reqwest::RequestBuilder, RouterError> {
     for (name, value) in &provider.static_headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -1178,33 +1420,28 @@ async fn apply_custom_headers(
             .map_err(|_| RouterError::InvalidHeader(name.to_string()))?;
         builder = builder.header(name, value);
     }
-    match &provider.auth_strategy {
-        AuthStrategy::None => {}
-        AuthStrategy::Bearer => {
-            let credential = state
-                .credentials
-                .get(&provider.credential_reference)
-                .map_err(|error| RouterError::Credential(error.to_string()))?;
-            builder = builder.header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", credential.expose_secret()),
-            );
-        }
-        AuthStrategy::ApiKey => {
-            let credential = state
-                .credentials
-                .get(&provider.credential_reference)
-                .map_err(|error| RouterError::Credential(error.to_string()))?;
-            builder = builder.header("x-api-key", credential.expose_secret());
-        }
-        AuthStrategy::Header { name } => {
-            let credential = state
-                .credentials
-                .get(&provider.credential_reference)
-                .map_err(|error| RouterError::Credential(error.to_string()))?;
-            let name = HeaderName::from_bytes(name.as_bytes())
+    // The credential header shape is owned by `AuthStrategy` so the router and
+    // provider model discovery cannot drift apart.
+    if !matches!(provider.auth_strategy, AuthStrategy::None) {
+        // Cached per registry generation. Resolution costs an OS keyring round
+        // trip, and doing it on every request both added latency and let a slow
+        // keyring daemon stall traffic. The call itself is offloaded to a blocking
+        // thread: on Linux the keyring reaches the Secret Service through `zbus`,
+        // which bridges to its synchronous API with
+        // `tokio::runtime::Runtime::block_on`, and calling that from inside this
+        // async handler panicked with "Cannot start a runtime from within a
+        // runtime", killing the tokio worker (and poisoning the shared client) on
+        // the very first request to a custom provider.
+        let credential = state
+            .resolve_credential(generation, &provider.credential_reference)
+            .await?;
+        if let Some((name, value)) = provider
+            .auth_strategy
+            .credential_header(credential.expose_secret())
+        {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| RouterError::InvalidHeader(name.clone()))?;
-            builder = builder.header(name, credential.expose_secret());
+            builder = builder.header(header_name, value);
         }
     }
     Ok(builder)
@@ -1270,6 +1507,150 @@ fn response_from_upstream(
             .insert(header::CONTENT_TYPE, content_type);
     }
     response
+}
+
+/// Passthrough for endpoints whose contract is not JSON (`/v1/images/edits`).
+///
+/// The body is forwarded byte-for-byte with its original `Content-Type`, because
+/// multipart payloads cannot be parsed and re-serialised without corrupting the
+/// boundary and the binary image parts. The route is resolved from an explicit
+/// `model` **query parameter**, since the multipart body carries no reliable
+/// model field; when absent, the request goes to the official backend exactly as
+/// stock Codex would have sent it.
+async fn forward_multipart_request(
+    state: RouterState,
+    headers: HeaderMap,
+    uri: Option<axum::http::Uri>,
+    body: Body,
+) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("multipart/form-data"));
+    let is_multipart = content_type.to_str().is_ok_and(|value| {
+        value
+            .to_ascii_lowercase()
+            .starts_with("multipart/form-data")
+    });
+    if !is_multipart {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            RouterError::UnsupportedContentType.to_string(),
+        );
+    }
+
+    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                RouterError::RequestBodyTooLarge(MAX_REQUEST_BODY_BYTES).to_string(),
+            );
+        }
+    };
+
+    // `?model=<logical id>` selects a route. Without it we forward to the
+    // official backend, which is the only route that can honour an image edit
+    // today (no provider protocol here defines a multipart contract).
+    let requested_model = uri
+        .as_ref()
+        .and_then(|uri| uri.query())
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "model")
+                .map(|(_, value)| value.into_owned())
+        })
+        .filter(|value| !value.trim().is_empty());
+    let (upstream_base, route) = match requested_model.as_deref() {
+        Some(logical_model_id) => {
+            let registry = state.registry.read().await;
+            match registry.resolve_logical_model_route(logical_model_id) {
+                Ok(LogicalModelRoute::Custom { provider_id, .. }) => {
+                    let Some(provider) = registry
+                        .provider(&provider_id)
+                        .filter(|provider| provider.enabled)
+                    else {
+                        return error_response(
+                            StatusCode::NOT_FOUND,
+                            RouterError::UnknownProvider(provider_id).to_string(),
+                        );
+                    };
+                    (provider.base_url.clone(), RouteClass::Custom)
+                }
+                Ok(LogicalModelRoute::Official { .. }) => {
+                    (state.official_base_url.clone(), RouteClass::Official)
+                }
+                Err(error) => {
+                    return error_response(StatusCode::NOT_FOUND, error.to_string());
+                }
+            }
+        }
+        None => (state.official_base_url.clone(), RouteClass::Official),
+    };
+
+    if route == RouteClass::Official
+        && let Err(response) = validate_official_authorization(&headers)
+    {
+        return response;
+    }
+
+    let upstream_url = match join_url(&upstream_base, OmniEndpoint::ImagesEdits.path()) {
+        Ok(url) => url,
+        Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+    };
+
+    let mut builder = state
+        .http_client
+        .post(upstream_url)
+        .timeout(UPSTREAM_READ_TIMEOUT)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(bytes);
+    if let Some(accept) = headers.get(header::ACCEPT) {
+        builder = builder.header(header::ACCEPT, accept.clone());
+    }
+    if route == RouteClass::Official {
+        builder = apply_official_headers(builder, &headers);
+    }
+
+    match builder.send().await {
+        Ok(upstream) => {
+            let status = upstream.status();
+            let response_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+            response_from_upstream(status, response_type, upstream.bytes_stream())
+        }
+        Err(error) => error_response(
+            StatusCode::BAD_GATEWAY,
+            RouterError::Upstream(error.to_string()).to_string(),
+        ),
+    }
+}
+
+/// Read an upstream JSON body with a hard size cap.
+///
+/// `reqwest::Response::json()` reads the entire body into memory with no limit.
+/// This checks the advertised `content-length` first (cheap rejection) and then
+/// enforces the cap on the actual byte stream, so a lying or absent length cannot
+/// bypass it.
+async fn read_bounded_json(upstream: reqwest::Response) -> Result<Value, RouterError> {
+    if let Some(length) = upstream.content_length()
+        && length > MAX_UPSTREAM_RESPONSE_BYTES as u64
+    {
+        return Err(RouterError::Upstream(format!(
+            "upstream response of {length} bytes exceeds the {MAX_UPSTREAM_RESPONSE_BYTES} byte limit"
+        )));
+    }
+    let mut collected: Vec<u8> = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| RouterError::Upstream(error.to_string()))?;
+        if collected.len() + chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+            return Err(RouterError::Upstream(format!(
+                "upstream response exceeds the {MAX_UPSTREAM_RESPONSE_BYTES} byte limit"
+            )));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&collected).map_err(RouterError::InvalidJson)
 }
 
 fn bridge_error_response(error: BridgeError) -> Response {
@@ -1374,7 +1755,15 @@ fn authorize(state: &RouterState, headers: &HeaderMap) -> Option<Response> {
     if let Some(response) = validate_request_origin(headers) {
         return Some(response);
     }
-    let expected = state.capability_token.as_deref()?;
+    // Fail closed. A state without a capability token used to authorize every
+    // request, so mounting `app(state)` directly exposed the whole admin and
+    // inference surface; only `serve()` enforced the token.
+    let Some(expected) = state.capability_token.as_deref() else {
+        return Some(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            RouterError::MissingCapabilityToken.to_string(),
+        ));
+    };
     let Some(value) = headers.get(CAPABILITY_HEADER) else {
         return Some(error_response(
             StatusCode::UNAUTHORIZED,
@@ -1511,8 +1900,109 @@ fn remove_stale_endpoint(path: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use codex_mp_core::{CustomModel, ProviderConfig};
-    use codex_mp_credentials::MemoryCredentialStore;
+    use codex_mp_credentials::{CredentialStoreError, MemoryCredentialStore};
     use secrecy::SecretString;
+
+    /// Counts `get` calls so a test can prove caching works.
+    #[derive(Default)]
+    struct CountingCredentialStore {
+        reads: Arc<StdMutex<usize>>,
+        values: Arc<StdMutex<HashMap<String, SecretString>>>,
+    }
+
+    impl CountingCredentialStore {
+        fn with(reference: &str, secret: &str) -> Self {
+            let store = Self::default();
+            store
+                .values
+                .lock()
+                .unwrap()
+                .insert(reference.to_owned(), SecretString::from(secret.to_owned()));
+            store
+        }
+
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
+    }
+
+    impl CredentialStore for CountingCredentialStore {
+        fn get(&self, reference: &str) -> Result<SecretString, CredentialStoreError> {
+            *self.reads.lock().unwrap() += 1;
+            self.values
+                .lock()
+                .unwrap()
+                .get(reference)
+                .cloned()
+                .ok_or_else(|| CredentialStoreError::NotFound(reference.to_owned()))
+        }
+
+        fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(reference.to_owned(), value.clone());
+            Ok(())
+        }
+
+        fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
+            self.values.lock().unwrap().remove(reference);
+            Ok(())
+        }
+    }
+
+    /// Regression: every custom-model request used to hit the OS keyring. A slow
+    /// keyring daemon therefore stalled traffic even though the secret had not
+    /// changed. The cache must serve repeats and still pick up a new generation.
+    #[tokio::test]
+    async fn provider_credentials_are_cached_per_registry_generation() {
+        let store = Arc::new(CountingCredentialStore::with("provider:cache", "sk-cached"));
+        let mut registry = ProviderRegistry::empty("/tmp/router-credential-cache-test.json");
+        registry
+            .add_provider(ProviderConfig::new("Cache", "https://example.test/v1").unwrap())
+            .unwrap();
+        let generation = registry.generation();
+        let state = RouterState::new(registry, store.clone());
+
+        let first = state
+            .resolve_credential(generation, "provider:cache")
+            .await
+            .unwrap();
+        assert_eq!(first.expose_secret(), "sk-cached");
+        assert_eq!(store.reads(), 1);
+
+        // Repeats inside the same generation must not touch the keyring again.
+        for _ in 0..5 {
+            let again = state
+                .resolve_credential(generation, "provider:cache")
+                .await
+                .unwrap();
+            assert_eq!(again.expose_secret(), "sk-cached");
+        }
+        assert_eq!(
+            store.reads(),
+            1,
+            "credential lookups were not cached within a registry generation"
+        );
+
+        // A new generation (any registry mutation) must invalidate the cache so a
+        // rotated credential takes effect immediately.
+        let rotated = generation + 1;
+        store.values.lock().unwrap().insert(
+            "provider:cache".to_owned(),
+            SecretString::from("sk-rotated".to_owned()),
+        );
+        let refreshed = state
+            .resolve_credential(rotated, "provider:cache")
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.expose_secret(),
+            "sk-rotated",
+            "a registry change must not serve a stale credential"
+        );
+        assert_eq!(store.reads(), 2);
+    }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write;
@@ -1547,15 +2037,25 @@ mod tests {
             .add_model(CustomModel::new("newapi", "qwen3.8", "NewAPI / Qwen3.8").unwrap())
             .unwrap();
         registry.set_official_model_ids(["gpt-5.6-sol"]);
+
+        // Exercises the same resolution the request path uses; the previous
+        // `resolve_route` helper was a divergent copy that mislabelled unknown
+        // models as custom.
+        let custom = registry
+            .resolve_logical_model_route("newapi/qwen3.8")
+            .expect("custom model should resolve");
+        assert!(matches!(custom, LogicalModelRoute::Custom { .. }));
+
+        let official = registry
+            .resolve_logical_model_route("gpt-5.6-sol")
+            .expect("official model should resolve");
+        assert!(matches!(official, LogicalModelRoute::Official { .. }));
+
+        // An unknown model must be an explicit error, never a silent route.
         assert!(
-            resolve_route(&registry, "newapi/qwen3.8")
-                .provider_id
-                .is_some()
-        );
-        assert!(
-            resolve_route(&registry, "gpt-5.6-sol")
-                .provider_id
-                .is_none()
+            registry
+                .resolve_logical_model_route("does-not-exist")
+                .is_err()
         );
     }
 
@@ -1579,11 +2079,64 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // The endpoint file carries the capability token, which authorises
+            // every Router endpoint. It must be 0600, and — because the previous
+            // implementation wrote it with `fs::write` and chmodded afterwards —
+            // no other file in the directory may have been created readable by
+            // group/other at any point.
             assert_eq!(
-                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            let loose: Vec<String> = fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path() != path)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                loose.is_empty(),
+                "a temporary file was left behind: {loose:?}"
+            );
         }
+    }
+
+    /// Regression: a `TcpListener::bind` failure (port already in use, permission
+    /// denied) was reported as "upstream request failed", which sent the operator
+    /// looking at the third-party provider instead of at the local port. The
+    /// message must name the address that could not be bound.
+    #[tokio::test]
+    async fn a_bind_failure_names_the_address_instead_of_blaming_upstream() {
+        // `serve` refuses to run without a capability token, so supply one: the
+        // bind is what this test is about.
+        let state = RouterState::with_capability_token(
+            ProviderRegistry::empty("/tmp/router-bind-error-test.json"),
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+            SecretString::from("tok".to_owned()),
+        );
+        // Hold the port, then ask the Router to bind the same one.
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = holder.local_addr().unwrap();
+
+        let config = RouterConfig {
+            bind_ip: addr.ip(),
+            port: addr.port(),
+            endpoint_file: None,
+        };
+        let error = serve(config, state).await.expect_err("bind must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not bind"),
+            "the error must name the operation, got: {message}"
+        );
+        assert!(
+            message.contains(&addr.port().to_string()),
+            "the error must name the address, got: {message}"
+        );
+        assert!(
+            !message.contains("upstream"),
+            "a bind failure must not blame the upstream, got: {message}"
+        );
     }
 
     #[test]
@@ -1789,22 +2342,251 @@ mod tests {
         upstream_task.abort();
     }
 
+    /// A *custom* route must still fail closed: an id we cannot resolve locally
+    /// cannot be forwarded to a third party.
     #[tokio::test]
-    async fn unknown_previous_response_id_fails_closed() {
+    async fn unknown_previous_response_id_fails_closed_for_a_custom_route() {
+        let mut registry = ProviderRegistry::empty("/tmp/router-history-boundary-test.json");
+        registry.set_official_model_ids(["gpt-5.6-sol"]);
+        let state = RouterState::new(registry, Arc::new(MemoryCredentialStore::default()));
+        let mut request = json!({
+            "model": "custom/model",
+            "previous_response_id": "resp-unknown",
+            "input": "continue"
+        });
+        let mut provider = ProviderConfig::new("Custom", "https://example.test/v1").unwrap();
+        provider.protocol = ProviderProtocol::ChatCompletions;
+
+        let error = hydrate_history_boundary(
+            &state,
+            &mut request,
+            "custom:custom:https://example.test/v1:model:ChatCompletions",
+            Some(&provider),
+        )
+        .await
+        .expect_err("unknown response IDs must not cross a route boundary");
+        assert!(matches!(error, BridgeError::ContextBoundary(_)));
+        assert!(!error.to_string().contains("resp-unknown"));
+    }
+
+    /// Regression: an official id the local ledger has never seen (router
+    /// restarted, or the id predates this process) must be passed through to the
+    /// official backend, which issued it and can resolve it. Failing closed here
+    /// broke every later turn of a live official conversation until the user
+    /// started a new thread.
+    #[tokio::test]
+    async fn unknown_previous_response_id_passes_through_on_the_official_route() {
         let mut registry = ProviderRegistry::empty("/tmp/router-history-boundary-test.json");
         registry.set_official_model_ids(["gpt-5.6-sol"]);
         let state = RouterState::new(registry, Arc::new(MemoryCredentialStore::default()));
         let mut request = json!({
             "model": "gpt-5.6-sol",
-            "previous_response_id": "resp-unknown",
+            "previous_response_id": "resp-from-before-restart",
             "input": "continue"
         });
 
-        let error = hydrate_history_boundary(&state, &mut request, "official:1:acct", None)
+        hydrate_history_boundary(&state, &mut request, "official:acct", None)
             .await
-            .expect_err("unknown response IDs must not cross a route boundary");
-        assert!(matches!(error, BridgeError::ContextBoundary(_)));
-        assert!(!error.to_string().contains("resp-unknown"));
+            .expect("the official backend owns its own response ids");
+        assert_eq!(
+            request["previous_response_id"], "resp-from-before-restart",
+            "the id must be forwarded unchanged"
+        );
+    }
+
+    /// A gateway that ignores `"stream": true` and answers with one JSON body.
+    /// The router used to pipe those bytes into the Chat-SSE state machine, which
+    /// found no SSE frames and reported `response.failed` for a perfectly valid
+    /// completion.
+    async fn non_streaming_chat_upstream(
+        State(capture): State<Arc<std::sync::Mutex<UpstreamCapture>>>,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> Response {
+        let body = serde_json::from_slice(&body).expect("router sends JSON upstream");
+        let mut capture = capture.lock().expect("capture lock");
+        capture.path = Some(uri.path().to_owned());
+        capture.body = Some(body);
+        // Deliberately a JSON body even though `stream` was requested.
+        Json(json!({
+            "id": "chatcmpl_json",
+            "object": "chat.completion",
+            "model": "model-x",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello-from-json"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    /// Regression: streaming is decided by what the upstream actually sent, so a
+    /// provider that ignores `stream` still yields a valid Responses reply.
+    #[tokio::test]
+    async fn chat_provider_ignoring_stream_still_returns_a_completion() {
+        let capture = Arc::new(std::sync::Mutex::new(UpstreamCapture::default()));
+        let upstream_app = Router::new()
+            .fallback(non_streaming_chat_upstream)
+            .with_state(capture.clone());
+        let upstream_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app).await;
+        });
+
+        let mut registry = ProviderRegistry::empty("/tmp/router-nostream-test.json");
+        let mut provider =
+            ProviderConfig::new("ChatAPI", &format!("http://{}/v1", upstream_addr)).unwrap();
+        provider.protocol = ProviderProtocol::ChatCompletions;
+        provider.auth_strategy = AuthStrategy::None;
+        registry.add_provider(provider).unwrap();
+        registry
+            .add_model(CustomModel::new("chatapi", "model-x", "ChatAPI / model-x").unwrap())
+            .unwrap();
+        let router_app = app(RouterState::with_capability_token(
+            registry,
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("test-capability"),
+        ));
+        let router_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let router_addr = router_listener.local_addr().unwrap();
+        let router_task = tokio::spawn(async move {
+            let _ = axum::serve(router_listener, router_app).await;
+        });
+
+        // Ask for a stream; the upstream answers with JSON.
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .header(CAPABILITY_HEADER, "test-capability")
+            .json(&json!({
+                "model": "chatapi/model-x",
+                "input": "hello",
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a JSON reply to a stream request must still succeed"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(
+            body["output"][0]["content"][0]["text"], "hello-from-json",
+            "the JSON completion must be converted, not failed: {body}"
+        );
+        assert_eq!(body["model"], "chatapi/model-x");
+
+        router_task.abort();
+        upstream_task.abort();
+    }
+
+    /// Regression: a Chat-Completions client pointed at a Responses-protocol
+    /// provider was answered with the **wrong payload shape**. The request was
+    /// translated, but the reply was returned verbatim, so the caller got
+    /// `{"object":"response","output":[...]}` where a Chat client expects
+    /// `{"object":"chat.completion","choices":[...]}`.
+    ///
+    /// A conforming client therefore saw HTTP 200 with an unparseable body —
+    /// strictly worse than an error, because nothing signals the failure. The
+    /// bridge has no Responses-response -> Chat-response converter (it only
+    /// converts *toward* the Responses API), so the combination must be refused
+    /// explicitly with guidance, keeping the supported `/v1/responses` path.
+    #[tokio::test]
+    async fn a_chat_client_cannot_use_a_responses_provider() {
+        let upstream_app = Router::new()
+            .fallback(mock_upstream)
+            .with_state(Arc::new(std::sync::Mutex::new(UpstreamCapture::default())));
+        let upstream_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app).await;
+        });
+
+        let mut registry = ProviderRegistry::empty("/tmp/router-chat-to-responses-test.json");
+        let mut provider =
+            ProviderConfig::new("RespAPI", &format!("http://{}/v1", upstream_addr)).unwrap();
+        provider.protocol = ProviderProtocol::Responses;
+        provider.auth_strategy = AuthStrategy::ApiKey;
+        provider.credential_reference = "provider:resp-test".into();
+        registry.add_provider(provider).unwrap();
+        registry
+            .add_model(CustomModel::new("respapi", "model-x", "RespAPI / model-x").unwrap())
+            .unwrap();
+        let credentials = MemoryCredentialStore::default();
+        credentials
+            .set("provider:resp-test", &SecretString::from("resp-secret"))
+            .unwrap();
+
+        let router_app = app(RouterState::with_capability_token(
+            registry,
+            Arc::new(credentials),
+            SecretString::from("test-capability"),
+        ));
+        let router_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let router_addr = router_listener.local_addr().unwrap();
+        let router_task = tokio::spawn(async move {
+            let _ = axum::serve(router_listener, router_app).await;
+        });
+
+        // A Chat-Completions client must be refused, not handed a Responses body.
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/chat/completions"))
+            .header(CAPABILITY_HEADER, "test-capability")
+            .json(&json!({
+                "model": "respapi/model-x",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "an unsupported protocol combination must be refused, not answered with the wrong shape"
+        );
+        let body: Value = response.json().await.unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/v1/responses"),
+            "the error must point at the working endpoint, got: {message}"
+        );
+
+        // The refusal is specific to the *combination*: the same provider is
+        // still reachable through its native endpoint (the shared mock upstream
+        // answers both paths, so this only asserts routing, not the body shape).
+        let response = reqwest::Client::new()
+            .post(format!("http://{router_addr}/v1/responses"))
+            .header(CAPABILITY_HEADER, "test-capability")
+            .json(&json!({
+                "model": "respapi/model-x",
+                "input": "hello",
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "the Responses endpoint must remain usable for this provider"
+        );
+
+        router_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]
@@ -1835,7 +2617,13 @@ mod tests {
         credentials
             .set("provider:chat-test", &SecretString::from("chat-secret"))
             .unwrap();
-        let router_app = app(RouterState::new(registry, Arc::new(credentials)));
+        // `authorize()` fails closed without a token, so anything actually served
+        // has to carry one; this also exercises the real header path.
+        let router_app = app(RouterState::with_capability_token(
+            registry,
+            Arc::new(credentials),
+            SecretString::from("test-capability"),
+        ));
         let router_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1846,6 +2634,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("http://{router_addr}/v1/responses"))
+            .header(CAPABILITY_HEADER, "test-capability")
             .json(&json!({
                 "model": "chatapi/model-x",
                 "input": "hello",
@@ -1873,6 +2662,7 @@ mod tests {
 
         let stream = reqwest::Client::new()
             .post(format!("http://{router_addr}/v1/responses"))
+            .header(CAPABILITY_HEADER, "test-capability")
             .json(&json!({
                 "model": "chatapi/model-x",
                 "input": "hello",
@@ -1910,6 +2700,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// An over-size body is a 413, not the 400 it used to report; clients treat
+    /// 400 as "do not retry / your request is malformed", which is wrong here.
+    #[tokio::test]
+    async fn oversized_request_body_is_reported_as_payload_too_large() {
+        let state = RouterState::with_capability_token(
+            ProviderRegistry::empty("/tmp/providers.json"),
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("capability-secret"),
+        );
+        let oversized = "x".repeat(MAX_REQUEST_BODY_BYTES + 1024);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("host", "127.0.0.1")
+            .header(CAPABILITY_HEADER, "capability-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(oversized))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app(state), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An unknown `Content-Encoding` is a media-type problem (415), not a
+    /// malformed body (400).
+    #[tokio::test]
+    async fn unsupported_content_encoding_is_reported_as_unsupported_media_type() {
+        let state = RouterState::with_capability_token(
+            ProviderRegistry::empty("/tmp/providers.json"),
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("capability-secret"),
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("host", "127.0.0.1")
+            .header(CAPABILITY_HEADER, "capability-secret")
+            .header("content-type", "application/json")
+            .header("content-encoding", "snappy")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app(state), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// `/v1/images/edits` is `multipart/form-data` by contract. It used to be
+    /// registered but unreachable: the global JSON requirement answered 415 before
+    /// any provider was consulted.
+    #[tokio::test]
+    async fn multipart_image_edits_is_forwarded_instead_of_rejected() {
+        let captured = Arc::new(StdMutex::new(None::<String>));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = captured.clone();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/images/edits",
+                post(move |headers: HeaderMap, body: bytes::Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = Some(format!(
+                            "{}|{}",
+                            headers
+                                .get(header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default(),
+                            String::from_utf8_lossy(&body)
+                        ));
+                        Json(json!({"created": 1}))
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut registry = ProviderRegistry::empty("/tmp/router-multipart-test.json");
+        let mut provider = ProviderConfig::new("Img", &format!("http://{address}/v1")).unwrap();
+        // No credential: this test is about body framing, not authentication.
+        provider.auth_strategy = AuthStrategy::None;
+        registry.add_provider(provider).unwrap();
+        registry
+            .add_model(CustomModel::new("img", "gpt-image-1", "Img / gpt-image-1").unwrap())
+            .unwrap();
+        let state = RouterState::with_capability_token(
+            registry,
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("capability-secret"),
+        );
+
+        let boundary = "----omnibridge-test";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit this\r\n--{boundary}--\r\n"
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            // `?model=` selects the custom route; without it the request would go
+            // to the official backend, which needs an OAuth bearer.
+            .uri("/v1/images/edits?model=img/gpt-image-1")
+            .header("host", "127.0.0.1")
+            .header(CAPABILITY_HEADER, "capability-secret")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app(state), request)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "multipart image edits must reach the upstream, not be rejected as non-JSON"
+        );
+        let recorded = captured.lock().unwrap().clone().expect("upstream saw it");
+        assert!(recorded.contains(&body), "body was not forwarded verbatim");
+        assert!(recorded.starts_with("multipart/form-data"));
     }
 
     #[tokio::test]
@@ -2040,6 +2954,58 @@ mod tests {
         upstream_task.abort();
     }
 
+    /// Regression: an unknown `previous_response_id` on a custom route produced
+    /// `previous response is not available in the route-aware history ledger` —
+    /// accurate but not actionable. A user hitting this after a router restart
+    /// had no idea the fix is simply to start a new thread.
+    #[tokio::test]
+    async fn an_unknown_previous_response_id_explains_how_to_recover() {
+        let mut registry = ProviderRegistry::empty("/tmp/does-not-matter.json");
+        registry
+            .add_provider(ProviderConfig {
+                id: "up".into(),
+                name: "Up".into(),
+                base_url: "https://example.test/v1".into(),
+                protocol: ProviderProtocol::Responses,
+                auth_strategy: AuthStrategy::Bearer,
+                static_headers: std::collections::BTreeMap::new(),
+                credential_reference: "provider:up".into(),
+                model_discovery: false,
+                enabled: true,
+                models: Vec::new(),
+            })
+            .unwrap();
+        registry
+            .add_model(CustomModel::new("up", "m1", "Up / m1").unwrap())
+            .unwrap();
+        let state = RouterState::new(registry, Arc::new(MemoryCredentialStore::default()));
+        let provider = state
+            .registry
+            .read()
+            .await
+            .provider("up")
+            .cloned()
+            .expect("provider present");
+        let mut request = json!({
+            "model": "up/m1",
+            "previous_response_id": "resp-never-issued",
+            "input": "continue"
+        });
+
+        let error = hydrate_history_boundary(&state, &mut request, "up:m1", Some(&provider))
+            .await
+            .expect_err("an unknown id on a custom route must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("Start a new thread"),
+            "the error must tell the user how to recover, got: {message}"
+        );
+        assert!(
+            message.contains("restart"),
+            "the error must name the likely cause, got: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn admin_shutdown_requires_capability_token() {
         let state = RouterState::with_capability_token(
@@ -2068,17 +3034,5 @@ mod tests {
             .unwrap();
         let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn chat_request_to_responses_maps_max_output_tokens() {
-        let request = json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 512,
-            "stream": false
-        });
-        let responses_req = chat_request_to_responses(&request, "mock-model").unwrap();
-        assert_eq!(responses_req["max_output_tokens"], 512);
-        assert_eq!(responses_req["max_tokens"], 512);
     }
 }

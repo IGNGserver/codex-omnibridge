@@ -13,7 +13,7 @@ use codex_mp_core::{
     AuthStrategy, CustomModel, ModelEdit, ProviderConfig, ProviderProtocol, ProviderRegistry,
     command_for_executable, default_registry_path, executable_variants, resolve_executable,
 };
-use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
+use codex_mp_credentials::{CredentialStoreError, NativeCredentialStore};
 use codex_mp_desktop::{
     DESKTOP_LAUNCHER_CONFIG_FILE, DesktopInstallOptions, DesktopIntegrationState,
     DesktopLauncherConfig, DesktopPaths, DesktopStatus, status_for,
@@ -356,14 +356,22 @@ enum AuthStrategyArg {
 }
 
 fn auth_strategy(value: AuthStrategyArg, header_name: Option<String>) -> Result<AuthStrategy> {
-    Ok(match value {
+    let strategy = match value {
         AuthStrategyArg::Bearer => AuthStrategy::Bearer,
         AuthStrategyArg::ApiKey => AuthStrategy::ApiKey,
         AuthStrategyArg::None => AuthStrategy::None,
         AuthStrategyArg::Header => AuthStrategy::Header {
-            name: header_name.context("--auth-header is required with --auth-strategy header")?,
+            name: header_name
+                .clone()
+                .context("--auth-header is required with --auth-strategy header")?,
         },
-    })
+    };
+    // `--auth-header` used to be accepted and silently discarded for every other
+    // strategy, so the command reported success while ignoring what was asked.
+    if header_name.is_some() && !matches!(strategy, AuthStrategy::Header { .. }) {
+        bail!("--auth-header is only valid together with --auth-strategy header");
+    }
+    Ok(strategy)
 }
 
 impl From<ProtocolArg> for ProviderProtocol {
@@ -393,7 +401,7 @@ async fn main() -> Result<()> {
     let registry_path = cli.registry.unwrap_or_else(default_registry_path);
     match cli.command {
         Command::Provider { command } => provider_command(&registry_path, command).await,
-        Command::Model { command } => model_command(&registry_path, command),
+        Command::Model { command } => model_command(&registry_path, command).await,
         Command::Models => list_models(&registry_path, &cli.codex_bin),
         Command::Sync => sync(&registry_path, &cli.codex_bin),
         Command::Repair => repair_integration(&registry_path, &cli.codex_bin),
@@ -501,7 +509,7 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
     match command {
         ProviderCommand::Add(args) => {
             let secret = read_secret(args.api_key_stdin, args.api_key_env)?;
-            let mut registry = ProviderRegistry::load(path)?;
+            let (mut registry, _lock) = ProviderRegistry::load_locked(path)?;
             let previous_registry = registry.clone();
             let mut provider = ProviderConfig::new(&args.name, &args.base_url)?;
             provider.protocol = args.protocol.into();
@@ -514,11 +522,13 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
                 &NativeCredentialStore::default(),
                 &reference,
                 secret.as_ref(),
-            )?;
+            )
+            .await?;
             println!(
                 "added provider `{reference}` metadata at {}",
                 path.display()
             );
+            reload_running_router(path).await?;
         }
         ProviderCommand::List => {
             let registry = ProviderRegistry::load(path)?;
@@ -546,7 +556,7 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
                 bail!("--enable and --disable are mutually exclusive");
             }
             let secret = read_secret(args.api_key_stdin, args.api_key_env)?;
-            let mut registry = ProviderRegistry::load(path)?;
+            let (mut registry, _lock) = ProviderRegistry::load_locked(path)?;
             let previous_registry = registry.clone();
             let provider = registry
                 .provider_mut(&args.id)
@@ -573,33 +583,45 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
                 provider.enabled = false;
             }
             let reference = provider.credential_reference.clone();
+            // Everything above is routing state, and the credential may be
+            // replaced below. A running Router caches resolved credentials per
+            // `registry.generation()` and only clears that cache when the
+            // generation *changes*, so without this bump an edited API key kept
+            // resolving to the previous secret until the Router restarted.
+            registry.bump_generation();
             save_provider_change(
                 &registry,
                 &previous_registry,
                 &NativeCredentialStore::default(),
                 &reference,
                 secret.as_ref(),
-            )?;
+            )
+            .await?;
             println!("updated provider `{}`", args.id);
+            reload_running_router(path).await?;
         }
         ProviderCommand::Remove(args) => {
-            let mut registry = ProviderRegistry::load(path)?;
+            let (mut registry, _lock) = ProviderRegistry::load_locked(path)?;
             let previous_registry = registry.clone();
             let provider = registry.remove_provider(&args.id)?;
             let store = NativeCredentialStore::default();
             let previous_secret = if args.purge_credential {
-                delete_credential_if_present(&store, &provider.credential_reference)?
+                delete_credential_if_present(&store, &provider.credential_reference).await?
             } else {
                 None
             };
             if let Err(error) = registry.save() {
                 let registry_rollback = previous_registry.save();
-                let credential_rollback: Result<()> =
-                    previous_secret.as_ref().map_or(Ok(()), |secret| {
-                        store
-                            .set(&provider.credential_reference, secret)
-                            .map_err(anyhow::Error::new)
-                    });
+                let credential_rollback: Result<()> = match previous_secret.as_ref() {
+                    Some(secret) => codex_mp_credentials::set_blocking(
+                        Arc::new(store.clone()),
+                        provider.credential_reference.clone(),
+                        secret.clone(),
+                    )
+                    .await
+                    .map_err(anyhow::Error::new),
+                    None => Ok(()),
+                };
                 return combine_rollback_errors(
                     error.into(),
                     registry_rollback,
@@ -608,14 +630,15 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
                 );
             }
             println!("removed provider `{}`", args.id);
+            reload_running_router(path).await?;
         }
         ProviderCommand::FetchModels(args) => fetch_models(path, args).await?,
     }
     Ok(())
 }
 
-fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
-    let mut registry = ProviderRegistry::load(path)?;
+async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
+    let (mut registry, _lock) = ProviderRegistry::load_locked(path)?;
     match command {
         ModelCommand::Add(args) => {
             let provider = registry
@@ -632,6 +655,7 @@ fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
             registry.add_model(model.clone())?;
             registry.save()?;
             println!("added model `{}`", model.logical_model_id);
+            reload_running_router(path).await?;
         }
         ModelCommand::Edit(args) => {
             if args.display_name.is_none()
@@ -656,17 +680,21 @@ fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
             )?;
             registry.save()?;
             println!("updated model `{logical_model_id}`");
+            reload_running_router(path).await?;
         }
         ModelCommand::Remove { logical_model_id } => {
             registry.remove_model(&logical_model_id)?;
             registry.save()?;
             println!("removed model `{logical_model_id}`");
+            reload_running_router(path).await?;
         }
         ModelCommand::Enable { logical_model_id } => {
-            set_model_enabled(&mut registry, &logical_model_id, true)?
+            set_model_enabled(&mut registry, &logical_model_id, true)?;
+            reload_running_router(path).await?;
         }
         ModelCommand::Disable { logical_model_id } => {
-            set_model_enabled(&mut registry, &logical_model_id, false)?
+            set_model_enabled(&mut registry, &logical_model_id, false)?;
+            reload_running_router(path).await?;
         }
     }
     Ok(())
@@ -689,6 +717,11 @@ fn set_model_enabled(
         .find(|m| m.logical_model_id == logical_model_id)
         .context("model not found")?;
     model.enabled = enabled;
+    // The enabled set is routing state. A running Router caches resolved
+    // credentials per `registry.generation()` and only clears that cache when the
+    // generation *changes*, so toggling a model must bump it (same gap as
+    // `ProviderManager::set_model_enabled`).
+    registry.bump_generation();
     registry.save()?;
     println!(
         "{} `{logical_model_id}`",
@@ -765,8 +798,23 @@ fn status(path: &std::path::Path, codex_bin: &std::path::Path) -> Result<()> {
     );
     let catalog_binary = catalog_binary_for(path, codex_bin)?;
     println!("Codex catalog source: {}", catalog_binary.display());
+    // Report the real policy instead of a blanket reassurance: the router is
+    // loopback-only, but the web panel can be bound to 0.0.0.0, and the
+    // account manager does read auth.json.
     println!("router bind policy: 127.0.0.1 only");
-    println!("OAuth: not accessed by codex-mp");
+    let registry = ProviderRegistry::load(path)?;
+    let sec = registry.web_security();
+    println!(
+        "web panel bind policy: {}",
+        if sec.allow_remote {
+            "0.0.0.0 (remote access enabled; plain HTTP, password required)"
+        } else {
+            "127.0.0.1 only"
+        }
+    );
+    println!("OAuth: the account manager reads auth.json to report the active account;");
+    println!("       OAuth tokens are only rewritten when you explicitly switch accounts");
+    println!("       from the web panel, and are never forwarded to a custom provider.");
     Ok(())
 }
 
@@ -901,6 +949,11 @@ fn desktop_restore(registry_path: &Path) -> Result<()> {
     let manifest_path = DesktopPaths::manifest_path_for_registry(registry_path);
     if codex_mp_desktop::restore(&paths, &manifest_path)? {
         println!("restored the original Desktop entrypoint and removed the managed runtime");
+    } else if codex_mp_desktop::restore_orphaned_launcher(&paths, &manifest_path)? {
+        // No manifest, but the entrypoint is still one of our launchers (an
+        // interrupted install, or a config directory the user cleaned). Saying
+        // "no manifest was found" left the Desktop hijacked with no CLI way back.
+        println!("restored the original Desktop entrypoint (no manifest was present)");
     } else {
         println!("no Desktop integration manifest was found");
     }
@@ -956,14 +1009,52 @@ async fn run_manager(path: &Path, args: ManagerArgs) -> Result<()> {
             .join("router-endpoint.json")
     });
     let executable = std::env::current_exe()?;
-    let mut supervisor = RouterSupervisor::new(executable, path.to_path_buf(), &endpoint_file);
+    // Same reasoning as `launch`: stock Codex dials the `base_url` from
+    // `config.toml`, so a long-lived Router must bind that port, not an ephemeral
+    // one, or Codex cannot reach it.
+    let manager_port = codex_mp_integration::router_port_for_registry(path);
+    let mut supervisor = RouterSupervisor::new(executable, path.to_path_buf(), &endpoint_file)
+        .with_port(manager_port);
     let endpoint = supervisor.start().await?;
     println!("router started on {}", endpoint.base_url);
     println!("manager is running; press Ctrl-C to stop the Router");
-    tokio::signal::ctrl_c().await?;
+    // Waiting on Ctrl-C alone meant SIGTERM (systemd stop, `kill`, a container
+    // stop) skipped `stop()` entirely and left the Router running as an orphan.
+    wait_for_shutdown_signal().await;
     supervisor.stop().await?;
     println!("router stopped and endpoint file removed");
     Ok(())
+}
+
+/// Resolve when the process is asked to terminate by any supported mechanism.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn launch(path: &Path, args: LaunchArgs) -> Result<ExitStatus> {
@@ -993,8 +1084,14 @@ async fn launch(path: &Path, args: LaunchArgs) -> Result<ExitStatus> {
             .config_dir
             .join("router-endpoint.json")
     });
+    // Stock Codex dials the `base_url` recorded in `config.toml`; it never reads
+    // the endpoint file. Starting the Router on an ephemeral port therefore sent
+    // every request to a port nobody was listening on. Bind the same port the
+    // config advertises so the managed config actually resolves.
+    let launch_port = codex_mp_integration::router_port_for_registry(path);
     let mut supervisor =
-        RouterSupervisor::new(std::env::current_exe()?, path.to_path_buf(), &endpoint_file);
+        RouterSupervisor::new(std::env::current_exe()?, path.to_path_buf(), &endpoint_file)
+            .with_port(launch_port);
     let endpoint = supervisor.start().await?;
 
     let mut command = tokio::process::Command::from(command_for_executable(&codex_binary));
@@ -1059,7 +1156,7 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             .context("running Web control panel")?;
         }
         WebCommand::Password(args) => {
-            let mut registry = ProviderRegistry::load(registry_path)?;
+            let (mut registry, _lock) = ProviderRegistry::load_locked(registry_path)?;
             if args.clear {
                 let sec = registry.web_security_mut();
                 sec.password_hash = None;
@@ -1093,7 +1190,7 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             if args.enable && args.disable {
                 bail!("--enable and --disable are mutually exclusive");
             }
-            let mut registry = ProviderRegistry::load(registry_path)?;
+            let (mut registry, _lock) = ProviderRegistry::load_locked(registry_path)?;
             if args.enable {
                 if registry.web_security().password_hash.is_none() {
                     bail!(
@@ -1110,7 +1207,9 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
                 registry.save()?;
                 println!("Web browser access disabled (local desktop direct access only).");
             } else {
-                println!("specify either --enable or --disable");
+                // Exiting 0 here would make the command look successful to a
+                // script that never actually changed anything.
+                bail!("specify either --enable or --disable");
             }
         }
         WebCommand::Remote(args) => {
@@ -1129,12 +1228,25 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
                 sec.allow_remote = true;
                 registry.save()?;
                 println!("Web panel remote access enabled (bind 0.0.0.0).");
+                println!();
+                println!("SECURITY WARNING");
+                println!(
+                    "  Remote access is served over plain HTTP: the access password and every"
+                );
+                println!("  request travel the network unencrypted, and anyone who can read that");
+                println!("  traffic can take over the panel.");
+                println!(
+                    "  Use this only on a trusted local network. For access over the internet,"
+                );
+                println!("  keep remote access disabled and tunnel it instead, e.g.");
+                println!("      ssh -L 31828:127.0.0.1:31828 <host>");
+                println!("  then open http://localhost:31828 locally.");
             } else if args.disable {
                 registry.web_security_mut().allow_remote = false;
                 registry.save()?;
                 println!("Web panel remote access disabled (bind 127.0.0.1 only).");
             } else {
-                println!("specify either --enable or --disable");
+                bail!("specify either --enable or --disable");
             }
         }
         WebCommand::Status => {
@@ -1171,6 +1283,70 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
     Ok(())
 }
 
+/// Ask a running Router to pick up registry changes.
+///
+/// The web panel does this after every provider/model edit; the CLI did not, so
+/// `codex-mp model add` while the panel's Router was serving left that Router
+/// advertising the previous model list — the new model simply was not routable
+/// until the Router was restarted. A Router that is not running is not an error
+/// (the change is already saved), so this reports and returns.
+async fn reload_running_router(registry_path: &Path) -> Result<()> {
+    let endpoint_file = IntegrationPaths::for_registry(registry_path)
+        .config_dir
+        .join("router-endpoint.json");
+    if !endpoint_file.exists() {
+        return Ok(());
+    }
+    // Pin the configured port even though `reload()` does not bind one. A
+    // supervisor that does not know which port `config.toml` advertises is a
+    // latent hazard: any later `start()` on it would bind an ephemeral port that
+    // stock Codex can never reach, which is exactly the N-17 failure mode.
+    let router_port = codex_mp_integration::router_port_for_registry(registry_path);
+    let supervisor = RouterSupervisor::new(
+        std::env::current_exe()?,
+        registry_path.to_path_buf(),
+        &endpoint_file,
+    )
+    .with_port(router_port);
+    match supervisor.reload().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Not fatal: the registry is saved and the next Router start picks it
+            // up. Say so instead of failing an otherwise successful command.
+            eprintln!(
+                "codex-mp: saved the change, but the running router did not reload it ({error}); \
+                 restart the router to apply it"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Whether something is listening at the Router's `/readyz`.
+///
+/// `resume` hands stock Codex `model_provider="omnibridge"`, so a Router must
+/// already be running. This command does not start one (unlike `launch`); without
+/// the check the session silently pointed at a port nobody owned and every model
+/// request failed with no explanation.
+async fn router_is_reachable(base_url: &str) -> bool {
+    // `base_url` carries the provider path (`.../v1`); `/readyz` sits at the root.
+    let root = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let url = format!("{root}/readyz");
+    match reqwest::Client::builder()
+        // A redirect could point this probe at an unrelated host; refuse them,
+        // consistent with every other client in this project.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client.get(url).send().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 async fn resume(
     registry_path: &Path,
     configured_codex: &Path,
@@ -1203,6 +1379,19 @@ async fn resume(
         bail!(
             "OmniBridge integration manifest is missing at {}; run `codex-mp sync` first",
             paths.manifest.display()
+        );
+    }
+
+    // `resume` injects `model_provider="omnibridge"`, so a Router must already be
+    // listening on the port `config.toml` advertises. This command does not start
+    // one (unlike `launch`). Without this check the session silently pointed at a
+    // port nobody owned: Codex started, and every model request failed.
+    let router_base = paths.router_base_url();
+    if !router_is_reachable(&router_base).await {
+        bail!(
+            "no OmniBridge Router is answering at {router_base}; start one first with \
+             `codex-mp manager` (or `codex-mp launch`), or install the service with \
+             `codex-mp-router-service-install`"
         );
     }
 
@@ -1282,38 +1471,84 @@ async fn uninstall(path: &Path, args: UninstallArgs) -> Result<()> {
     if endpoint_file.exists() {
         let supervisor =
             RouterSupervisor::new(std::env::current_exe()?, path.to_path_buf(), &endpoint_file);
-        supervisor
-            .shutdown()
-            .await
-            .context("running Router did not accept the shutdown request")?;
-        for _ in 0..40 {
-            if !endpoint_file.exists() {
-                break;
+        // An unreachable Router is already stopped, which is the state uninstall
+        // wants. The endpoint file can outlive its process (SIGKILL, power loss,
+        // a container restart), and treating that as a hard error made uninstall
+        // impossible: it aborted *before* restoring the Codex config, so the user
+        // was left with a hijacked config and no working way to undo it.
+        match supervisor.shutdown().await {
+            Ok(()) => {
+                for _ in 0..40 {
+                    if !endpoint_file.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if endpoint_file.exists() {
+                    // The Router answered but kept its endpoint file. Clear it so
+                    // the rest of the uninstall can proceed rather than dead-ending.
+                    eprintln!(
+                        "codex-mp: router acknowledged shutdown but left {}; removing it",
+                        endpoint_file.display()
+                    );
+                    let _ = std::fs::remove_file(&endpoint_file);
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if endpoint_file.exists() {
-            bail!(
-                "Router accepted shutdown but endpoint file remains: {}",
-                endpoint_file.display()
-            );
+            Err(error) => {
+                eprintln!(
+                    "codex-mp: no running router answered at {} ({error}); continuing",
+                    endpoint_file.display()
+                );
+                // Remove the orphaned record so it cannot block a later run.
+                let _ = std::fs::remove_file(&endpoint_file);
+            }
         }
     }
 
-    let desktop_manifest = DesktopPaths::manifest_path_for_registry(path);
-    let desktop_restored = codex_mp_desktop::restore_if_present(&desktop_manifest)
-        .context("Codex Desktop was not restored; no state was removed")?;
-
+    // Restore the Codex config FIRST. It is the change that actually hijacks the
+    // user's editor, and it must be undone even if the Desktop adapter cannot be
+    // cleaned up. Previously a Desktop failure aborted this function before the
+    // config was restored, leaving `config.toml` pointing at a Router that was
+    // about to be uninstalled — the worst possible end state.
     let restored = restore_if_present(&integration_paths)
         .context("Codex integration was not restored; no state was removed")?;
-    let manager = codex_mp_manager::ProviderManager::new(path.to_path_buf());
-    let remove_registry = !args.keep_provider_data && *path == default_registry_path();
-    let removed_credentials = if args.keep_provider_data {
-        0
-    } else {
-        manager.purge_provider_data(remove_registry).context(
+
+    // Desktop teardown is second, and a failure is reported without undoing the
+    // config restore that already succeeded.
+    let desktop_manifest = DesktopPaths::manifest_path_for_registry(path);
+    let desktop_restored = match codex_mp_desktop::restore_if_present(&desktop_manifest) {
+        Ok(done) => done,
+        Err(error) => {
+            eprintln!(
+                "codex-mp: the Codex config was restored, but the Desktop adapter could not be \
+                 removed ({error}); run `codex-mp desktop restore` to retry"
+            );
+            false
+        }
+    };
+    // The registry and its credentials are one unit of user data: a registry whose
+    // keys have been deleted lists providers that cannot work, and a keyring entry
+    // whose provider is gone is an orphan. They are therefore removed together or
+    // kept together.
+    //
+    // A *custom* `--registry` is never deleted: the user chose that location and
+    // may manage it separately. Its credentials are preserved for the same reason.
+    // Only the standard registry location, and only without `--keep-provider-data`,
+    // is treated as "uninstall everything".
+    let remove_registry = should_remove_provider_data(args.keep_provider_data, path);
+    // Detect an unreadable registry up front. `purge_provider_data` tolerates one
+    // (otherwise a hand-edit that broke the JSON made `uninstall` impossible), but
+    // with no readable references it cannot know which credentials to delete, so
+    // the user must be told that a key may survive rather than being left to
+    // assume the purge was complete.
+    let registry_unreadable = remove_registry && ProviderRegistry::load(path).is_err();
+    let removed_credentials = if remove_registry {
+        let manager = codex_mp_manager::ProviderManager::new(path.to_path_buf());
+        manager.purge_provider_data(true).await.context(
             "Provider data cleanup failed; the executable can remain installed for retry",
         )?
+    } else {
+        0
     };
     if remove_registry {
         remove_empty_state_directory(path);
@@ -1321,13 +1556,155 @@ async fn uninstall(path: &Path, args: UninstallArgs) -> Result<()> {
     println!(
         "uninstalled integration (restored_config={restored}, restored_desktop={desktop_restored}, removed_credentials={removed_credentials}, removed_registry={remove_registry})"
     );
-    if !remove_registry && !args.keep_provider_data {
+    if registry_unreadable {
         println!(
-            "custom registry preserved at {}; use --keep-provider-data to preserve its keyring entries too",
+            "note: the provider registry could not be read, so stored credentials \
+             could not be enumerated or removed; check your credential store and \
+             delete any leftover entry manually"
+        );
+    }
+    if !remove_registry {
+        // Say plainly what was kept and why, so the user is not left wondering
+        // whether their keys survived.
+        println!(
+            "provider registry and its credentials preserved at {}; \
+             re-run with the default registry (or delete them manually) to remove them",
             path.display()
         );
     }
     Ok(())
+}
+
+/// Whether uninstall should delete the provider registry **and** its credentials.
+///
+/// The registry and its credentials are one unit of user data: a registry whose
+/// keys were deleted lists providers that cannot work, and a keyring entry whose
+/// provider is gone is an orphan. Anything that keeps one must keep the other.
+/// A custom `--registry` is never removed — the user chose that location and may
+/// manage it separately.
+fn should_remove_provider_data(keep_provider_data: bool, registry_path: &Path) -> bool {
+    !keep_provider_data && registry_path == default_registry_path()
+}
+
+#[cfg(test)]
+mod router_reachability_tests {
+    use super::*;
+
+    /// The `/readyz` probe must be derived from the provider `base_url`, which
+    /// carries a `/v1` path segment that has to be stripped.
+    #[test]
+    fn the_readiness_probe_strips_the_provider_path() {
+        let build = |base: &str| {
+            base.trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .trim_end_matches('/')
+                .to_owned()
+                + "/readyz"
+        };
+        assert_eq!(
+            build("http://127.0.0.1:8787/v1"),
+            "http://127.0.0.1:8787/readyz"
+        );
+        assert_eq!(
+            build("http://127.0.0.1:8787/v1/"),
+            "http://127.0.0.1:8787/readyz"
+        );
+        assert_eq!(
+            build("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787/readyz"
+        );
+    }
+
+    /// Regression: `resume` injected `model_provider="omnibridge"` without
+    /// checking that a Router was listening. With none running, stock Codex
+    /// started and every model request failed silently. A closed port must be
+    /// reported as unreachable.
+    #[tokio::test]
+    async fn a_closed_port_is_reported_as_unreachable() {
+        // Bind and immediately drop, so the port is almost certainly free.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            !router_is_reachable(&format!("http://127.0.0.1:{port}/v1")).await,
+            "a port with no listener must not be treated as a live Router"
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_discovery_tests {
+    use super::*;
+
+    /// The discovery response parser must accept the shapes real gateways use and
+    /// skip unusable entries rather than failing the whole call.
+    #[test]
+    fn parse_discovered_models_accepts_the_common_shapes() {
+        // OpenAI style: `{"data":[{"id":...}]}`.
+        let openai = serde_json::json!({
+            "data": [{"id": "gpt-oss-120b", "display_name": "GPT-OSS"}]
+        });
+        let parsed = parse_discovered_models(&openai).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].upstream_model_id, "gpt-oss-120b");
+        assert_eq!(parsed[0].display_name.as_deref(), Some("GPT-OSS"));
+
+        // A bare array of strings.
+        let bare = serde_json::json!(["a", " b ", ""]);
+        let parsed = parse_discovered_models(&bare).unwrap();
+        assert_eq!(parsed.len(), 2, "blank ids must be skipped, not kept");
+        assert_eq!(parsed[0].upstream_model_id, "a");
+        assert_eq!(parsed[1].upstream_model_id, "b");
+
+        // `{"models":[...]}` with alternate id keys.
+        let alt = serde_json::json!({"models": [{"slug": "s-1"}, {"name": "n-1"}]});
+        let parsed = parse_discovered_models(&alt).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].upstream_model_id, "s-1");
+        assert_eq!(parsed[1].upstream_model_id, "n-1");
+    }
+
+    /// A response with no usable list must fail loudly rather than reporting zero.
+    #[test]
+    fn parse_discovered_models_rejects_an_unusable_response() {
+        assert!(parse_discovered_models(&serde_json::json!({"unexpected": 1})).is_err());
+        // A non-empty list with nothing usable is an error, not an empty success.
+        assert!(parse_discovered_models(&serde_json::json!([{}, 42, ""])).is_err());
+        // An empty list is a legitimate "no models".
+        assert!(
+            parse_discovered_models(&serde_json::json!([]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_data_tests {
+    use super::*;
+
+    /// Regression: uninstall used to delete the stored credentials but keep the
+    /// registry whenever `--registry` was non-default, leaving a provider list
+    /// whose keys no longer existed. The decision now covers both together.
+    #[test]
+    fn provider_data_is_removed_only_for_the_default_registry() {
+        let default_path = default_registry_path();
+
+        assert!(
+            should_remove_provider_data(false, &default_path),
+            "the default registry and its credentials must be removed on a plain uninstall"
+        );
+        assert!(
+            !should_remove_provider_data(true, &default_path),
+            "--keep-provider-data must preserve both the registry and its credentials"
+        );
+
+        let custom = PathBuf::from("/tmp/some-custom-registry/providers.json");
+        assert!(
+            !should_remove_provider_data(false, &custom),
+            "a custom registry must never be deleted, so its credentials must survive too"
+        );
+    }
 }
 
 fn remove_empty_state_directory(registry_path: &std::path::Path) {
@@ -1397,15 +1774,62 @@ async fn fetch_models(path: &PathBuf, args: FetchModelsArgs) -> Result<()> {
         .provider(&id)
         .with_context(|| format!("provider `{id}` was not found"))?;
     let provider_name = provider.name.clone();
-    let key = NativeCredentialStore::default().get(&provider.credential_reference)?;
+    // Offloaded: the keyring backend bridges to a synchronous API (on Linux,
+    // `zbus` calls `Runtime::block_on`), which panics with "Cannot start a runtime
+    // from within a runtime" when invoked from inside this async function. Every
+    // other keyring touch in this file already goes through `*_blocking`; this
+    // call site was missed, so `provider fetch-models` panicked unconditionally.
+    let key = codex_mp_credentials::get_blocking(
+        Arc::new(NativeCredentialStore::default()),
+        provider.credential_reference.clone(),
+    )
+    .await?;
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .get(url)
-        .bearer_auth(secrecy::ExposeSecret::expose_secret(&key))
-        .send()
-        .await?;
+    // Redirects are refused: this request carries the provider's API key, and
+    // reqwest's default policy would resend the header to whatever host a
+    // 307/308 names (verified elsewhere in this project with a local redirector).
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "codex-mp: FATAL: no hardened model-discovery client available; \
+                 provider redirects will be followed"
+            );
+            reqwest::Client::new()
+        });
+    let mut request = client.get(url);
+    // Probe with the provider's *configured* auth strategy; always sending a
+    // Bearer token broke discovery for api_key/header providers.
+    if let Some((name, value)) = provider
+        .auth_strategy
+        .credential_header(secrecy::ExposeSecret::expose_secret(&key))
+    {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
     let status = response.status();
+    // Bound the read. `text()` buffers the entire body, so a hostile or broken
+    // provider could exhaust memory with a multi-gigabyte "model list". The
+    // router already caps upstream responses; discovery must too.
+    const MAX_DISCOVERY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+    if let Some(length) = response.content_length()
+        && length > MAX_DISCOVERY_RESPONSE_BYTES as u64
+    {
+        bail!(
+            "provider returned {length} bytes, which exceeds the \
+             {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list"
+        );
+    }
     let body = response.text().await?;
+    if body.len() > MAX_DISCOVERY_RESPONSE_BYTES {
+        bail!(
+            "provider returned {} bytes, which exceeds the \
+             {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list",
+            body.len()
+        );
+    }
     let value: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("provider returned non-JSON response (HTTP {status})"))?;
     if !status.is_success() {
@@ -1429,7 +1853,7 @@ async fn fetch_models(path: &PathBuf, args: FetchModelsArgs) -> Result<()> {
     };
     let mut added = 0usize;
     if !selected.is_empty() {
-        let mut updated = ProviderRegistry::load(path)?;
+        let (mut updated, _lock) = ProviderRegistry::load_locked(path)?;
         for upstream_model_id in selected {
             let discovered = models
                 .iter()
@@ -1478,7 +1902,14 @@ async fn fetch_models(path: &PathBuf, args: FetchModelsArgs) -> Result<()> {
     Ok(())
 }
 
-fn save_provider_change(
+/// Persist a provider change together with its credential.
+///
+/// Every keyring touch is offloaded to a blocking thread: the Linux keyring
+/// backend reaches the Secret Service through `zbus`, which internally calls
+/// `tokio::runtime::Runtime::block_on`. Calling it straight from this async
+/// command panicked with "Cannot start a runtime from within a runtime" and
+/// aborted the command before it wrote anything.
+async fn save_provider_change(
     registry: &ProviderRegistry,
     previous_registry: &ProviderRegistry,
     store: &NativeCredentialStore,
@@ -1486,16 +1917,31 @@ fn save_provider_change(
     secret: Option<&SecretString>,
 ) -> Result<()> {
     let previous_secret = if secret.is_some() {
-        store.get(reference).ok()
+        match codex_mp_credentials::get_blocking(Arc::new(store.clone()), reference.to_owned())
+            .await
+        {
+            Ok(secret) => Some(secret),
+            // "No previous secret" and "the backend could not be read" must not
+            // be conflated: treating a failed read as absent would let the
+            // rollback below delete a credential that is still valid.
+            Err(CredentialStoreError::NotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        }
     } else {
         None
     };
     if let Some(secret) = secret {
-        store.set(reference, secret)?;
+        codex_mp_credentials::set_blocking(
+            Arc::new(store.clone()),
+            reference.to_owned(),
+            secret.clone(),
+        )
+        .await?;
     }
     if let Err(error) = registry.save() {
         let registry_rollback = previous_registry.save();
-        let credential_rollback = restore_secret(store, reference, previous_secret.as_ref());
+        let credential_rollback =
+            restore_secret_async(store, reference.to_owned(), previous_secret).await;
         return combine_rollback_errors(
             error.into(),
             registry_rollback,
@@ -1526,13 +1972,14 @@ fn combine_rollback_errors(
     }
 }
 
-fn delete_credential_if_present(
+async fn delete_credential_if_present(
     store: &NativeCredentialStore,
     reference: &str,
 ) -> Result<Option<SecretString>> {
-    match store.get(reference) {
+    match codex_mp_credentials::get_blocking(Arc::new(store.clone()), reference.to_owned()).await {
         Ok(secret) => {
-            store.delete(reference)?;
+            codex_mp_credentials::delete_blocking(Arc::new(store.clone()), reference.to_owned())
+                .await?;
             Ok(Some(secret))
         }
         Err(CredentialStoreError::NotFound(_)) => Ok(None),
@@ -1540,17 +1987,23 @@ fn delete_credential_if_present(
     }
 }
 
-fn restore_secret(
+/// Async counterpart of the credential rollback path; see
+/// [`save_provider_change`] for why every keyring touch is offloaded.
+async fn restore_secret_async(
     store: &NativeCredentialStore,
-    reference: &str,
-    previous_secret: Option<&SecretString>,
+    reference: String,
+    previous_secret: Option<SecretString>,
 ) -> Result<()> {
     match previous_secret {
-        Some(secret) => store.set(reference, secret)?,
-        None => match store.delete(reference) {
-            Ok(()) | Err(CredentialStoreError::NotFound(_)) => {}
-            Err(error) => return Err(error.into()),
-        },
+        Some(secret) => {
+            codex_mp_credentials::set_blocking(Arc::new(store.clone()), reference, secret).await?;
+        }
+        None => {
+            match codex_mp_credentials::delete_blocking(Arc::new(store.clone()), reference).await {
+                Ok(()) | Err(CredentialStoreError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     Ok(())
 }

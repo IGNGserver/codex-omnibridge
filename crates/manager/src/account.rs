@@ -1,20 +1,98 @@
 //! Management of official Codex / ChatGPT accounts, credentials persistence,
 //! token refresh, rate limits usage checking, atomic switching, and Codex process restarting.
 
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use codex_mp_core::{atomic_replace, set_private_permissions};
+use codex_mp_core::FileLock;
+use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
 use directories::{BaseDirs, ProjectDirs};
 use reqwest::Client;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Keyring service name under which managed account tokens are stored.
+const ACCOUNT_CREDENTIAL_SERVICE: &str = "dev.codex-multiprovider.accounts";
+
+/// Only this many `auth.bak-switch-*` copies are kept. Each one contains live
+/// OAuth tokens, so an unbounded pile of them is a credential-leak hazard.
+const MAX_AUTH_BACKUPS: usize = 3;
+
+/// Credential reference for a managed account's token set.
+fn account_credential_reference(id: &str) -> String {
+    format!("account:{id}")
+}
+
+/// Whether a stored account corresponds to the account Codex is currently logged
+/// in as. Prefers the account id, falling back to the e-mail because older Codex
+/// builds did not always persist `account_id`.
+fn account_matches_active(account: &ManagedAccount, active: &ActiveAccountStatus) -> bool {
+    if let Some(matched_id) = &active.matched_account_id {
+        return account.id == *matched_id;
+    }
+    match (&account.email, &active.email) {
+        (Some(account_email), Some(active_email)) => {
+            account_email.eq_ignore_ascii_case(active_email)
+        }
+        _ => false,
+    }
+}
+
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Largest body accepted from the (hard-coded, official) token and usage
+/// endpoints.
+///
+/// `Response::json()` buffers the whole body with no limit. These endpoints are
+/// HTTPS and not user-controlled, so this is defence in depth rather than a
+/// reachable attack — but a captive portal or a broken intermediary could still
+/// return something enormous, and the same bound is already applied to provider
+/// discovery.
+const MAX_ACCOUNT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read an error body for a diagnostic message, truncated to a readable size.
+///
+/// `text()` buffers the whole body; an error path only ever shows a short
+/// snippet, so an oversized or hostile response should not be absorbed whole.
+async fn read_bounded_error_text(response: reqwest::Response) -> String {
+    /// Enough for a readable diagnostic, far below any response worth buffering.
+    const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+    let text = response.text().await.unwrap_or_default();
+    if text.len() <= MAX_ERROR_BODY_BYTES {
+        return text;
+    }
+    let mut truncated: String = text.chars().take(MAX_ERROR_BODY_BYTES).collect();
+    truncated.push_str("… (truncated)");
+    truncated
+}
+
+/// Read a bounded JSON body, rejecting anything larger than the cap.
+async fn read_bounded_account_json(
+    response: reqwest::Response,
+    what: &str,
+) -> Result<serde_json::Value, AccountError> {
+    if let Some(length) = response.content_length()
+        && length > MAX_ACCOUNT_RESPONSE_BYTES as u64
+    {
+        return Err(AccountError::RefreshFailed(format!(
+            "{what} returned {length} bytes, exceeding the {MAX_ACCOUNT_RESPONSE_BYTES} byte limit"
+        )));
+    }
+    let text = response.text().await?;
+    if text.len() > MAX_ACCOUNT_RESPONSE_BYTES {
+        return Err(AccountError::RefreshFailed(format!(
+            "{what} returned {} bytes, exceeding the {MAX_ACCOUNT_RESPONSE_BYTES} byte limit",
+            text.len()
+        )));
+    }
+    serde_json::from_str(&text).map_err(AccountError::from)
+}
+
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_USER_AGENT: &str = "codex_cli_rs";
@@ -25,12 +103,25 @@ pub enum AccountError {
     Io(#[from] io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The accounts store exists but cannot be parsed.
+    ///
+    /// Reported with the file path and an explicit remedy so a user whose store
+    /// was corrupted by a hand-edit or a bad write can recover, instead of seeing
+    /// a bare parser message from the panel.
+    #[error(
+        "the accounts store at {path} is not valid JSON ({detail}); \
+         move it aside (for example `mv {path} {path}.bak`) to start from an empty \
+         list, then re-import your accounts"
+    )]
+    StoreUnreadable { path: String, detail: String },
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
     #[error("Account not found: `{0}`")]
     NotFound(String),
     #[error("Invalid token format: {0}")]
     InvalidToken(String),
+    #[error("Account `{0}` has no stored credentials; refusing to overwrite auth.json")]
+    MissingCredentials(String),
     #[error("Token refresh failed: {0}")]
     RefreshFailed(String),
     #[error("Rate limit check failed: HTTP {status} {message}")]
@@ -39,10 +130,12 @@ pub enum AccountError {
     CodexHomeNotFound,
     #[error("Failed to parse auth.json: {0}")]
     AuthJsonInvalid(String),
+    #[error("Credential store error: {0}")]
+    Credential(#[from] CredentialStoreError),
 }
 
 /// Token payload stored in auth.json and account store
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountTokens {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
@@ -52,6 +145,13 @@ pub struct AccountTokens {
     pub refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+impl AccountTokens {
+    /// True when no secret material is present (i.e. nothing to persist).
+    pub fn is_empty(&self) -> bool {
+        self.id_token.is_none() && self.access_token.is_none() && self.refresh_token.is_none()
+    }
 }
 
 /// Parsed profile claim info from id_token
@@ -113,6 +213,11 @@ pub struct ManagedAccount {
     pub plan_type: Option<String>,
     pub user_id: Option<String>,
     pub account_id: Option<String>,
+    /// Secrets are never written to the on-disk store; they live in the OS
+    /// keyring. `skip_serializing` keeps them out of the JSON while still
+    /// allowing a legacy store file (which embedded them) to be read and
+    /// migrated on first load.
+    #[serde(default, skip_serializing)]
     pub tokens: AccountTokens,
     pub last_refresh: Option<String>,
     pub created_at: u64,
@@ -125,6 +230,25 @@ pub struct ManagedAccount {
 pub struct AccountsFile {
     pub schema_version: u32,
     pub accounts: Vec<ManagedAccount>,
+}
+
+impl ManagedAccount {
+    /// Secret-free projection of this account.
+    ///
+    /// Every API response and UI path must go through this: `ManagedAccount`
+    /// carries `tokens`, including the long-lived OAuth refresh token, and must
+    /// never be serialized to a client.
+    pub fn to_summary(&self, is_active: bool) -> AccountSummary {
+        AccountSummary {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            email: self.email.clone(),
+            plan_type: self.plan_type.clone(),
+            is_active,
+            updated_at: self.updated_at,
+            usage: self.usage.clone(),
+        }
+    }
 }
 
 /// Public summary for Web / UI
@@ -153,7 +277,11 @@ pub struct ActiveAccountStatus {
 pub struct AccountManager {
     store_path: PathBuf,
     codex_home: PathBuf,
-    http_client: Client,
+    // `Arc` so the whole manager can be moved into `spawn_blocking`: every one of
+    // its synchronous methods may touch the OS keyring, which must never run on
+    // an async worker thread (see `codex_mp_credentials::run_blocking`).
+    http_client: Arc<Client>,
+    credentials: Arc<dyn CredentialStore>,
 }
 
 impl AccountManager {
@@ -164,13 +292,46 @@ impl AccountManager {
     }
 
     pub fn with_paths(store_path: impl Into<PathBuf>, codex_home: impl Into<PathBuf>) -> Self {
+        Self::with_credential_store(
+            store_path,
+            codex_home,
+            Arc::new(NativeCredentialStore::new(ACCOUNT_CREDENTIAL_SERVICE)),
+        )
+    }
+
+    /// Build a manager backed by a caller-supplied credential store. Tests use
+    /// this to avoid touching the host keyring.
+    pub fn with_credential_store(
+        store_path: impl Into<PathBuf>,
+        codex_home: impl Into<PathBuf>,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> Self {
         Self {
             store_path: store_path.into(),
             codex_home: codex_home.into(),
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            http_client: Arc::new(
+                Client::builder()
+                    // This client POSTs a **live OAuth refresh token** to the
+                    // token endpoint. Without an explicit policy reqwest uses
+                    // `Policy::limited(10)`, and a 307/308 redirect makes it
+                    // resend the request body — the refresh token — to whatever
+                    // host the redirect names. Verified with a local redirector:
+                    // the target received `refresh_token=SECRET-RT`.
+                    //
+                    // Every other client in this project already sets this; this
+                    // was the one that carries the most sensitive payload.
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_else(|_| {
+                        eprintln!(
+                            "codex-mp: FATAL: no hardened account client available; \
+                             OAuth redirects will be followed"
+                        );
+                        Client::new()
+                    }),
+            ),
+            credentials,
         }
     }
 
@@ -188,6 +349,18 @@ impl AccountManager {
 
     // ---------------- Persistence ---------------- //
 
+    /// Load the accounts store while holding the cross-process lock.
+    ///
+    /// Callers that mutate must use this and keep the guard alive until after
+    /// [`Self::save_file`]. `load_file` + `save_file` on its own is a lost-update
+    /// race: two writers can each read revision N and both replace it, silently
+    /// dropping one account. This was reproducible with 8 concurrent imports.
+    pub fn load_file_locked(&self) -> Result<(AccountsFile, FileLock), AccountError> {
+        let guard = FileLock::acquire(&self.store_path)?;
+        let file = self.load_file()?;
+        Ok((file, guard))
+    }
+
     pub fn load_file(&self) -> Result<AccountsFile, AccountError> {
         if !self.store_path.exists() {
             return Ok(AccountsFile {
@@ -196,26 +369,87 @@ impl AccountManager {
             });
         }
         let content = fs::read_to_string(&self.store_path)?;
-        let file: AccountsFile = serde_json::from_str(&content)?;
+        // Name the file and the remedy. A bare `expected value at line 1 column 15`
+        // gave the user no way to know *which* file was broken, and the panel
+        // surfaced it verbatim — leaving account import and listing both failing
+        // with no recovery path other than guessing.
+        let mut file: AccountsFile =
+            serde_json::from_str(&content).map_err(|error| AccountError::StoreUnreadable {
+                path: self.store_path.display().to_string(),
+                detail: error.to_string(),
+            })?;
+
+        // Tokens are keyring-resident. A store written by an older release still
+        // carries them inline, so re-home those into the keyring now and rewrite
+        // the file without them.
+        let mut migrated_legacy_secrets = false;
+        for account in &mut file.accounts {
+            let reference = account_credential_reference(&account.id);
+            if !account.tokens.is_empty() {
+                let secret = SecretString::from(serde_json::to_string(&account.tokens)?);
+                self.credentials.set(&reference, &secret)?;
+                migrated_legacy_secrets = true;
+                continue;
+            }
+            match self.credentials.get(&reference) {
+                Ok(secret) => {
+                    account.tokens = serde_json::from_str::<AccountTokens>(secret.expose_secret())
+                        .map_err(|error| {
+                            AccountError::InvalidToken(format!(
+                                "stored credentials for account `{}` are unreadable: {error}",
+                                account.id
+                            ))
+                        })?;
+                }
+                // Genuinely nothing stored: this account has no credentials yet.
+                Err(CredentialStoreError::NotFound(_)) => {}
+                // The backend failed. Treating that as "no credentials" used to
+                // let a later `switch_to_account` write an empty token set into
+                // `auth.json`, destroying the user's live session. Fail closed.
+                Err(error) => return Err(AccountError::Credential(error)),
+            }
+        }
+        if migrated_legacy_secrets {
+            self.save_file(&file)?;
+        }
+
         Ok(file)
     }
 
+    /// Persist the accounts document.
+    ///
+    /// Only credentials that actually changed are written. Writing every
+    /// account's tokens on every save was both wasteful and fragile: a usage
+    /// refresh for *one* account rewrote *all* of them, so a keyring problem on
+    /// any single account failed an unrelated account's refresh.
     pub fn save_file(&self, file: &AccountsFile) -> Result<(), AccountError> {
+        // Persist secrets to the keyring before the metadata document, so a
+        // failure cannot leave an account whose tokens were never stored.
+        for account in &file.accounts {
+            if account.tokens.is_empty() {
+                continue;
+            }
+            let reference = account_credential_reference(&account.id);
+            let secret = SecretString::from(serde_json::to_string(&account.tokens)?);
+            // Skip accounts whose stored secret already matches. A keyring
+            // round-trip is not free, and this makes a usage-only update touch no
+            // credentials at all.
+            if let Ok(existing) = self.credentials.get(&reference)
+                && existing.expose_secret() == secret.expose_secret()
+            {
+                continue;
+            }
+            self.credentials.set(&reference, &secret)?;
+        }
+
         if let Some(parent) = self.store_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temp = self
-            .store_path
-            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        let bytes = serde_json::to_vec_pretty(file)?;
-        {
-            let mut f = File::create(&temp)?;
-            f.write_all(&bytes)?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
-        }
-        atomic_replace(&temp, &self.store_path)?;
-        set_private_permissions(&self.store_path)?;
+        let mut bytes = serde_json::to_vec_pretty(file)?;
+        bytes.push(b'\n');
+        // Private from the moment it exists: this file names the accounts, and a
+        // `File::create` temp file is umask-readable (0664 here) until the chmod.
+        codex_mp_core::write_private_atomic(&self.store_path, &bytes)?;
         Ok(())
     }
 
@@ -271,15 +505,15 @@ impl AccountManager {
 
         let file = self.load_file()?;
         let matched = file.accounts.iter().find(|acc| {
-            if let (Some(acc_email), Some(cur_email)) = (&acc.email, &email) {
-                if acc_email.eq_ignore_ascii_case(cur_email) {
-                    return true;
-                }
+            if let (Some(acc_email), Some(cur_email)) = (&acc.email, &email)
+                && acc_email.eq_ignore_ascii_case(cur_email)
+            {
+                return true;
             }
-            if let (Some(acc_aid), Some(cur_aid)) = (&acc.account_id, &effective_account_id) {
-                if acc_aid == cur_aid {
-                    return true;
-                }
+            if let (Some(acc_aid), Some(cur_aid)) = (&acc.account_id, &effective_account_id)
+                && acc_aid == cur_aid
+            {
+                return true;
             }
             false
         });
@@ -309,26 +543,22 @@ impl AccountManager {
 
         let mut summaries = Vec::new();
         for acc in file.accounts {
-            let is_active = if let Some(matched_id) = &active.matched_account_id {
-                acc.id == *matched_id
-            } else if let (Some(active_email), Some(acc_email)) = (&active.email, &acc.email) {
-                active_email.eq_ignore_ascii_case(acc_email)
-            } else {
-                false
-            };
-
-            summaries.push(AccountSummary {
-                id: acc.id,
-                name: acc.name,
-                email: acc.email,
-                plan_type: acc.plan_type,
-                is_active,
-                updated_at: acc.updated_at,
-                usage: acc.usage,
-            });
+            summaries.push(acc.to_summary(account_matches_active(&acc, &active)));
         }
 
         Ok(summaries)
+    }
+
+    /// Secret-free summary of a single account, including whether it is active.
+    ///
+    /// Use this instead of returning a `ManagedAccount` (and therefore its
+    /// `tokens`) from any API surface.
+    pub fn summarise_account(&self, account: &ManagedAccount) -> AccountSummary {
+        let is_active = self
+            .check_active_status()
+            .map(|active| account_matches_active(account, &active))
+            .unwrap_or(false);
+        account.to_summary(is_active)
     }
 
     /// Capture current active auth.json into managed accounts
@@ -377,17 +607,17 @@ impl AccountManager {
             .clone()
             .or_else(|| profile.chatgpt_account_id.clone());
 
-        let mut file = self.load_file()?;
+        let (mut file, _lock) = self.load_file_locked()?;
         let existing_index = file.accounts.iter().position(|acc| {
-            if let (Some(a_email), Some(e_email)) = (&acc.email, &email) {
-                if a_email.eq_ignore_ascii_case(e_email) {
-                    return true;
-                }
+            if let (Some(a_email), Some(e_email)) = (&acc.email, &email)
+                && a_email.eq_ignore_ascii_case(e_email)
+            {
+                return true;
             }
-            if let (Some(a_id), Some(e_id)) = (&acc.account_id, &account_id) {
-                if a_id == e_id {
-                    return true;
-                }
+            if let (Some(a_id), Some(e_id)) = (&acc.account_id, &account_id)
+                && a_id == e_id
+            {
+                return true;
             }
             false
         });
@@ -417,12 +647,8 @@ impl AccountManager {
             acc.clone()
         } else {
             let id = uuid::Uuid::new_v4().to_string();
-            let name = name_hint.unwrap_or_else(|| {
-                email
-                    .as_deref()
-                    .unwrap_or_else(|| "ChatGPT Account")
-                    .to_string()
-            });
+            let name = name_hint
+                .unwrap_or_else(|| email.as_deref().unwrap_or("ChatGPT Account").to_string());
 
             let new_acc = ManagedAccount {
                 id,
@@ -446,19 +672,30 @@ impl AccountManager {
     }
 
     pub fn delete_account(&self, id: &str) -> Result<bool, AccountError> {
-        let mut file = self.load_file()?;
+        let (mut file, _lock) = self.load_file_locked()?;
         let before_len = file.accounts.len();
         file.accounts.retain(|acc| acc.id != id);
-        if file.accounts.len() != before_len {
-            self.save_file(&file)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if file.accounts.len() == before_len {
+            return Ok(false);
         }
+        self.save_file(&file)?;
+        // The store no longer references this id, so its keyring entry must go
+        // too; otherwise a removed account keeps a live refresh token around.
+        // Silently printing a warning here meant the caller reported a clean
+        // deletion while a usable credential was still on the machine, so this
+        // now surfaces as an error the operator can act on.
+        self.credentials
+            .delete(&account_credential_reference(id))
+            .map_err(|error| {
+                AccountError::Credential(CredentialStoreError::Backend(format!(
+                    "removed account `{id}` from the store but could not delete its stored                      credentials; a live token may remain: {error}"
+                )))
+            })?;
+        Ok(true)
     }
 
     pub fn rename_account(&self, id: &str, new_name: &str) -> Result<(), AccountError> {
-        let mut file = self.load_file()?;
+        let (mut file, _lock) = self.load_file_locked()?;
         let acc = file
             .accounts
             .iter_mut()
@@ -482,6 +719,13 @@ impl AccountManager {
             .ok_or_else(|| AccountError::NotFound(id.to_string()))?;
 
         let account = file.accounts[acc_idx].clone();
+
+        // Last line of defence. Writing `"tokens": {}` into auth.json logs the
+        // user out and discards the only copy of their session, so a switch that
+        // cannot actually resolve credentials must fail instead of proceeding.
+        if account.tokens.is_empty() {
+            return Err(AccountError::MissingCredentials(id.to_owned()));
+        }
 
         // Read existing auth.json if any to preserve other untouched fields (like OPENAI_API_KEY if present)
         let mut auth_doc: serde_json::Map<String, serde_json::Value> =
@@ -509,42 +753,106 @@ impl AccountManager {
             );
         }
 
-        // Backup existing auth.json before writing
+        // Backup existing auth.json before writing. A backup contains a live
+        // refresh token, so old copies are pruned to a small bounded set and each
+        // one is written through an atomic, 0600 temp file.
         let auth_path = self.auth_json_path();
         if auth_path.exists() {
-            let backup_path = auth_path.with_extension(format!("bak-switch-{}", now_secs()));
-            let _ = fs::copy(&auth_path, backup_path);
+            self.write_auth_backup(&auth_path)?;
         } else if let Some(parent) = auth_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let temp_path = auth_path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        let bytes = serde_json::to_vec_pretty(&auth_doc)?;
-        {
-            let mut f = File::create(&temp_path)?;
-            f.write_all(&bytes)?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
-        }
-        atomic_replace(&temp_path, &auth_path)?;
-        set_private_permissions(&auth_path)?;
+        let mut bytes = serde_json::to_vec_pretty(&auth_doc)?;
+        bytes.push(b'\n');
+        // `auth.json` holds live OAuth tokens; it must never be group/world
+        // readable, not even for the instant between create and chmod.
+        codex_mp_core::write_private_atomic(&auth_path, &bytes)?;
 
         Ok(account)
+    }
+
+    /// Copy the current `auth.json` aside before a switch, keeping only the most
+    /// recent [`MAX_AUTH_BACKUPS`] copies.
+    ///
+    /// Every copy holds a live refresh token, so they must be bounded, written
+    /// privately, and named uniquely enough that two switches in the same second
+    /// cannot overwrite each other's evidence.
+    fn write_auth_backup(&self, auth_path: &Path) -> Result<(), AccountError> {
+        let bytes = fs::read(auth_path)?;
+
+        let backup_path = auth_path.with_extension(format!(
+            "bak-switch-{}-{}",
+            now_secs(),
+            uuid::Uuid::new_v4()
+        ));
+        // A backup is a verbatim copy of `auth.json`, i.e. a full set of live
+        // tokens, so it is created privately too.
+        codex_mp_core::write_private_atomic(&backup_path, &bytes)?;
+
+        self.prune_auth_backups(auth_path)?;
+        Ok(())
+    }
+
+    fn prune_auth_backups(&self, auth_path: &Path) -> Result<(), AccountError> {
+        let Some(parent) = auth_path.parent() else {
+            return Ok(());
+        };
+        let Some(stem) = auth_path.file_stem().and_then(|s| s.to_str()) else {
+            return Ok(());
+        };
+        let prefix = format!("{stem}.bak-switch-");
+
+        let mut backups: Vec<PathBuf> = fs::read_dir(parent)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect();
+
+        if backups.len() <= MAX_AUTH_BACKUPS {
+            return Ok(());
+        }
+        // Names end in a second-resolution timestamp, so a lexical sort is
+        // chronological for every backup this code writes.
+        backups.sort();
+        let excess = backups.len() - MAX_AUTH_BACKUPS;
+        for stale in backups.into_iter().take(excess) {
+            if let Err(error) = fs::remove_file(&stale) {
+                eprintln!(
+                    "codex-mp: could not prune stale auth backup {}: {error}",
+                    stale.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     // ---------------- Refresh Token & Usage Query ---------------- //
 
     /// Refresh token if access token is missing or expired, updating stored account
+    ///
+    /// Takes `&Arc<Self>` so the keyring-backed persistence steps can be moved to
+    /// a blocking thread. Calling `load_file`/`save_file` directly here panicked
+    /// under a tokio runtime on Linux, where the keyring backend (`zbus`) reaches
+    /// a synchronous API through `Runtime::block_on`.
     pub async fn refresh_account_token(
-        &self,
+        self: &Arc<Self>,
         account_id: &str,
     ) -> Result<ManagedAccount, AccountError> {
-        let mut file = self.load_file()?;
+        let account_id_owned = account_id.to_owned();
+        let this = self.clone();
+        let mut file = tokio::task::spawn_blocking(move || this.load_file())
+            .await
+            .map_err(|error| AccountError::RefreshFailed(error.to_string()))??;
         let acc_idx = file
             .accounts
             .iter()
-            .position(|a| a.id == account_id)
-            .ok_or_else(|| AccountError::NotFound(account_id.to_string()))?;
+            .position(|a| a.id == account_id_owned)
+            .ok_or_else(|| AccountError::NotFound(account_id_owned.clone()))?;
 
         let refresh_token = file.accounts[acc_idx]
             .tokens
@@ -571,13 +879,15 @@ impl AccountManager {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let err_text = resp.text().await.unwrap_or_default();
+            // Bound the error snippet too: `text()` buffers the whole body, and
+            // only a short message is ever shown.
+            let err_text = read_bounded_error_text(resp).await;
             return Err(AccountError::RefreshFailed(format!(
                 "HTTP {status}: {err_text}"
             )));
         }
 
-        let token_resp: serde_json::Value = resp.json().await?;
+        let token_resp = read_bounded_account_json(resp, "the token endpoint").await?;
         let new_access_token = token_resp
             .get("access_token")
             .and_then(|v| v.as_str())
@@ -613,7 +923,11 @@ impl AccountManager {
         acc.updated_at = now_secs();
 
         let updated_acc = acc.clone();
-        self.save_file(&file)?;
+        let this = self.clone();
+        let file_to_save = file.clone();
+        tokio::task::spawn_blocking(move || this.save_file(&file_to_save))
+            .await
+            .map_err(|error| AccountError::RefreshFailed(error.to_string()))??;
 
         // If this refreshed account happens to be the active one in auth.json, sync it
         let active = self.check_active_status().unwrap_or(ActiveAccountStatus {
@@ -625,7 +939,17 @@ impl AccountManager {
             auth_mode: None,
         });
         if active.matched_account_id.as_deref() == Some(account_id) {
-            let _ = self.switch_to_account(account_id);
+            // The refresh just persisted new tokens for the account Codex is
+            // logged in as, so `auth.json` must be re-synced or Codex keeps
+            // presenting the old (expired) access token and stays broken.
+            // Swallowing this error hid that: the refresh looked successful while
+            // the live session was left stale.
+            self.switch_to_account(account_id).map_err(|error| {
+                AccountError::RefreshFailed(format!(
+                    "refreshed the stored tokens for `{account_id}` but could not update \
+                     auth.json, so Codex will keep using the expired access token: {error}"
+                ))
+            })?;
         }
 
         Ok(updated_acc)
@@ -634,31 +958,59 @@ impl AccountManager {
     /// Fetch usage / rate limits for a given account. If 401 Unauthorized is returned,
     /// attempt token refresh and retry once.
     pub async fn fetch_usage(
-        &self,
+        self: &Arc<Self>,
         account_id: &str,
     ) -> Result<AccountUsageSnapshot, AccountError> {
         let account = {
-            let file = self.load_file()?;
-            file.accounts
-                .into_iter()
-                .find(|a| a.id == account_id)
-                .ok_or_else(|| AccountError::NotFound(account_id.to_string()))?
+            let this = self.clone();
+            let account_id_owned = account_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let file = this.load_file()?;
+                file.accounts
+                    .into_iter()
+                    .find(|a| a.id == account_id_owned)
+                    .ok_or_else(|| AccountError::NotFound(account_id_owned))
+            })
+            .await
+            .map_err(|error| AccountError::UsageCheckFailed {
+                status: 500,
+                message: error.to_string(),
+            })??
         };
 
         match self.do_fetch_usage(&account).await {
             Ok(snapshot) => {
-                self.save_usage_snapshot(account_id, snapshot.clone())?;
+                self.save_usage_snapshot_offloaded(account_id, snapshot.clone())
+                    .await?;
                 Ok(snapshot)
             }
             Err(AccountError::UsageCheckFailed { status: 401, .. }) => {
                 // Token might be expired, try refreshing
                 let refreshed = self.refresh_account_token(account_id).await?;
                 let snapshot = self.do_fetch_usage(&refreshed).await?;
-                self.save_usage_snapshot(account_id, snapshot.clone())?;
+                self.save_usage_snapshot_offloaded(account_id, snapshot.clone())
+                    .await?;
                 Ok(snapshot)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// `save_usage_snapshot` is keyring-backed, so it must not run on an async
+    /// worker thread (see `refresh_account_token`).
+    async fn save_usage_snapshot_offloaded(
+        self: &Arc<Self>,
+        account_id: &str,
+        snapshot: AccountUsageSnapshot,
+    ) -> Result<(), AccountError> {
+        let this = self.clone();
+        let account_id_owned = account_id.to_owned();
+        tokio::task::spawn_blocking(move || this.save_usage_snapshot(&account_id_owned, snapshot))
+            .await
+            .map_err(|error| AccountError::UsageCheckFailed {
+                status: 500,
+                message: error.to_string(),
+            })?
     }
 
     async fn do_fetch_usage(
@@ -685,14 +1037,14 @@ impl AccountManager {
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let msg = resp.text().await.unwrap_or_default();
+            let msg = read_bounded_error_text(resp).await;
             return Err(AccountError::UsageCheckFailed {
                 status,
                 message: msg,
             });
         }
 
-        let body: serde_json::Value = resp.json().await?;
+        let body = read_bounded_account_json(resp, "the usage endpoint").await?;
         let snapshot = parse_wham_usage_response(&body);
         Ok(snapshot)
     }
@@ -702,7 +1054,7 @@ impl AccountManager {
         account_id: &str,
         snapshot: AccountUsageSnapshot,
     ) -> Result<(), AccountError> {
-        let mut file = self.load_file()?;
+        let (mut file, _lock) = self.load_file_locked()?;
         if let Some(acc) = file.accounts.iter_mut().find(|a| a.id == account_id) {
             acc.usage = Some(snapshot);
             acc.updated_at = now_secs();
@@ -717,11 +1069,16 @@ impl AccountManager {
     pub fn restart_codex_processes(&self) -> Result<RestartCodexReport, AccountError> {
         let mut killed_pids = Vec::new();
 
-        // 1. Terminate running codex app-server processes
+        // 1. Terminate running codex app-server processes. Only report PIDs
+        //    that are actually gone, so the UI cannot claim a clean restart
+        //    while a process is still holding the old credentials.
         let running_pids = find_codex_running_pids();
         for pid in &running_pids {
-            terminate_pid(*pid);
-            killed_pids.push(*pid);
+            if terminate_pid(*pid) {
+                killed_pids.push(*pid);
+            } else {
+                eprintln!("codex-mp: could not terminate Codex app-server pid {pid}");
+            }
         }
 
         // 2. Remove stale app-server socket if present
@@ -766,10 +1123,37 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Current UTC time as an RFC 3339 timestamp, e.g. `2026-09-17T12:34:56Z`.
+///
+/// `auth.json` stores `last_refresh` as a timestamp string that Codex parses;
+/// writing bare Unix seconds there corrupted its refresh bookkeeping.
 fn chrono_iso_now() -> String {
-    // Simple UTC ISO8601 representation without external date crate
     let secs = now_secs();
-    format!("{secs}")
+    let days = secs / 86_400;
+    let seconds_of_day = secs % 86_400;
+    let (hour, minute, second) = (
+        seconds_of_day / 3_600,
+        (seconds_of_day % 3_600) / 60,
+        seconds_of_day % 60,
+    );
+    let (year, month, day) = civil_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Convert a count of days since the Unix epoch into a civil (year, month, day).
+/// Howard Hinnant's `civil_from_days` algorithm; valid for the whole range we care
+/// about and avoids pulling in a date crate.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 pub fn parse_id_token_claims(id_token: &str) -> Result<ProfileInfo, AccountError> {
@@ -928,7 +1312,23 @@ pub fn parse_wham_usage_response(val: &serde_json::Value) -> AccountUsageSnapsho
     }
 }
 
-/// Find running Codex PIDs
+/// Image names that identify a real Codex runtime. Matching on a `codex`
+/// substring instead would also select `codex-mp.exe` and `codex-mp-panel.exe`,
+/// i.e. the very process asking for the restart.
+#[cfg(target_os = "windows")]
+const CODEX_IMAGE_NAMES: [&str; 3] = ["codex.exe", "chatgpt.exe", "codex-code-mode-host.exe"];
+
+/// True when a Windows image name refers to a Codex runtime.
+#[cfg(target_os = "windows")]
+fn is_codex_image(image: &str) -> bool {
+    let image = image.trim().to_ascii_lowercase();
+    CODEX_IMAGE_NAMES.contains(&image.as_str())
+}
+
+/// Find running Codex PIDs.
+///
+/// Every platform narrows on the `app-server` argument: a bare Codex CLI session
+/// or a `codex-mp` process must never be killed by the account switcher.
 pub fn find_codex_running_pids() -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -946,12 +1346,15 @@ pub fn find_codex_running_pids() -> Vec<u32> {
                 continue;
             };
             let cmdline_path = format!("/proc/{pid}/cmdline");
-            if let Ok(cmdline) = fs::read(cmdline_path) {
-                let cmd_str = String::from_utf8_lossy(&cmdline);
-                // Look for codex app-server processes
-                if (cmd_str.contains("codex") || cmd_str.contains("codex-real"))
-                    && cmd_str.contains("app-server")
-                {
+            if let Ok(cmdline) = fs::read(&cmdline_path) {
+                // `/proc/<pid>/cmdline` is NUL-separated; split it so matching is
+                // done per argument rather than on a joined string.
+                let args: Vec<String> = cmdline
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect();
+                if is_codex_app_server_process(&args, pid) {
                     pids.push(pid);
                 }
             }
@@ -964,6 +1367,7 @@ pub fn find_codex_running_pids() -> Vec<u32> {
     #[cfg(target_os = "windows")]
     {
         let mut pids = Vec::new();
+        let own_pid = std::process::id();
         let output = std::process::Command::new("tasklist.exe")
             .args(["/FO", "CSV", "/NH"])
             .output();
@@ -974,33 +1378,69 @@ pub fn find_codex_running_pids() -> Vec<u32> {
                     .split(',')
                     .map(|s| s.trim().trim_matches('"'))
                     .collect();
-                if fields.len() >= 2 {
-                    let img = fields[0].to_lowercase();
-                    if img.contains("codex") {
-                        if let Ok(pid) = fields[1].parse::<u32>() {
-                            pids.push(pid);
-                        }
-                    }
+                if fields.len() < 2 {
+                    continue;
+                }
+                // Exact image-name match, plus an app-server command-line check
+                // via wmic-equivalent listing below, keeps this in line with the
+                // Linux/macOS semantics.
+                if !is_codex_image(fields[0]) {
+                    continue;
+                }
+                let Ok(pid) = fields[1].parse::<u32>() else {
+                    continue;
+                };
+                // Never select this process or the parent that asked for the
+                // restart. The image-name check already excludes `codex-mp`, but
+                // the parent is a separate guard for a caller whose image happens
+                // to match.
+                if pid == own_pid || Some(pid) == parent_process_id() {
+                    continue;
+                }
+                if process_command_line_contains(pid, "app-server") {
+                    pids.push(pid);
                 }
             }
         }
+        pids.sort_unstable();
+        pids.dedup();
         pids
     }
 
     #[cfg(target_os = "macos")]
     {
+        // `pgrep -f "codex.*app-server"` matched by regular expression over the
+        // whole command line, so it also selected `codex-mp ... app-server ...`
+        // (our own binary, and the parent that requested the restart) as well as
+        // arguments that merely contained the word. Enumerate with `ps` instead
+        // and apply the same argv-level predicate used on Linux.
         let mut pids = Vec::new();
-        let output = std::process::Command::new("pgrep")
-            .args(["-f", "codex.*app-server"])
+        // `-ww` disables truncation; `-o pid=,command=` prints one line per
+        // process with no header.
+        let output = std::process::Command::new("ps")
+            .args(["-ww", "-A", "-o", "pid=,command="])
             .output();
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
+                let line = line.trim_start();
+                let Some((pid_text, command)) = line.split_once(char::is_whitespace) else {
+                    continue;
+                };
+                let Ok(pid) = pid_text.parse::<u32>() else {
+                    continue;
+                };
+                // `ps` prints the command line space-joined; the arguments the
+                // predicate cares about (`app-server`) contain no spaces, so a
+                // whitespace split is sufficient and argv[0] stays first.
+                let args: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+                if is_codex_app_server_process(&args, pid) {
                     pids.push(pid);
                 }
             }
         }
+        pids.sort_unstable();
+        pids.dedup();
         pids
     }
 
@@ -1010,18 +1450,119 @@ pub fn find_codex_running_pids() -> Vec<u32> {
     }
 }
 
-pub fn terminate_pid(pid: u32) {
+/// Whether `/proc/<pid>/cmdline` arguments describe a real Codex app-server.
+///
+/// The previous check matched any command line *containing* `codex` and
+/// `app-server` and not equal to the current PID. That wrongly selected:
+///
+/// - the **parent** process (the panel or `codex-mp` invocation that spawned the
+///   app-server), so "switch account" killed its own caller;
+/// - unrelated `codex-mp` commands that merely mention `app-server`, e.g.
+///   `codex-mp desktop install --app-server-binary ...`.
+///
+/// A match now requires argv[0] to be a Codex runtime binary (not `codex-mp`),
+/// with `app-server` present as its own argument, and never selects this process
+/// or its parent.
+fn is_codex_app_server_process(args: &[String], pid: u32) -> bool {
+    let Some(program) = args.first() else {
+        return false;
+    };
+    let program_name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    // `codex-mp` is us, never the thing we restart. `codex-real` is the stock
+    // binary the launcher renames to.
+    let is_codex_runtime =
+        program_name.starts_with("codex") && !program_name.starts_with("codex-mp");
+    if !is_codex_runtime {
+        return false;
+    }
+    if pid == std::process::id() || Some(pid) == parent_process_id() {
+        return false;
+    }
+    // `app-server` must be a standalone argument, not a substring of a path we
+    // were merely told about.
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "app-server" || arg.ends_with("/app-server"))
+}
+
+/// This process's parent PID, when it can be determined.
+///
+/// Killing the parent would take down the caller that asked for the restart (the
+/// panel, or the `codex-mp` invocation), so it is never a candidate.
+#[cfg(unix)]
+fn parent_process_id() -> Option<u32> {
+    Some(unsafe { libc::getppid() } as u32)
+}
+
+#[cfg(not(unix))]
+fn parent_process_id() -> Option<u32> {
+    None
+}
+
+/// Best-effort Windows command-line lookup used to narrow the process match.
+/// Returns `true` when the command line cannot be read, so an unreadable process
+/// is still considered (matching the looser Linux behaviour).
+#[cfg(target_os = "windows")]
+fn process_command_line_contains(pid: u32, needle: &str) -> bool {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout);
+            line.trim().is_empty() || line.contains(needle)
+        }
+        _ => true,
+    }
+}
+
+/// Terminate a process, returning whether it is believed to be gone.
+///
+/// SIGTERM alone is only a request: a process that ignores it was previously
+/// reported as terminated while still running. Escalate to SIGKILL after a grace
+/// period and report the real outcome.
+pub fn terminate_pid(pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
+            if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+                // ESRCH means it is already gone, which counts as success.
+                return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            }
         }
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+            if !alive {
+                return true;
+            }
+        }
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        unsafe { libc::kill(pid as i32, 0) != 0 }
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/F"])
+        let output = std::process::Command::new("taskkill.exe")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
+        match output {
+            // 128 = "process not found", which means the goal is already met.
+            Ok(out) => out.status.success() || out.status.code() == Some(128),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -1029,6 +1570,450 @@ pub fn terminate_pid(pid: u32) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A credential store whose reads always fail, simulating a locked or
+    /// unavailable keyring (exactly what happens on a headless Linux box).
+    struct FailingReadStore;
+
+    impl CredentialStore for FailingReadStore {
+        fn get(&self, reference: &str) -> Result<SecretString, CredentialStoreError> {
+            Err(CredentialStoreError::Backend(format!(
+                "keyring unavailable for {reference}"
+            )))
+        }
+        fn set(&self, _reference: &str, _value: &SecretString) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+        fn delete(&self, _reference: &str) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+    }
+
+    /// A credential store that counts how many times each operation is called.
+    #[derive(Default)]
+    struct CountingStore {
+        writes: std::sync::Mutex<Vec<String>>,
+        inner: codex_mp_credentials::MemoryCredentialStore,
+    }
+
+    impl CredentialStore for CountingStore {
+        fn get(&self, reference: &str) -> Result<SecretString, CredentialStoreError> {
+            self.inner.get(reference)
+        }
+        fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
+            self.writes.lock().unwrap().push(reference.to_owned());
+            self.inner.set(reference, value)
+        }
+        fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
+            self.inner.delete(reference)
+        }
+    }
+
+    /// Regression: `save_file` rewrote *every* account's tokens on every save, so
+    /// a usage refresh for one account wrote all of them. With N accounts that is
+    /// N keyring round-trips per refresh (N^2 per cycle), and a keyring problem on
+    /// any single account failed an unrelated account's refresh.
+    ///
+    /// Saving an unchanged document must write nothing at all.
+    /// Regression: a corrupted accounts store surfaced a bare parser message
+    /// (`JSON error: expected value at line 1 column 15`) with no indication of
+    /// *which* file was broken and no way to recover — account listing and import
+    /// both failed, and the panel showed the message verbatim.
+    ///
+    /// The error must name the file and state the remedy.
+    #[test]
+    fn a_corrupt_accounts_store_names_the_file_and_the_remedy() {
+        let directory = tempdir().unwrap();
+        let store_path = directory.path().join("accounts.json");
+        std::fs::write(&store_path, b"{\"accounts\": [broken").unwrap();
+
+        let store =
+            AccountManager::with_paths(store_path.clone(), directory.path().join("codex-home"));
+        let error = store
+            .load_file()
+            .expect_err("a corrupt store must be reported")
+            .to_string();
+
+        assert!(
+            error.contains(&store_path.display().to_string()),
+            "the error must name the offending file, got: {error}"
+        );
+        assert!(
+            error.contains("mv ") && error.contains(".bak"),
+            "the error must state a concrete recovery step, got: {error}"
+        );
+        // The original parser detail is still useful, so it must survive.
+        assert!(
+            error.contains("expected value"),
+            "the underlying parse detail must be kept, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_provider_data_tolerates_an_unreadable_registry() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let store = Arc::new(CountingStore::default());
+        let manager =
+            AccountManager::with_credential_store(&store_path, &codex_home, store.clone());
+
+        let tokens = AccountTokens {
+            id_token: None,
+            access_token: Some("at-1".into()),
+            refresh_token: Some("rt-1".into()),
+            account_id: Some("acc-1".into()),
+        };
+        manager
+            .import_or_update_account(tokens, None, Some("One".into()))
+            .unwrap();
+
+        let written_after_import = store.writes.lock().unwrap().len();
+        assert!(
+            written_after_import > 0,
+            "importing an account must store its credentials"
+        );
+
+        // Re-saving the identical document must not touch the keyring again.
+        let file = manager.load_file().unwrap();
+        manager.save_file(&file).unwrap();
+        assert_eq!(
+            store.writes.lock().unwrap().len(),
+            written_after_import,
+            "saving an unchanged document must not rewrite any credential"
+        );
+    }
+
+    /// Regression: the token and usage endpoints were read with
+    /// `Response::json()`, which buffers the whole body with no limit. They are
+    /// hard-coded official HTTPS endpoints, so this is defence in depth, but an
+    /// intermediary returning something enormous would otherwise be absorbed
+    /// wholesale.
+    ///
+    /// The server advertises a huge `content-length` and then sends **no body**,
+    /// so the check is deterministic: the reader must reject on the advertised
+    /// length alone, without trying to buffer anything.
+    #[tokio::test]
+    async fn the_account_response_bound_rejects_an_oversized_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Headers claim a body far past the cap; no body follows.
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    MAX_ACCOUNT_RESPONSE_BYTES + 1
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Hold the connection briefly so the client can read the headers.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("the header response must arrive");
+        let result = read_bounded_account_json(response, "a test endpoint").await;
+        assert!(
+            result.is_err(),
+            "an advertised length past the cap must be rejected before buffering"
+        );
+        server.abort();
+    }
+
+    /// Regression: when the keyring read failed, `load_file` left the account's
+    /// tokens empty, and `switch_to_account` then wrote that empty token set into
+    /// `auth.json` — logging the user out and destroying the only copy of their
+    /// session. A switch that cannot resolve the tokens must fail instead.
+    #[test]
+    fn switch_refuses_to_write_empty_tokens_when_the_keyring_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+
+        // Seed an account whose tokens live only in the (working) keyring.
+        let good = Arc::new(codex_mp_credentials::MemoryCredentialStore::default());
+        let seeder = AccountManager::with_credential_store(&store_path, &codex_home, good);
+        let tokens = AccountTokens {
+            id_token: Some(
+                "dummy.eyJlbWFpbCI6ImtleXJpbmctdGVzdEBleGFtcGxlLmNvbSIsInN1YiI6IjcifQ.dummy".into(),
+            ),
+            access_token: Some("at-live".into()),
+            refresh_token: Some("rt-live".into()),
+            account_id: Some("acc-live".into()),
+        };
+        let account = seeder
+            .import_or_update_account(tokens, None, Some("Live".into()))
+            .unwrap();
+
+        // Now the keyring becomes unavailable.
+        let broken = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(FailingReadStore),
+        );
+        // The tokens are unreachable, so switching must fail.
+        let result = broken.switch_to_account(&account.id);
+        assert!(
+            result.is_err(),
+            "switch succeeded even though the account's credentials were unreadable"
+        );
+        assert!(
+            !broken.auth_json_path().exists(),
+            "a failed switch must not leave a rewritten auth.json behind"
+        );
+    }
+
+    /// A store that refuses deletes, used to prove cleanup failures surface.
+    struct FailingDeleteStore;
+
+    impl CredentialStore for FailingDeleteStore {
+        fn get(&self, _reference: &str) -> Result<SecretString, CredentialStoreError> {
+            Ok(SecretString::from("{}"))
+        }
+        fn set(&self, _reference: &str, _value: &SecretString) -> Result<(), CredentialStoreError> {
+            Ok(())
+        }
+        fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
+            Err(CredentialStoreError::Backend(format!(
+                "cannot delete {reference}"
+            )))
+        }
+    }
+
+    /// Regression: a failure to delete the keyring entry was only printed, so
+    /// `delete_account` reported success while a live refresh token stayed on the
+    /// machine. That is a credential-retention problem, not a cosmetic warning.
+    #[test]
+    fn deleting_an_account_reports_a_failed_credential_cleanup() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+
+        let writer = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
+        let account = writer
+            .import_or_update_account(
+                AccountTokens {
+                    id_token: None,
+                    access_token: Some("at".into()),
+                    refresh_token: Some("rt".into()),
+                    account_id: Some("acc".into()),
+                },
+                None,
+                Some("ToDelete".into()),
+            )
+            .unwrap();
+
+        let failing = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(FailingDeleteStore),
+        );
+        let result = failing.delete_account(&account.id);
+        assert!(
+            result.is_err(),
+            "a credential that could not be deleted must be reported, not swallowed"
+        );
+    }
+
+    /// Regression: the accounts store did the same unprotected
+    /// `load -> mutate -> atomic_replace` cycle the registry used to do, so two
+    /// concurrent imports could each read revision N and both replace it,
+    /// silently dropping one account. Atomic rename prevents a torn file, not a
+    /// lost update.
+    /// Regression: the token-refresh and usage error paths read the whole body
+    /// with `text()`, on endpoints that are official but still external. An error
+    /// diagnostic only ever shows a short snippet, so an oversized body must be
+    /// truncated rather than buffered.
+    #[tokio::test]
+    async fn an_oversized_error_body_is_truncated() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let body = "e".repeat(64 * 1024);
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("the error response must arrive");
+        let message = read_bounded_error_text(response).await;
+        assert!(
+            message.len() < 16 * 1024,
+            "an oversized error body must be truncated, got {} bytes",
+            message.len()
+        );
+        assert!(
+            message.ends_with("(truncated)"),
+            "the truncation must be visible in the message"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn concurrent_account_imports_do_not_lose_an_account() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex");
+        fs::create_dir_all(&codex_home).unwrap();
+
+        // Seed the file so every writer has something to read.
+        let seeder = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
+        seeder
+            .import_or_update_account(
+                AccountTokens {
+                    id_token: None,
+                    access_token: Some("seed".into()),
+                    refresh_token: Some("seed".into()),
+                    account_id: Some("seed".into()),
+                },
+                None,
+                Some("Seed".into()),
+            )
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let store_path = store_path.clone();
+            let codex_home = codex_home.clone();
+            handles.push(std::thread::spawn(move || {
+                let manager = AccountManager::with_credential_store(
+                    &store_path,
+                    &codex_home,
+                    Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+                );
+                manager
+                    .import_or_update_account(
+                        AccountTokens {
+                            id_token: None,
+                            access_token: Some(format!("at-{index}")),
+                            refresh_token: Some(format!("rt-{index}")),
+                            account_id: Some(format!("acc-{index}")),
+                        },
+                        None,
+                        Some(format!("Account {index}")),
+                    )
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let file: AccountsFile =
+            serde_json::from_str(&fs::read_to_string(&store_path).unwrap()).unwrap();
+        assert_eq!(
+            file.accounts.len(),
+            9,
+            "an account was lost to a concurrent write (expected seed + 8)"
+        );
+    }
+
+    /// Regression: the matcher used to select any process whose command line
+    /// contained `codex` and `app-server`, which included the **parent** process
+    /// (the panel or `codex-mp` invocation doing the restart) and unrelated
+    /// `codex-mp` commands that merely mentioned `app-server`. "Switch account"
+    /// could therefore kill its own caller.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_real_codex_app_servers_are_selected_for_restart() {
+        let own = std::process::id();
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Must match: a real Codex runtime running the app-server.
+        assert!(is_codex_app_server_process(
+            &args(&[
+                "/home/u/.codex/packages/standalone/releases/v/bin/codex-real",
+                "app-server"
+            ]),
+            4242,
+        ));
+        assert!(is_codex_app_server_process(
+            &args(&["/usr/bin/codex", "app-server"]),
+            4243,
+        ));
+
+        // Must NOT match: our own binary, in any form.
+        assert!(!is_codex_app_server_process(
+            &args(&[
+                "/home/u/.local/bin/codex-mp",
+                "launch",
+                "--app-server-binary",
+                "/x"
+            ]),
+            4244,
+        ));
+        assert!(!is_codex_app_server_process(
+            &args(&[
+                "codex-mp",
+                "desktop",
+                "install",
+                "--app-server-binary",
+                "/x"
+            ]),
+            4245,
+        ));
+
+        // Must NOT match: this process.
+        assert!(!is_codex_app_server_process(
+            &args(&["codex", "app-server"]),
+            own
+        ));
+
+        // Must NOT match: `app-server` only appears inside a path argument.
+        assert!(!is_codex_app_server_process(
+            &args(&["/usr/bin/codex", "--config", "/srv/app-server/config.toml"]),
+            4246,
+        ));
+
+        // Must NOT match: a bare codex command with no app-server role.
+        assert!(!is_codex_app_server_process(
+            &args(&["/usr/bin/codex", "exec"]),
+            4247
+        ));
+    }
 
     #[test]
     fn test_parse_wham_usage() {
@@ -1074,7 +2059,7 @@ mod tests {
         assert!(parsed.secondary_weekly.is_some());
         assert_eq!(parsed.secondary_weekly.as_ref().unwrap().used_percent, 50);
         assert!(parsed.reserve.is_some());
-        assert_eq!(parsed.reserve.as_ref().unwrap().limit_reached, true);
+        assert!(parsed.reserve.as_ref().unwrap().limit_reached);
         assert_eq!(parsed.reserve.as_ref().unwrap().used_percent, Some(100));
     }
 

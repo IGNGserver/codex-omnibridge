@@ -14,14 +14,21 @@ pub struct TrayConfig {
     pub title: String,
 }
 
-#[allow(dead_code)]
+/// Owns the tray's stop flag. Dropping it asks the tray thread to exit.
+///
+/// The tray thread is detached (it runs a native event loop), so this handle is
+/// the only way to stop it. It is `Drop`-based rather than requiring an explicit
+/// `stop()` call, because the previous API had a `stop()` method that nothing
+/// ever called — flagged `#[allow(dead_code)]`, which kept the compiler from
+/// pointing out that the tray could never be shut down.
+#[must_use = "dropping the handle immediately stops the tray"]
 pub struct TrayHandle {
     stop_signal: Arc<AtomicBool>,
 }
 
-#[allow(dead_code)]
-impl TrayHandle {
-    pub fn stop(&self) {
+impl Drop for TrayHandle {
+    fn drop(&mut self) {
+        // Idempotent: asking an already-stopped tray to stop is harmless.
         self.stop_signal.store(true, Ordering::SeqCst);
     }
 }
@@ -35,7 +42,7 @@ pub fn spawn_tray(config: TrayConfig) -> Option<TrayHandle> {
         thread::spawn(move || {
             linux_tray::run_linux_tray(config, stop_clone);
         });
-        return Some(TrayHandle { stop_signal });
+        Some(TrayHandle { stop_signal })
     }
 
     #[cfg(windows)]

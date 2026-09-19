@@ -1,4 +1,8 @@
-#![allow(clippy::all)]
+// Lint scope for this module: the algorithm is ported from CC Switch and keeps
+// its original structure, which trips style/complexity/perf lints that would be
+// noise here. Correctness and suspicious lints stay ENABLED on purpose - those
+// are the ones that catch real protocol bugs. Do not widen this to
+// `clippy::all`, which would silently disable them again.
 
 #[inline]
 pub fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
@@ -11,10 +15,10 @@ pub fn take_sse_block(buffer: &mut String) -> Option<String> {
     let mut best: Option<(usize, usize)> = None;
 
     for (delimiter, len) in [("\r\n\r\n", 4usize), ("\n\n", 2usize)] {
-        if let Some(pos) = buffer.find(delimiter) {
-            if best.is_none_or(|(best_pos, _)| pos < best_pos) {
-                best = Some((pos, len));
-            }
+        if let Some(pos) = buffer.find(delimiter)
+            && best.is_none_or(|(best_pos, _)| pos < best_pos)
+        {
+            best = Some((pos, len));
         }
     }
 

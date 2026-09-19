@@ -6,16 +6,16 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
-bytes = "1.0"
-codex-mp-catalog = { path = "../catalog" }
 codex-mp-core = { path = "../core" }
-codex-mp-credentials = { path = "../credentials" }
 codex-mp-desktop = { path = "../desktop" }
 codex-mp-integration = { path = "../integration" }
 codex-mp-manager = { path = "../manager" }
 codex-mp-router = { path = "../router" }
 http.workspace = true
+mime_guess = "2.0"
+password-hash.workspace = true
 rust-embed.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -23,11 +23,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
-tower.workspace = true
 tower-http.workspace = true
-tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
-mime_guess = "2.0"
 
 [dev-dependencies]
+codex-mp-credentials = { path = "../credentials" }
 tempfile = "3.23"
+tower = { workspace = true, features = ["util"] }
