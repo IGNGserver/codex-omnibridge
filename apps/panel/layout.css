@@ -12,7 +12,8 @@
 .m3-layout-root {
   display: flex;
   flex-direction: column;
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 /* ==========================================================================
@@ -116,17 +117,16 @@
   block-size: 40px;
   flex: none;
   border-radius: var(--md-sys-shape-corner-medium);
-  /* Solid container rather than the old primary→tertiary gradient, which
-     could not respond to contrast settings. */
-  background-color: var(--md-sys-color-primary-container);
-  color: var(--md-sys-color-on-primary-container);
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.m3-brand-icon .material-symbols-outlined::before {
-  font-variation-settings: "FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24;
+.m3-brand-icon img {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: contain;
 }
 
 .m3-brand-title {
@@ -222,6 +222,8 @@
   padding: var(--md-sys-space-12);
   background-color: var(--md-sys-color-surface-container-low);
   flex: none;
+  overflow-y: auto;
+  min-block-size: 0;
 }
 
 .m3-nav-item {
@@ -434,6 +436,9 @@
 .m3-main-content {
   flex: 1;
   min-inline-size: 0;
+  min-block-size: 0;
+  overflow-y: auto;
+  scroll-behavior: smooth;
   background-color: var(--md-sys-color-surface);
   padding: var(--md-sys-space-24) var(--md-sys-space-32) var(--md-sys-space-64);
   /* Constrained and centred: previously max-width without auto margins left

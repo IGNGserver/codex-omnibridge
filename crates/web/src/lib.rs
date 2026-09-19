@@ -16,7 +16,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_mp_core::{
-    ModelCapabilities, ModelEdit, ProviderProtocol, ProviderRegistry, resolve_executable,
+    ModelCapabilities, ModelEdit, ProviderProtocol, ProviderRegistry, clean_verbatim_path,
+    resolve_executable,
 };
 use codex_mp_desktop::{DesktopInstallOptions, DesktopPaths, status_for};
 use codex_mp_integration::{IntegrationPaths, build_and_install};
@@ -390,6 +391,7 @@ pub fn create_web_router(state: WebState) -> Router {
     let api_router = Router::new()
         // 状态相关
         .route("/router/status", get(api_router_status))
+        .route("/router/restart", post(api_router_restart))
         .route("/desktop/status", get(api_desktop_status))
         .route("/desktop/install", post(api_desktop_install))
         .route("/desktop/restore", post(api_desktop_restore))
@@ -702,7 +704,11 @@ struct SecurityStatusResponse {
     port: u16,
 }
 
-async fn api_security_status(State(state): State<WebState>) -> Response {
+async fn api_security_status(
+    State(state): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let registry = match ProviderRegistry::load(state.registry_path()) {
         Ok(r) => r,
         Err(e) => {
@@ -714,6 +720,49 @@ async fn api_security_status(State(state): State<WebState>) -> Response {
         }
     };
     let sec = registry.web_security();
+
+    // Check if the caller is authenticated (either loopback local_token or valid session token)
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let custom_token_header = headers.get("x-local-token").and_then(|v| v.to_str().ok());
+    let token = if let Some(auth) = auth_header {
+        auth.strip_prefix("Bearer ")
+            .map(|token| token.trim().to_string())
+    } else {
+        custom_token_header.map(|custom| custom.trim().to_string())
+    };
+
+    let is_authenticated = if let Some(ref tok) = token {
+        if is_loopback_addr(peer)
+            && !state.local_token.is_empty()
+            && constant_time_equal(tok.as_bytes(), state.local_token.as_bytes())
+        {
+            true
+        } else {
+            let now = Instant::now();
+            let current_hash = sec.password_hash.clone();
+            let mut sessions = state.sessions.write().await;
+            sessions.retain(|_, session| session.is_valid(now, current_hash.as_deref()));
+            sessions.contains_key(tok)
+        }
+    } else {
+        false
+    };
+
+    if !is_authenticated {
+        // Unauthenticated callers only receive minimal reconnaissance-safe info:
+        // whether web access is enabled and whether a password is required.
+        return Json(serde_json::json!({
+            "web_enabled": sec.web_enabled,
+            "password_set": sec.password_hash.is_some(),
+            "allow_remote": null,
+            "bind_addr": null,
+            "port": null,
+        }))
+        .into_response();
+    }
+
     let addr = *state.listen_addr.read().await;
     Json(SecurityStatusResponse {
         web_enabled: sec.web_enabled,
@@ -972,11 +1021,41 @@ async fn api_security_update(
 }
 
 async fn api_router_status(State(state): State<WebState>) -> Response {
-    match state.supervisor.lock().await.status().await {
-        Ok(status) => Json(status).into_response(),
+    if let Ok(mut guard) = state.supervisor.try_lock() {
+        match guard.status().await {
+            Ok(status) => Json(status).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        // Supervisor lock is held (e.g. start/restart is in progress).
+        // Return starting=true immediately rather than blocking the web client for up to 40 seconds.
+        Json(serde_json::json!({
+            "running": true,
+            "healthy": false,
+            "starting": true,
+            "last_error": serde_json::Value::Null,
+        }))
+        .into_response()
+    }
+}
+
+async fn api_router_restart(State(state): State<WebState>) -> Response {
+    let mut supervisor = state.supervisor.lock().await;
+    match supervisor.restart().await {
+        Ok(endpoint) => Json(serde_json::json!({
+            "status": "ok",
+            "base_url": endpoint.base_url,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({
+                "error": e.to_string(),
+            })),
         )
             .into_response(),
     }
@@ -1183,7 +1262,7 @@ async fn api_catalog_sync(State(state): State<WebState>) -> Response {
         )
             .into_response();
     }
-    Json(serde_json::json!({"catalog_path": paths.catalog.display().to_string()})).into_response()
+    Json(serde_json::json!({"catalog_path": clean_verbatim_path(&paths.catalog).display().to_string()})).into_response()
 }
 
 async fn api_list_providers(State(state): State<WebState>) -> Response {

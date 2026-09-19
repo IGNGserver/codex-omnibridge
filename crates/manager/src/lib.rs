@@ -692,10 +692,12 @@ pub enum ManagerError {
     PortInUse { port: u16 },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouterStatus {
     pub running: bool,
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Health of a published Router endpoint relative to the local registry.
@@ -847,6 +849,8 @@ pub struct RouterSupervisor {
     /// and delete the other owner's endpoint file. Remembering the endpoint we
     /// were handed pins every subsequent action to the right process.
     active_endpoint: Option<RouterEndpoint>,
+    /// Last error recorded during router startup or operation.
+    last_error: Option<String>,
 }
 
 impl RouterSupervisor {
@@ -881,6 +885,7 @@ impl RouterSupervisor {
             reused_endpoint: false,
             active_endpoint: None,
             port: 0,
+            last_error: None,
         }
     }
 
@@ -911,6 +916,19 @@ impl RouterSupervisor {
     }
 
     pub async fn start(&mut self) -> Result<RouterEndpoint, ManagerError> {
+        match self.start_inner().await {
+            Ok(endpoint) => {
+                self.last_error = None;
+                Ok(endpoint)
+            }
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    async fn start_inner(&mut self) -> Result<RouterEndpoint, ManagerError> {
         if let Some(child) = self.child.as_mut()
             && child.try_wait()?.is_none()
         {
@@ -1108,6 +1126,7 @@ impl RouterSupervisor {
     }
 
     pub async fn status(&mut self) -> Result<RouterStatus, ManagerError> {
+        let last_error = self.last_error.clone();
         let Some(child) = self.child.as_mut() else {
             if self.reused_endpoint {
                 let endpoint = match self.current_endpoint() {
@@ -1116,17 +1135,21 @@ impl RouterSupervisor {
                         return Ok(RouterStatus {
                             running: false,
                             healthy: false,
+                            last_error,
                         });
                     }
                 };
+                let healthy = self.endpoint_is_healthy(&endpoint).await;
                 return Ok(RouterStatus {
                     running: true,
-                    healthy: self.endpoint_is_healthy(&endpoint).await,
+                    healthy,
+                    last_error,
                 });
             }
             return Ok(RouterStatus {
                 running: false,
                 healthy: false,
+                last_error,
             });
         };
         if child.try_wait()?.is_some() {
@@ -1137,6 +1160,7 @@ impl RouterSupervisor {
             return Ok(RouterStatus {
                 running: false,
                 healthy: false,
+                last_error,
             });
         }
         let endpoint = match self.current_endpoint() {
@@ -1145,6 +1169,7 @@ impl RouterSupervisor {
                 return Ok(RouterStatus {
                     running: true,
                     healthy: false,
+                    last_error,
                 });
             }
         };
@@ -1152,6 +1177,7 @@ impl RouterSupervisor {
         Ok(RouterStatus {
             running: true,
             healthy,
+            last_error,
         })
     }
 
@@ -1180,6 +1206,11 @@ impl RouterSupervisor {
         self.reused_endpoint = false;
         self.active_endpoint = None;
         Ok(())
+    }
+
+    pub async fn restart(&mut self) -> Result<RouterEndpoint, ManagerError> {
+        self.stop().await?;
+        self.start().await
     }
 
     /// True when the shared endpoint file still contains `endpoint`, or when we

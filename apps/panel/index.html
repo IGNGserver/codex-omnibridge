@@ -20,7 +20,8 @@
       content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:*; form-action 'none'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'"
     />
     <title>Codex OmniBridge - 控制中心</title>
-    <link rel="icon" type="image/png" href="favicon.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="favicon.png?v=2" />
+    <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png" />
     <!-- Material Symbols 图标库（图标字形；字体本身自托管，见 fonts/） -->
     <link rel="stylesheet" href="tokens.css" />
     <link rel="stylesheet" href="base.css" />
@@ -37,7 +38,7 @@
       <header class="m3-top-app-bar window-drag-region" id="top-app-bar">
         <div class="m3-app-bar__leading window-no-drag">
           <div class="m3-brand-icon" aria-hidden="true">
-            <span class="material-symbols-outlined m3-i-hub"></span>
+            <img src="app-icon.png" alt="" width="40" height="40" draggable="false" />
           </div>
           <h1 class="m3-brand-title">Codex OmniBridge</h1>
           <span class="m3-brand-version m3-label-small">v0.1.0</span>
@@ -150,8 +151,14 @@
                 <div class="m3-metric-card m3-metric-card--primary">
                   <div class="m3-metric-top">
                     <span class="m3-label-medium m3-metric-label">ROUTER 状态</span>
-                    <div class="m3-metric-icon" aria-hidden="true">
-                      <span class="material-symbols-outlined m3-i-router"></span>
+                    <div style="display:flex;align-items:center;gap:var(--md-sys-space-8)">
+                      <button class="m3-btn m3-btn-outlined m3-btn-sm is-hidden" id="router-restart-btn" type="button" title="重启 Router">
+                        <span class="material-symbols-outlined m3-i-refresh" aria-hidden="true"></span>
+                        <span>重启</span>
+                      </button>
+                      <div class="m3-metric-icon" aria-hidden="true">
+                        <span class="material-symbols-outlined m3-i-router"></span>
+                      </div>
                     </div>
                   </div>
                   <div class="m3-metric-value" id="metric-router-val">检测中…</div>
@@ -446,7 +453,19 @@
                       </label>
                     </div>
 
-                    <p id="settings-security-tip" class="m3-body-small m3-settings-hint"></p>
+                    <div class="m3-security-url-container" style="display:flex;flex-direction:column;gap:var(--md-sys-space-8)">
+                      <p id="settings-security-tip" class="m3-body-small m3-settings-hint"></p>
+                      <div class="m3-btn-group is-hidden" id="settings-security-actions" style="display:flex;gap:var(--md-sys-space-8)">
+                        <button class="m3-btn m3-btn-tonal m3-btn-sm" id="security-open-browser-btn" type="button">
+                          <span class="material-symbols-outlined m3-i-open-in-new" aria-hidden="true"></span>
+                          <span>在浏览器中打开</span>
+                        </button>
+                        <button class="m3-btn m3-btn-outlined m3-btn-sm" id="security-copy-url-btn" type="button">
+                          <span class="material-symbols-outlined m3-i-content-copy" aria-hidden="true"></span>
+                          <span>复制地址</span>
+                        </button>
+                      </div>
+                    </div>
 
                     <div class="m3-settings-actions">
                       <button type="submit" class="m3-btn m3-btn-filled">
@@ -480,6 +499,20 @@
                         <span>恢复官方原版</span>
                       </button>
                     </div>
+                  </div>
+                </div>
+
+                <!-- 关于与版本信息 -->
+                <div class="m3-card m3-card-elevated m3-settings-card">
+                  <div class="m3-quota-head">
+                    <div class="m3-section-title-group">
+                      <h3 class="m3-title-large">关于与版本信息</h3>
+                      <p class="m3-body-medium m3-quota-note">当前构建与运行环境版本</p>
+                    </div>
+                    <div class="m3-chip m3-chip--neutral">v0.1.0</div>
+                  </div>
+                  <div class="m3-settings-row">
+                    <span class="m3-body-medium m3-settings-hint" id="settings-version-info">Codex OmniBridge 面板版本: v0.1.0 · Rust Core: v0.1.0</span>
                   </div>
                 </div>
               </div>

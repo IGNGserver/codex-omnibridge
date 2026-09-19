@@ -1410,6 +1410,20 @@ pub fn set_private_permissions(path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Strip Windows verbatim (`\\?\` or `\\?\UNC\`) prefix if present, returning a normal path.
+/// On non-Windows platforms, returns the path as-is.
+pub fn clean_verbatim_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{stripped}"))
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

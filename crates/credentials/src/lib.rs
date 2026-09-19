@@ -273,73 +273,94 @@ impl CredentialStore for NativeCredentialStore {
         }
 
         let entry = self.entry(reference)?;
-        entry
-            .get_password()
-            .map(SecretString::from)
-            .map_err(|error| {
-                if matches!(error, keyring::Error::NoEntry) {
-                    CredentialStoreError::NotFound(reference.to_owned())
-                } else {
-                    CredentialStoreError::Backend(error.to_string())
+        match entry.get_password() {
+            Ok(pwd) => Ok(SecretString::from(pwd)),
+            Err(error) => {
+                // If the key was stored in the file store (e.g. automatic fallback for large secrets),
+                // check the file store before giving up.
+                let fallback_file = file_backend_path();
+                if let Ok(s) = std::fs::read_to_string(&fallback_file)
+                    && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
+                    && let Some(val) = map.get(reference)
+                {
+                    return Ok(SecretString::from(val.clone()));
                 }
-            })
+                if matches!(error, keyring::Error::NoEntry) {
+                    Err(CredentialStoreError::NotFound(reference.to_owned()))
+                } else {
+                    Err(CredentialStoreError::Backend(error.to_string()))
+                }
+            }
+        }
     }
 
     fn set(&self, reference: &str, value: &SecretString) -> Result<(), CredentialStoreError> {
         // `--secret-backend file` selects the 0600 file as the store, so it must
         // be written **first** and be authoritative.
-        //
-        // Writing the keyring first (as this used to) made the two stores
-        // disagree: `get` reads the file first, so a rotated key was written to
-        // the keyring while reads kept returning the file's stale value. Verified
-        // end-to-end: after `provider edit --api-key-stdin` the upstream still
-        // received the previous key.
         if self.file_backend_enabled() {
             return self.set_in_file(reference, value);
         }
-        self.entry(reference)?
-            .set_password(value.expose_secret())
-            .map_err(|e| {
-                CredentialStoreError::Backend(format!(
+
+        // On Windows (or when a secret exceeds Windows Credential Manager's limit),
+        // large secret material (e.g. OAuth token bundles > 2560 UTF-16 chars)
+        // cannot be stored in the native keyring. Automatically fall back to the 0600 file store.
+        let secret_str = value.expose_secret();
+        if secret_str.encode_utf16().count() >= 2560 {
+            return self.set_in_file(reference, value);
+        }
+
+        let entry = self.entry(reference)?;
+        match entry.set_password(secret_str) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("2560 chars")
+                    || err_msg.contains("longer than the platform limit")
+                {
+                    return self.set_in_file(reference, value);
+                }
+                Err(CredentialStoreError::Backend(format!(
                     "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
-                ))
-            })
+                )))
+            }
+        }
     }
 
     fn delete(&self, reference: &str) -> Result<(), CredentialStoreError> {
         // A failure here used to be discarded and `Ok(())` returned, so a caller
         // that removed a provider believed the key was gone while it stayed live
         // in the keyring. `NoEntry` is the one benign case: already absent.
+        let mut had_keyring_error = false;
+        let mut keyring_err_msg = String::new();
         if let Err(error) = self.entry(reference)?.delete_credential()
             && !matches!(error, keyring::Error::NoEntry)
         {
-            let fallback_enabled = self.file_backend_enabled();
-            // When the 0600 file backend is explicitly enabled, the key may only
-            // ever have lived there, so a keyring miss is not fatal.
-            if !fallback_enabled {
-                return Err(CredentialStoreError::Backend(format!(
-                    "keyring delete failed for `{reference}`: {error}"
-                )));
+            had_keyring_error = true;
+            keyring_err_msg = error.to_string();
+        }
+
+        // Always clean up any entry in the file store (handles file backend or fallback writes)
+        let fallback_file = file_backend_path();
+        let mut removed_from_file = false;
+        if fallback_file.exists()
+            && let Ok(_guard) = codex_mp_core::FileLock::acquire(&fallback_file)
+            && let Ok(s) = fs::read_to_string(&fallback_file)
+            && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
+        {
+            if map.remove(reference).is_some() {
+                removed_from_file = true;
+                if let Ok(json_str) = serde_json::to_string(&map) {
+                    let _ = write_private_json_atomic(&fallback_file, &json_str);
+                }
             }
         }
-        if !self.file_backend_enabled() {
-            return Ok(());
+
+        if had_keyring_error && !removed_from_file && !self.file_backend_enabled() {
+            return Err(CredentialStoreError::Backend(format!(
+                "keyring delete failed for `{reference}`: {keyring_err_msg}"
+            )));
         }
-        // In file mode the file **is** the store, so the removal must be
-        // serialized and durable there. Without the lock two concurrent deletes
-        // could each rewrite the map from a stale read.
-        let fallback_file = file_backend_path();
-        let _guard = codex_mp_core::FileLock::acquire(&fallback_file)
-            .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
-        if let Ok(s) = fs::read_to_string(&fallback_file)
-            && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
-            && map.remove(reference).is_some()
-        {
-            let json_str = serde_json::to_string(&map)
-                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
-            write_private_json_atomic(&fallback_file, &json_str)
-                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
-        }
+
         Ok(())
     }
 }
