@@ -2407,6 +2407,10 @@ mod tests {
     /// `restore` reported "no manifest" and did nothing, while `install` refused
     /// with `EntrypointNotNative` — so the Desktop stayed hijacked with no CLI way
     /// back. `restore_orphaned_launcher` must heal it from the sibling backup.
+    // Linux-only like its sibling above: `install_into` writes the platform's
+    // real environment override, so on macOS this would touch the user's
+    // `~/Library/LaunchAgents` and fail.
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_install_loses_manifest_then_recovers_the_entrypoint() {
         let fixture = fixture("0.154.0-desktop");
@@ -2438,6 +2442,9 @@ mod tests {
 
     /// After an install loses its manifest, `install` must be able to run again
     /// (the user's other escape route) rather than refusing `EntrypointNotNative`.
+    // Linux-only for the same reason: `install_into` writes the platform's real
+    // environment override, which macOS would place in ~/Library/LaunchAgents.
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_recovers_from_a_lost_manifest() {
         let fixture = fixture("0.154.0-desktop");
