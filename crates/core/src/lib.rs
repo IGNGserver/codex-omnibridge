@@ -1722,14 +1722,20 @@ mod tests {
             "a second lock was granted while the first was held"
         );
 
+        // Checking file absence immediately after `drop(first)` would be inherently
+        // racy: the waiting thread polls every 25ms and may have already re-acquired
+        // (recreated) the lock file by then. Joining first establishes the ordering —
+        // the waiter can only succeed *because* the drop released it, and its own
+        // temporary guard is dropped before the closure returns — so the final
+        // file-absence check below is deterministic.
         drop(first);
-        assert!(
-            !lock_file_path(&state).exists(),
-            "the lock was not released"
-        );
         assert!(
             blocked.join().unwrap(),
             "the waiting acquirer never got the lock"
+        );
+        assert!(
+            !lock_file_path(&state).exists(),
+            "the lock file must be gone once every holder has dropped it"
         );
     }
 
