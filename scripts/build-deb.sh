@@ -57,24 +57,21 @@ Description: Codex OmniBridge - Seamless model switching & Web management panel 
  Completely headless-compatible single binary with zero GTK dependencies.
 EOF
 
-# 4. 生成 DEBIAN/prerm (卸载前停止运行中的进程，安全还原受管配置)
-cat >"${BUILD_DIR}/DEBIAN/prerm" <<'EOF'
-#!/usr/bin/env bash
-set -e
-
-# 停止运行中的进程
-pkill -f '/usr/bin/codex-mp' || true
-
-# 如果是彻底卸载或移除，对登录用户调用 uninstall 进行无残留还原
-if [[ -x /usr/bin/codex-mp ]]; then
-  # 尝试为当前 sudo 用户运行 uninstall
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    runuser -u "${SUDO_USER}" -- /usr/bin/codex-mp uninstall || true
-  fi
+# 4. 安装 DEBIAN/prerm (卸载前停止运行中的进程，安全还原受管配置)
+#
+# 使用 installer/linux/deb/prerm 这一份**唯一**实现，不再内联生成第二份。
+# 内联副本与仓库版本已经分叉：它用 `pkill -f '/usr/bin/codex-mp'`（子串匹配，
+# 会误伤命令行里含该路径的无关进程），且只在 SUDO_USER 存在时才调用 uninstall
+# —— 以 root 身份直接卸载（容器、CI、`su`）时什么都不做，用户配置不会被还原。
+PRERM_SOURCE="${SCRIPT_DIR}/../installer/linux/deb/prerm"
+if [[ ! -f "${PRERM_SOURCE}" ]]; then
+  PRERM_SOURCE="${PROJECT_DIR}/installer/linux/deb/prerm"
 fi
-exit 0
-EOF
-chmod 0755 "${BUILD_DIR}/DEBIAN/prerm"
+if [[ ! -f "${PRERM_SOURCE}" ]]; then
+  echo "error: canonical deb prerm not found (expected installer/linux/deb/prerm)" >&2
+  exit 2
+fi
+install -m 0755 "${PRERM_SOURCE}" "${BUILD_DIR}/DEBIAN/prerm"
 
 # 5. 生成 DEBIAN/postrm (清理残留)
 cat >"${BUILD_DIR}/DEBIAN/postrm" <<'EOF'

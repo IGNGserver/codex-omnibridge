@@ -6,8 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=CODEX_MP_REGISTRY=%h/.config/codexmultiprovider/providers.json
-ExecStart=%h/.local/bin/codex-mp --registry %h/.config/codexmultiprovider/providers.json router --port 8787 --endpoint-file %h/.config/codexmultiprovider/router-endpoint.json
+Environment=CODEX_MP_REGISTRY=__REGISTRY_PATH__
+ExecStart=__CLI_PATH__ --registry __REGISTRY_PATH__ router --port 8787 --endpoint-file __ENDPOINT_FILE__
 Restart=on-failure
 RestartSec=2s
 KillSignal=SIGINT

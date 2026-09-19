@@ -1,0 +1,302 @@
+name: CI
+
+# Runs on every push and pull request. The Release workflow is dispatched by hand,
+# so without this file a commit that breaks the build or the test suite can sit on
+# the default branch unnoticed until someone prepares a release.
+on:
+  push:
+  pull_request:
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-and-test:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Installed via rustup directly so no third-party toolchain action sits in
+      # the supply chain; stable must be >= 1.88 because the workspace uses
+      # edition 2024 and let-chains.
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: cargo build (release CLI)
+        run: cargo build --release --locked --package codex-mp-cli
+
+  guards:
+    name: Repository guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Crate-level `#![allow(clippy::..)]` silently disables whole lint groups
+      # for a file, which makes the clippy gate above meaningless for that file.
+      # The ported bridge code used to carry `clippy::style/complexity/perf` and
+      # ~8k lines were effectively unlinted; those allowances are now gone and
+      # this gate keeps them gone.
+      - name: No crate-level clippy suppression
+        run: |
+          if grep -rn --include='*.rs' -E '^#!\[allow\(clippy' crates/; then
+            echo "::error::crate-level '#![allow(clippy::..)]' is not allowed; scope the allowance to a specific item instead"
+            exit 1
+          fi
+
+      # `#[allow(dead_code)]` hides functions nothing calls. Four such functions
+      # in the bridge turned out to be test-only helpers, and one `TrayHandle`
+      # `stop()` was never called, so the tray could never be shut down. Removing
+      # the allowances let the compiler point at all of them.
+      - name: No dead_code suppression
+        run: |
+          if grep -rn --include='*.rs' -E '^\s*#\[allow\(dead_code\)\]' crates/; then
+            echo "::error::'#[allow(dead_code)]' is not allowed; delete the dead code or move it behind #[cfg(test)]"
+            exit 1
+          fi
+
+      # Shell installers are executed on Linux/macOS. CRLF endings break them with
+      # "\r: command not found", so the repository must never store CRLF shell.
+      - name: Shell scripts must use LF endings
+        run: |
+          status=0
+          while IFS= read -r file; do
+            if grep -qU $'\r' "$file"; then
+              echo "::error file=$file::CRLF line endings detected in a shell script"
+              status=1
+            fi
+          done < <(git ls-files '*.sh' 'installer/linux/deb/*')
+          exit $status
+
+      - name: Shell syntax
+        run: |
+          for file in $(git ls-files '*.sh' 'installer/linux/deb/*'); do
+            bash -n "$file" || exit 1
+          done
+
+      # SHA256SUMS records paths relative to the repository root.
+      # `sed s|__PLACEHOLDER__|${VAR}|` must escape the replacement: `&` and `\`
+      # in a path silently corrupt the rendered systemd unit / launchd plist.
+      - name: Placeholder substitutions escape their values
+        run: bash scripts/check-sed-escaping.sh
+
+      - name: Patch checksums
+        run: sha256sum -c patches/codex/73a1148c9c775c2a4616ce5096291740a00ed68a/SHA256SUMS
+
+      # The systemd unit must point at the registry the CLI actually resolves.
+      # A mismatch is silent and severe: the router starts "healthy" and routes
+      # nothing, and no other check catches it. This asserts the installer renders
+      # the same path `codex-mp status` reports, by running the binary itself.
+      - name: Service installer path must match the CLI registry path
+        run: |
+          set -euo pipefail
+          cargo build --locked --package codex-mp-cli
+          bin="$PWD/target/debug/codex-mp"
+          work="$(mktemp -d)"
+          mkdir -p "$work/bin" "$work/home/.config"
+          printf '#!/bin/sh\nexit 0\n' > "$work/bin/systemctl"
+          cp "$work/bin/systemctl" "$work/bin/loginctl"
+          chmod +x "$work/bin/systemctl" "$work/bin/loginctl"
+          export PATH="$work/bin:$PATH"
+          export HOME="$work/home"
+          export XDG_CONFIG_HOME="$work/home/.config"
+          export CODEX_MP_CLI_BINARY="$bin"
+          export CODEX_MP_UNIT_SOURCE="$PWD/installer/codex-mp-router.service"
+          unset CODEX_MP_REGISTRY || true
+          bash installer/install-router-service.sh >/dev/null
+          unit="$XDG_CONFIG_HOME/systemd/user/codex-mp-router.service"
+          test -f "$unit" || { echo "::error::the service installer produced no unit"; exit 1; }
+          if grep -q '__' "$unit"; then
+            echo "::error::unrendered placeholders left in the installed unit"
+            grep -n '__' "$unit"
+            exit 1
+          fi
+          cli_registry="$("$bin" status | sed -n 's/^registry: //p')"
+          unit_registry="$(sed -n 's/^Environment=CODEX_MP_REGISTRY=//p' "$unit")"
+          if [ "$cli_registry" != "$unit_registry" ]; then
+            echo "::error::service unit registry ($unit_registry) != CLI registry ($cli_registry)"
+            exit 1
+          fi
+          echo "service unit registry matches the CLI: $cli_registry"
+
+  frontend:
+    name: Frontend and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: JavaScript syntax
+        run: |
+          node --check apps/panel/main.js
+          node --check apps/electron/main.js
+          node --check apps/electron/preload.js
+
+      # Auth tokens must be cleared on logout and on 401. A token that is never
+      # cleared keeps authenticating requests after logout, which is invisible in
+      # normal use and was a real regression.
+      - name: Panel auth token handling
+        run: node scripts/check-panel-auth.js
+
+      # The panel's design tokens are a contract: raw colours belong only in
+      # tokens.css, baseline type roles cap at weight 500 (700 belongs to the
+      # emphasized roles), and the self-hosted fonts and Expressive tokens must
+      # be present. Each of these failed silently at least once during the
+      # Expressive rewrite, so they are checked mechanically.
+      - name: Panel design-token discipline
+        run: node scripts/check-panel-tokens.js
+
+      # A supervisor that starts a Router without pinning the configured port
+      # makes Codex dial a port nobody owns. The endpoint file still advertises
+      # the real port, so every endpoint-file-based test still passes.
+      - name: Router port matches the managed config
+        run: node scripts/check-router-port.js
+
+      # Packaging must not keep a second copy of the deb install hooks: the copy
+      # in scripts/build-deb.sh had drifted (substring pkill, root no-op).
+      - name: One canonical deb prerm
+        run: node scripts/check-packaging.js
+
+      # The Router caches credentials per registry generation. A mutation that
+      # forgets to bump the generation keeps serving stale (or old) secrets —
+      # verified live: the upstream kept receiving the previous API key.
+      - name: Routing mutations invalidate the credential cache
+        run: node scripts/check-generation-bump.js
+
+      # reqwest follows redirects by default and RESENDS the body, so a 307/308
+      # would hand an API key or OAuth refresh token to another host. Verified:
+      # the redirect target received the token.
+      - name: HTTP clients refuse redirects
+        run: node scripts/check-http-clients.js
+
+      # A synchronous keyring call inside an async fn panics at runtime
+      # ("Cannot start a runtime from within a runtime"). This project hit that
+      # six times, most recently in `provider fetch-models`, which panicked on
+      # every invocation.
+      - name: No blocking keyring calls in async code
+        run: node scripts/check-blocking-in-async.js
+
+      # The CSP is declared twice (HTTP header for the browser, <meta> for
+      # Electron's file:// case). They must stay textually identical or the two
+      # builds enforce different policies.
+      - name: Panel CSP declarations agree
+        run: node scripts/check-csp-identical.js
+
+      - name: Panel must keep a Content-Security-Policy
+        run: |
+          if ! grep -q 'Content-Security-Policy' apps/panel/index.html; then
+            echo "::error file=apps/panel/index.html::the panel lost its CSP meta tag"
+            exit 1
+          fi
+
+      - name: Electron must not disable the same-origin policy
+        run: |
+          if grep -n 'webSecurity:\s*false' apps/electron/main.js; then
+            echo "::error file=apps/electron/main.js::webSecurity must stay enabled"
+            exit 1
+          fi
+
+      - name: package.json must stay valid JSON
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('package.json', 'utf8'))"
+
+  # Real-browser verification of the panel. These bugs are invisible to static
+  # checks and to unit tests: a 12% container tint under 38% text alpha renders
+  # at 1:1 contrast, a floating label without `for` leaves a field unnamed in the
+  # accessibility tree, and a container query on the grid itself silently pins
+  # every grid to one column. None of those show up in a source diff.
+  panel-verify:
+    name: Panel browser verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      # Playwright is installed here rather than declared in package.json: the
+      # panel ships zero runtime dependencies, and a devDependency would pull
+      # ~300 MB of browsers into every contributor install for a check that
+      # only CI runs.
+      - name: Install Playwright (ephemeral)
+        run: |
+          npm install --no-save playwright@1.53.0
+          npx playwright install --with-deps chromium
+
+      - name: Verify the panel in a real browser
+        run: node tools/panel-verify/run.mjs
+        env:
+          PANEL_SHOTS: panel-verify-shots
+
+      # Screenshots are only interesting when the run failed, but uploading them
+      # unconditionally makes a failure diagnosable without a local repro.
+      - name: Upload panel screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: panel-verify-screenshots
+          path: panel-verify-shots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  powershell:
+    name: PowerShell parse
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Parsing only: it catches syntax errors without needing a real install.
+      - name: Parse installer and build scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Path installer,scripts -Recurse -Include *.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              Write-Host "::error file=$($_.FullName)::$($errors[0].Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }

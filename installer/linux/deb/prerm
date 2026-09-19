@@ -1,17 +1,66 @@
 #!/bin/bash
-set -e
+# Debian pre-removal script for Codex OmniBridge.
+#
+# dpkg runs this before the package files are deleted, which is the only window
+# in which the bundled CLI still exists to restore the user's Codex config.toml.
+# Electron Builder exposes no `beforeRemove` option for the deb target, so this
+# script is attached through the `fpm` passthrough as `--before-remove`.
+#
+# Everything here is best-effort: a failure to restore must not block `apt
+# remove`, but it must be reported so the user can finish the job by hand.
 
-# 停止运行中的进程
-pkill -f 'codex-mp' || true
-pkill -f 'codex-omnibridge' || true
+set -u
 
-# 执行纯净还原
-if command -v codex-mp >/dev/null 2>&1; then
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    runuser -u "${SUDO_USER}" -- codex-mp uninstall || true
-  else
-    codex-mp uninstall || true
+log() { echo "codex-omnibridge: $*" >&2; }
+
+# Stop the router first. Match the exact process name so that unrelated
+# processes whose command line merely contains "codex-mp" are left alone.
+if command -v pkill >/dev/null 2>&1; then
+  pkill -x codex-mp >/dev/null 2>&1 || true
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user stop codex-mp-router.service >/dev/null 2>&1 || true
+fi
+
+find_cli() {
+  local candidate
+  for candidate in \
+    "${CODEX_MP_INSTALL_DIR:-}/codex-mp" \
+    "/usr/bin/codex-mp" \
+    "/usr/local/bin/codex-mp" \
+    "/opt/Codex OmniBridge/bin/codex-mp"; do
+    [[ -n "${candidate}" && -x "${candidate}" ]] && { printf '%s' "${candidate}"; return 0; }
+  done
+  if command -v codex-mp >/dev/null 2>&1; then
+    command -v codex-mp
+    return 0
   fi
+  return 1
+}
+
+restore_integration() {
+  local cli="$1"
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    runuser -u "${SUDO_USER}" -- "${cli}" uninstall && return 0
+  elif [[ "$(id -u)" -ne 0 ]]; then
+    "${cli}" uninstall && return 0
+  fi
+  return 1
+}
+
+CLI="$(find_cli)" || CLI=""
+
+if [[ -n "${CLI}" ]]; then
+  if restore_integration "${CLI}"; then
+    log "restored the Codex configuration"
+  else
+    log "WARNING: could not restore the Codex configuration automatically."
+    log "WARNING: run 'codex-mp uninstall' as your normal user to restore ~/.codex/config.toml."
+  fi
+else
+  log "WARNING: codex-mp binary not found; the Codex configuration was not restored."
+  log "WARNING: run 'codex-mp uninstall' as your normal user to restore ~/.codex/config.toml."
 fi
 
 exit 0

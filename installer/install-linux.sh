@@ -15,8 +15,10 @@ UNINSTALL_SCRIPT="${PROJECT_DIR}/installer/uninstall-linux.sh"
 [[ -f "${UNINSTALL_SCRIPT}" ]] || UNINSTALL_SCRIPT="${PROJECT_DIR}/uninstall-linux.sh"
 ROUTER_SERVICE_INSTALLER="${PROJECT_DIR}/installer/install-router-service.sh"
 ROUTER_SERVICE_UNINSTALLER="${PROJECT_DIR}/installer/uninstall-router-service.sh"
+ROUTER_SERVICE_UNIT="${PROJECT_DIR}/installer/codex-mp-router.service"
 [[ -f "${ROUTER_SERVICE_INSTALLER}" ]] || ROUTER_SERVICE_INSTALLER="${PROJECT_DIR}/install-router-service.sh"
 [[ -f "${ROUTER_SERVICE_UNINSTALLER}" ]] || ROUTER_SERVICE_UNINSTALLER="${PROJECT_DIR}/uninstall-router-service.sh"
+[[ -f "${ROUTER_SERVICE_UNIT}" ]] || ROUTER_SERVICE_UNIT="${PROJECT_DIR}/codex-mp-router.service"
 STOCK_CODEX_ARTIFACT_DIR="${CODEX_MP_CODEX_ARTIFACT_DIR:-${PROJECT_DIR}/dist/stock-codex}"
 INSTALL_MANIFEST="${INSTALL_DIR}/.codex-mp-install-manifest"
 
@@ -98,11 +100,7 @@ install -m 0755 "${CLI_BINARY}" "${INSTALL_DIR}/codex-mp"
 install -m 0755 "${UNINSTALL_SCRIPT}" "${INSTALL_DIR}/codex-mp-uninstall"
 install -m 0755 "${ROUTER_SERVICE_INSTALLER}" "${INSTALL_DIR}/codex-mp-router-service-install"
 install -m 0755 "${ROUTER_SERVICE_UNINSTALLER}" "${INSTALL_DIR}/codex-mp-router-service-uninstall"
-
-if [[ "${CODEX_MP_INSTALL_SERVICE:-0}" == "1" ]]; then
-  CODEX_MP_ENABLE_SERVICE="${CODEX_MP_ENABLE_SERVICE:-0}" \
-    "${INSTALL_DIR}/codex-mp-router-service-install"
-fi
+install -m 0644 "${ROUTER_SERVICE_UNIT}" "${INSTALL_DIR}/codex-mp-router.service"
 
 if [[ "${install_stock_codex}" == "1" ]]; then
   for artifact in \
@@ -117,23 +115,16 @@ if [[ "${install_stock_codex}" == "1" ]]; then
   done
 fi
 
-if [[ "${CODEX_MP_INSTALL_DESKTOP:-0}" == "1" ]]; then
-  if [[ "${install_stock_codex}" != "1" ]]; then
-    echo "error: CODEX_MP_INSTALL_DESKTOP=1 requires the explicit experimental Desktop runtime artifact" >&2
-    exit 1
-  fi
-  "${INSTALL_DIR}/codex-mp" desktop install \
-    --app-server-binary "${INSTALL_DIR}/codex-mp-app-server-bin" \
-    --codex-mp-binary "${INSTALL_DIR}/codex-mp"
-fi
-
+# The manifest is written before the optional post-install steps below so that a
+# failure there can never leave files on disk that the uninstaller cannot see.
 manifest_tmp="${INSTALL_MANIFEST}.tmp"
 {
   printf '%s\n' \
     "${INSTALL_DIR}/codex-mp" \
     "${INSTALL_DIR}/codex-mp-uninstall" \
     "${INSTALL_DIR}/codex-mp-router-service-install" \
-    "${INSTALL_DIR}/codex-mp-router-service-uninstall"
+    "${INSTALL_DIR}/codex-mp-router-service-uninstall" \
+    "${INSTALL_DIR}/codex-mp-router.service"
   if [[ "${install_stock_codex}" == "1" ]]; then
     printf '%s\n' \
       "${INSTALL_DIR}/codex-mp-codex-bin" \
@@ -146,6 +137,22 @@ manifest_tmp="${INSTALL_MANIFEST}.tmp"
 } >"${manifest_tmp}"
 install -m 0600 "${manifest_tmp}" "${INSTALL_MANIFEST}"
 rm -f "${manifest_tmp}"
+
+if [[ "${CODEX_MP_INSTALL_SERVICE:-0}" == "1" ]]; then
+  CODEX_MP_ENABLE_SERVICE="${CODEX_MP_ENABLE_SERVICE:-0}" \
+    CODEX_MP_UNIT_SOURCE="${INSTALL_DIR}/codex-mp-router.service" \
+    "${INSTALL_DIR}/codex-mp-router-service-install"
+fi
+
+if [[ "${CODEX_MP_INSTALL_DESKTOP:-0}" == "1" ]]; then
+  if [[ "${install_stock_codex}" != "1" ]]; then
+    echo "error: CODEX_MP_INSTALL_DESKTOP=1 requires the explicit experimental Desktop runtime artifact" >&2
+    exit 1
+  fi
+  "${INSTALL_DIR}/codex-mp" desktop install \
+    --app-server-binary "${INSTALL_DIR}/codex-mp-app-server-bin" \
+    --codex-mp-binary "${INSTALL_DIR}/codex-mp"
+fi
 
 echo "installed ${INSTALL_DIR}/codex-mp"
 echo "installed ${INSTALL_DIR}/codex-mp-uninstall"

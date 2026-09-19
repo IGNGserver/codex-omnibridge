@@ -107,11 +107,16 @@ macOS 使用 Unix 脚本，但生成的启动器只依赖 POSIX `sh`，不依赖
 
 ### 启动顺序
 
-可以手动先启动 Router：
+可以手动先启动 Router。**端口必须与 `config.toml` 中
+`[model_providers.omnibridge].base_url` 的端口一致**（默认 8787）：stock Codex
+只读 `config.toml` 里的 `base_url`，**不会**读取 endpoint file，因此用一个随机端口启动
+会让 Codex 的每个请求都发往没人监听的地址。
 
 ```bash
 ENDPOINT_FILE="$HOME/.config/codexmultiprovider/router-endpoint.json"
-codex-mp router --port 0 --endpoint-file "$ENDPOINT_FILE"
+# 8787 是 `codex-mp sync` 写入 config.toml 的默认端口；若你改过
+# CODEX_MP_ROUTER_BASE_URL，请在这里使用同一个端口。
+codex-mp router --port 8787 --endpoint-file "$ENDPOINT_FILE"
 ```
 
 再让 patched Codex CLI/app-server 继承同一 endpoint file：
@@ -120,6 +125,9 @@ codex-mp router --port 0 --endpoint-file "$ENDPOINT_FILE"
 export CODEX_MP_ROUTER_ENDPOINT_FILE="$ENDPOINT_FILE"
 /path/to/patched/codex app-server
 ```
+
+> 更推荐使用下面的启动器（`codex-mp launch` / 面板）：它会自动从受管
+> `config.toml` 解析端口并绑定，无需手工保持一致。
 
 也可以直接使用跨平台启动器，由 Rust supervisor 负责复用或启动 Router：
 
@@ -169,6 +177,24 @@ Router 默认只绑定 `127.0.0.1`，端口可以为 `0`。启动后写入 JSON 
   "capability_token": "..."
 }
 ```
+
+## 凭据后端与环境变量覆盖
+
+凭据（provider 的 API Key、托管账号的 token）默认存放在系统钥匙串。
+两种替代/覆盖方式：
+
+| 方式 | 行为 |
+|---|---|
+| `--secret-backend file` | **使用 0600 的 `~/.config/codexmultiprovider/.credentials` 作为存储**（不再写钥匙串）。适用于无钥匙串的无头环境 |
+| `CODEX_MP_KEY_<REFERENCE>` 环境变量 | **优先级最高**，直接覆盖上述任何存储 |
+
+环境变量的名称由凭据引用转换而来：大写、非字母数字字符替换为下划线。
+例如 provider `newapi` 的引用是 `provider:newapi`，对应
+`CODEX_MP_KEY_PROVIDER_NEWAPI`。
+
+**注意**：环境变量覆盖会**静默改变**该 provider 实际使用的上游凭据。
+程序在首次使用某个覆盖时会打印一行说明；但如果你发现"改了 Key 却不生效"，
+请先检查环境中是否存在对应的 `CODEX_MP_KEY_*` 变量。
 
 Unix endpoint file 强制 0600；Windows 写入时移除继承 ACL 并只授予当前 Windows principal；token 不打印到 stdout。`/v1/models`、`/v1/responses` 和 `/v1/chat/completions` 都要求 `x-codex-omnibridge-token: <raw token>`；官方 route 另外要求有效的 `Authorization: Bearer ...`，该 header 只允许转发到官方 upstream，Custom route 不携带它。POST body 必须是 `application/json`。官方 model ID 被 Router 明确拒绝为 `501 Not Implemented`，避免把官方请求误发给第三方适配层。
 
