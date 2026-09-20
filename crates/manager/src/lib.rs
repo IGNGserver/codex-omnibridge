@@ -2048,11 +2048,13 @@ mod tests {
                         ProviderProtocol::Responses,
                         None,
                     )
-                    .is_ok()
+                    .map(|_| index)
+                    .map_err(|error| format!("H{index}: {error:?}"))
             }));
         }
         for handle in handles {
-            assert!(handle.await.expect("a blocking task panicked"));
+            let result = handle.await.expect("a blocking task panicked");
+            assert!(result.is_ok(), "concurrent add_provider failed: {result:?}");
         }
 
         let registry = ProviderRegistry::load(&registry_path).unwrap();
