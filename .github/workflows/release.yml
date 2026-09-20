@@ -355,6 +355,10 @@ jobs:
           mkdir -p assets
           while IFS= read -r -d '' artifact; do
             filename="${artifact##*/}"
+            # GitHub Release canonicalizes spaces in asset labels to dots.
+            # Normalize before generating SHA256SUMS so the manifest names
+            # match the files users actually download.
+            filename="${filename// /.}"
             if [[ -e "assets/${filename}" ]]; then
               echo "发现重复发布附件名称: ${filename}" >&2
               exit 1
