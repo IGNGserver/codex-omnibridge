@@ -1111,18 +1111,31 @@ pub fn atomic_replace(
             ) -> i32;
         }
 
-        if unsafe {
-            MoveFileExW(
-                temporary.as_ptr(),
-                destination.as_ptr(),
-                REPLACE_EXISTING | WRITE_THROUGH,
-            )
-        } == 0
-        {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
+        // Windows Defender and file indexers can briefly open a newly replaced
+        // state file without delete sharing. Treat only those transient sharing
+        // errors as retryable; permanent ACL/path errors still fail immediately
+        // after the bounded retry window.
+        const MAX_ATTEMPTS: usize = 20;
+        for attempt in 0..MAX_ATTEMPTS {
+            if unsafe {
+                MoveFileExW(
+                    temporary.as_ptr(),
+                    destination.as_ptr(),
+                    REPLACE_EXISTING | WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+
+            let error = std::io::Error::last_os_error();
+            let retryable = matches!(error.raw_os_error(), Some(5 | 32));
+            if !retryable || attempt + 1 == MAX_ATTEMPTS {
+                return Err(error);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
         }
+        unreachable!("the atomic replacement retry loop always returns")
     }
 }
 
