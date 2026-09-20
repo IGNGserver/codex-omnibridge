@@ -1479,17 +1479,29 @@ fn set_private_permissions_windows(path: &Path) -> Result<(), std::io::Error> {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let security_status = unsafe {
-            SetNamedSecurityInfoW(
-                path_wide.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                acl,
-                null_mut(),
-            )
-        };
+        const MAX_ATTEMPTS: usize = 20;
+        let mut security_status = 0;
+        for attempt in 0..MAX_ATTEMPTS {
+            security_status = unsafe {
+                SetNamedSecurityInfoW(
+                    path_wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    acl,
+                    null_mut(),
+                )
+            };
+            if security_status == 0 {
+                break;
+            }
+            let retryable = matches!(security_status, 5 | 32 | 33);
+            if !retryable || attempt + 1 == MAX_ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
+        }
         unsafe {
             let _ = LocalFree(acl.cast());
         }
