@@ -1,10 +1,11 @@
 //! Management of official Codex / ChatGPT accounts, credentials persistence,
 //! token refresh, rate limits usage checking, atomic switching, and Codex process restarting.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -93,6 +94,41 @@ async fn read_bounded_account_json(
     serde_json::from_str(&text).map_err(AccountError::from)
 }
 
+/// Extract only the non-secret OAuth error fields. The complete response is
+/// still bounded by `read_bounded_error_text`, but persisting or returning the
+/// raw body would make the health state noisy and could expose intermediary
+/// diagnostics to the browser.
+fn oauth_error_details(body: &str) -> (Option<String>, String) {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let nested = parsed.as_ref().and_then(|value| value.get("error"));
+    let source = nested.or(parsed.as_ref());
+    let code = source
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let message = source
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(body)
+        .chars()
+        .take(256)
+        .collect();
+    (code, message)
+}
+
+fn is_reauthentication_code(code: Option<&str>, status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED
+        || code.is_some_and(|value| {
+            matches!(
+                value,
+                "refresh_token_expired"
+                    | "refresh_token_reused"
+                    | "refresh_token_invalidated"
+                    | "refresh_token_account_mismatch"
+            )
+        })
+}
+
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_USER_AGENT: &str = "codex_cli_rs";
@@ -122,8 +158,18 @@ pub enum AccountError {
     InvalidToken(String),
     #[error("Account `{0}` has no stored credentials; refusing to overwrite auth.json")]
     MissingCredentials(String),
+    #[error("Account `{0}` requires re-authentication before it can be activated")]
+    RequiresReauthentication(String),
     #[error("Token refresh failed: {0}")]
     RefreshFailed(String),
+    #[error("Account `{account_id}` requires re-authentication ({code}): {message}")]
+    ReauthenticationRequired {
+        account_id: String,
+        code: String,
+        message: String,
+    },
+    #[error("Account identity changed during token refresh: {0}")]
+    AccountIdentityMismatch(String),
     #[error("Rate limit check failed: HTTP {status} {message}")]
     UsageCheckFailed { status: u16, message: String },
     #[error("Failed to determine Codex home directory")]
@@ -132,6 +178,44 @@ pub enum AccountError {
     AuthJsonInvalid(String),
     #[error("Credential store error: {0}")]
     Credential(#[from] CredentialStoreError),
+}
+
+impl AccountError {
+    /// Stable, secret-free error code for the account API and persisted health
+    /// state. The display implementation intentionally remains more detailed
+    /// for local diagnostics, while the web surface uses this method.
+    pub fn public_code(&self) -> &'static str {
+        match self {
+            Self::ReauthenticationRequired { .. }
+            | Self::AccountIdentityMismatch(_)
+            | Self::RequiresReauthentication(_) => "reauth_required",
+            Self::UsageCheckFailed { status: 401, .. } => "usage_unauthorized",
+            Self::UsageCheckFailed { status: 429, .. } => "usage_rate_limited",
+            Self::UsageCheckFailed { .. } => "usage_check_failed",
+            Self::Network(_) => "network_error",
+            Self::RefreshFailed(_) => "refresh_failed",
+            _ => "account_operation_failed",
+        }
+    }
+
+    /// Human-readable message safe to persist in the account metadata and send
+    /// to the panel. It never includes the OAuth endpoint response body.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::ReauthenticationRequired { .. }
+            | Self::AccountIdentityMismatch(_)
+            | Self::RequiresReauthentication(_) => {
+                "官方账号凭证已失效或身份不一致，请重新登录后再次保存当前账号。".into()
+            }
+            Self::UsageCheckFailed { status: 401, .. } => {
+                "额度服务拒绝了当前凭证，请重新登录后重试。".into()
+            }
+            Self::UsageCheckFailed { status: 429, .. } => "额度服务暂时限流，请稍后重试。".into(),
+            Self::Network(_) => "额度服务网络请求失败，请检查网络后重试。".into(),
+            Self::RefreshFailed(_) => "官方账号凭证刷新失败，请稍后重试。".into(),
+            _ => self.to_string(),
+        }
+    }
 }
 
 /// Token payload stored in auth.json and account store
@@ -151,6 +235,22 @@ impl AccountTokens {
     /// True when no secret material is present (i.e. nothing to persist).
     pub fn is_empty(&self) -> bool {
         self.id_token.is_none() && self.access_token.is_none() && self.refresh_token.is_none()
+    }
+
+    /// A token bundle with only an id token cannot be used by Codex or the
+    /// usage endpoint. Keep the account record from becoming a logout payload.
+    pub fn has_usable_credentials(&self) -> bool {
+        self.access_token.is_some() || self.refresh_token.is_some()
+    }
+
+    fn credential_state(&self) -> CredentialState {
+        if self.refresh_token.is_some() {
+            CredentialState::Ready
+        } else if self.access_token.is_some() {
+            CredentialState::AccessOnly
+        } else {
+            CredentialState::Unknown
+        }
     }
 }
 
@@ -204,6 +304,36 @@ pub struct AccountUsageSnapshot {
     pub reserve: Option<ReserveLimitSummary>,
 }
 
+/// Health of the credential owned by the account manager. This is deliberately
+/// separate from whether Codex's live auth.json is currently active.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialState {
+    Ready,
+    AccessOnly,
+    NeedsReauth,
+    #[default]
+    Unknown,
+}
+
+/// Secret-free persisted diagnostic attached to an account or usage query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountIssue {
+    pub code: String,
+    pub message: String,
+    pub occurred_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageStatus {
+    Unknown,
+    Fresh,
+    Stale,
+    ReauthRequired,
+    Error,
+}
+
 /// Managed account entry
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedAccount {
@@ -223,6 +353,12 @@ pub struct ManagedAccount {
     pub created_at: u64,
     pub updated_at: u64,
     pub usage: Option<AccountUsageSnapshot>,
+    #[serde(default)]
+    pub credential_state: CredentialState,
+    #[serde(default)]
+    pub credential_issue: Option<AccountIssue>,
+    #[serde(default)]
+    pub usage_issue: Option<AccountIssue>,
 }
 
 /// Persistent store file structure
@@ -239,6 +375,19 @@ impl ManagedAccount {
     /// carries `tokens`, including the long-lived OAuth refresh token, and must
     /// never be serialized to a client.
     pub fn to_summary(&self, is_active: bool) -> AccountSummary {
+        let usage_status = if let Some(issue) = &self.usage_issue {
+            if issue.code == "reauth_required" {
+                UsageStatus::ReauthRequired
+            } else if self.usage.is_some() {
+                UsageStatus::Stale
+            } else {
+                UsageStatus::Error
+            }
+        } else if self.usage.is_some() {
+            UsageStatus::Fresh
+        } else {
+            UsageStatus::Unknown
+        };
         AccountSummary {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -247,6 +396,10 @@ impl ManagedAccount {
             is_active,
             updated_at: self.updated_at,
             usage: self.usage.clone(),
+            credential_state: self.credential_state.clone(),
+            credential_issue: self.credential_issue.clone(),
+            usage_status,
+            usage_issue: self.usage_issue.clone(),
         }
     }
 }
@@ -261,6 +414,10 @@ pub struct AccountSummary {
     pub is_active: bool,
     pub updated_at: u64,
     pub usage: Option<AccountUsageSnapshot>,
+    pub credential_state: CredentialState,
+    pub credential_issue: Option<AccountIssue>,
+    pub usage_status: UsageStatus,
+    pub usage_issue: Option<AccountIssue>,
 }
 
 /// Active account detection result
@@ -282,6 +439,7 @@ pub struct AccountManager {
     // an async worker thread (see `codex_mp_credentials::run_blocking`).
     http_client: Arc<Client>,
     credentials: Arc<dyn CredentialStore>,
+    refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AccountManager {
@@ -332,6 +490,7 @@ impl AccountManager {
                     }),
             ),
             credentials,
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -345,6 +504,20 @@ impl AccountManager {
 
     pub fn auth_json_path(&self) -> PathBuf {
         self.codex_home.join("auth.json")
+    }
+
+    /// One in-process flight per account. The accounts-file lock acquired by
+    /// `refresh_account_token` extends this protection across multiple
+    /// OmniBridge processes as well.
+    fn refresh_lock_for(&self, account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(account_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     // ---------------- Persistence ---------------- //
@@ -386,6 +559,9 @@ impl AccountManager {
         for account in &mut file.accounts {
             let reference = account_credential_reference(&account.id);
             if !account.tokens.is_empty() {
+                if account.credential_state == CredentialState::Unknown {
+                    account.credential_state = account.tokens.credential_state();
+                }
                 let secret = SecretString::from(serde_json::to_string(&account.tokens)?);
                 // Attempt migration to keyring/credential store. If migration fails (e.g. platform limits or backend issues),
                 // do NOT fail the entire load_file: keep the inline tokens in memory so the accounts can still be used.
@@ -416,12 +592,32 @@ impl AccountManager {
                 // `auth.json`, destroying the user's live session. Fail closed.
                 Err(error) => return Err(AccountError::Credential(error)),
             }
+            if account.credential_state == CredentialState::Unknown {
+                account.credential_state = account.tokens.credential_state();
+            }
         }
         if migrated_legacy_secrets {
             self.save_file(&file)?;
         }
 
         Ok(file)
+    }
+
+    /// Read only the non-secret account metadata. Active-session detection
+    /// must remain available even when an unrelated managed credential is
+    /// temporarily unreadable in the OS keyring.
+    fn load_metadata_file(&self) -> Result<AccountsFile, AccountError> {
+        if !self.store_path.exists() {
+            return Ok(AccountsFile {
+                schema_version: 1,
+                accounts: Vec::new(),
+            });
+        }
+        let content = fs::read_to_string(&self.store_path)?;
+        serde_json::from_str(&content).map_err(|error| AccountError::StoreUnreadable {
+            path: self.store_path.display().to_string(),
+            detail: error.to_string(),
+        })
     }
 
     /// Persist the accounts document.
@@ -494,7 +690,39 @@ impl AccountManager {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        // `auth.json` can also contain an API-key or an incomplete/old
+        // document. Its mere presence must not make the panel claim that an
+        // official OAuth session is active.
+        if auth_mode.as_deref() != Some("chatgpt") {
+            return Ok(ActiveAccountStatus {
+                is_logged_in: false,
+                email: None,
+                plan_type: None,
+                account_id: None,
+                matched_account_id: None,
+                auth_mode,
+            });
+        }
+
         let tokens_val = active_auth.get("tokens");
+        let tokens = tokens_val
+            .cloned()
+            .ok_or_else(|| AccountError::AuthJsonInvalid("tokens field missing".into()))
+            .and_then(|value| {
+                serde_json::from_value::<AccountTokens>(value).map_err(|error| {
+                    AccountError::AuthJsonInvalid(format!("invalid tokens: {error}"))
+                })
+            })?;
+        if !tokens.has_usable_credentials() {
+            return Ok(ActiveAccountStatus {
+                is_logged_in: false,
+                email: None,
+                plan_type: None,
+                account_id: None,
+                matched_account_id: None,
+                auth_mode,
+            });
+        }
         let id_token = tokens_val
             .and_then(|t| t.get("id_token"))
             .and_then(|v| v.as_str());
@@ -511,20 +739,37 @@ impl AccountManager {
         let plan_type = profile.plan_type;
         let effective_account_id = account_id.or(profile.chatgpt_account_id);
 
-        let file = self.load_file()?;
-        let matched = file.accounts.iter().find(|acc| {
-            if let (Some(acc_email), Some(cur_email)) = (&acc.email, &email)
-                && acc_email.eq_ignore_ascii_case(cur_email)
-            {
-                return true;
-            }
-            if let (Some(acc_aid), Some(cur_aid)) = (&acc.account_id, &effective_account_id)
-                && acc_aid == cur_aid
-            {
-                return true;
-            }
-            false
-        });
+        if email.is_none() && effective_account_id.is_none() {
+            return Ok(ActiveAccountStatus {
+                is_logged_in: false,
+                email: None,
+                plan_type: None,
+                account_id: None,
+                matched_account_id: None,
+                auth_mode,
+            });
+        }
+
+        let file = self.load_metadata_file()?;
+        // Account id is the stronger identity. Only fall back to e-mail when
+        // the active auth has no account id, or when the stored legacy record
+        // has no id of its own. This prevents two saved accounts sharing an
+        // e-mail from selecting the wrong live token bundle.
+        let matched = if let Some(current_account_id) = &effective_account_id {
+            file.accounts
+                .iter()
+                .find(|account| account.account_id.as_ref() == Some(current_account_id))
+                .or_else(|| {
+                    file.accounts.iter().find(|account| {
+                        account.account_id.is_none()
+                            && matches!((&account.email, &email), (Some(a), Some(e)) if a.eq_ignore_ascii_case(e))
+                    })
+                })
+        } else {
+            file.accounts.iter().find(|account| {
+                matches!((&account.email, &email), (Some(a), Some(e)) if a.eq_ignore_ascii_case(e))
+            })
+        };
 
         Ok(ActiveAccountStatus {
             is_logged_in: true,
@@ -540,14 +785,7 @@ impl AccountManager {
 
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, AccountError> {
         let file = self.load_file()?;
-        let active = self.check_active_status().unwrap_or(ActiveAccountStatus {
-            is_logged_in: false,
-            email: None,
-            plan_type: None,
-            account_id: None,
-            matched_account_id: None,
-            auth_mode: None,
-        });
+        let active = self.check_active_status()?;
 
         let mut summaries = Vec::new();
         for acc in file.accounts {
@@ -574,21 +812,31 @@ impl AccountManager {
         &self,
         custom_name: Option<String>,
     ) -> Result<ManagedAccount, AccountError> {
-        let auth_val = self
-            .read_active_auth()?
-            .ok_or_else(|| AccountError::AuthJsonInvalid("auth.json not found".into()))?;
+        let (tokens, last_refresh) = {
+            let _auth_lock = FileLock::acquire(self.auth_json_path())?;
+            let auth_val = self
+                .read_active_auth()?
+                .ok_or_else(|| AccountError::AuthJsonInvalid("auth.json not found".into()))?;
 
-        let tokens_obj = auth_val
-            .get("tokens")
-            .ok_or_else(|| AccountError::AuthJsonInvalid("tokens field missing".into()))?;
+            if auth_val.get("auth_mode").and_then(|value| value.as_str()) != Some("chatgpt") {
+                return Err(AccountError::AuthJsonInvalid(
+                    "auth.json is not using the official `chatgpt` auth mode".into(),
+                ));
+            }
 
-        let tokens: AccountTokens = serde_json::from_value(tokens_obj.clone())
-            .map_err(|e| AccountError::AuthJsonInvalid(format!("invalid tokens: {e}")))?;
+            let tokens_obj = auth_val
+                .get("tokens")
+                .ok_or_else(|| AccountError::AuthJsonInvalid("tokens field missing".into()))?;
 
-        let last_refresh = auth_val
-            .get("last_refresh")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+            let tokens: AccountTokens = serde_json::from_value(tokens_obj.clone())
+                .map_err(|e| AccountError::AuthJsonInvalid(format!("invalid tokens: {e}")))?;
+
+            let last_refresh = auth_val
+                .get("last_refresh")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (tokens, last_refresh)
+        };
 
         self.import_or_update_account(tokens, last_refresh, custom_name)
     }
@@ -600,11 +848,7 @@ impl AccountManager {
         last_refresh: Option<String>,
         name_hint: Option<String>,
     ) -> Result<ManagedAccount, AccountError> {
-        let profile = tokens
-            .id_token
-            .as_deref()
-            .and_then(|tok| parse_id_token_claims(tok).ok())
-            .unwrap_or_default();
+        let profile = validate_import_tokens(&tokens)?;
 
         let now = now_secs();
         let email = profile.email.clone();
@@ -616,22 +860,26 @@ impl AccountManager {
             .or_else(|| profile.chatgpt_account_id.clone());
 
         let (mut file, _lock) = self.load_file_locked()?;
-        let existing_index = file.accounts.iter().position(|acc| {
-            if let (Some(a_email), Some(e_email)) = (&acc.email, &email)
-                && a_email.eq_ignore_ascii_case(e_email)
-            {
-                return true;
-            }
-            if let (Some(a_id), Some(e_id)) = (&acc.account_id, &account_id)
-                && a_id == e_id
-            {
-                return true;
-            }
-            false
-        });
+        let email_index = file.accounts.iter().position(
+            |acc| matches!((&acc.email, &email), (Some(a), Some(e)) if a.eq_ignore_ascii_case(e)),
+        );
+        let account_id_index = file
+            .accounts
+            .iter()
+            .position(|acc| matches!((&acc.account_id, &account_id), (Some(a), Some(e)) if a == e));
+        if let (Some(by_email), Some(by_account_id)) = (email_index, account_id_index)
+            && by_email != by_account_id
+        {
+            return Err(AccountError::InvalidToken(
+                "the supplied token identity matches two different managed accounts".into(),
+            ));
+        }
+        let existing_index = email_index.or(account_id_index);
+        let credential_state = tokens.credential_state();
 
         let account = if let Some(idx) = existing_index {
             let acc = &mut file.accounts[idx];
+            let tokens_changed = acc.tokens != tokens;
             if let Some(n) = name_hint {
                 acc.name = n;
             }
@@ -650,6 +898,15 @@ impl AccountManager {
             }
             if account_id.is_some() {
                 acc.account_id = account_id;
+            }
+            acc.credential_state = credential_state.clone();
+            acc.credential_issue = None;
+            acc.usage_issue = None;
+            if tokens_changed {
+                // A quota snapshot belongs to the previous credential
+                // generation. Keeping it while clearing the error would make
+                // the panel call old data "fresh" after re-capture.
+                acc.usage = None;
             }
             acc.updated_at = now;
             acc.clone()
@@ -670,6 +927,9 @@ impl AccountManager {
                 created_at: now,
                 updated_at: now,
                 usage: None,
+                credential_state,
+                credential_issue: None,
+                usage_issue: None,
             };
             file.accounts.push(new_acc.clone());
             new_acc
@@ -719,7 +979,7 @@ impl AccountManager {
 
     /// Switch active auth.json to the chosen managed account
     pub fn switch_to_account(&self, id: &str) -> Result<ManagedAccount, AccountError> {
-        let file = self.load_file()?;
+        let (file, _accounts_lock) = self.load_file_locked()?;
         let acc_idx = file
             .accounts
             .iter()
@@ -731,9 +991,15 @@ impl AccountManager {
         // Last line of defence. Writing `"tokens": {}` into auth.json logs the
         // user out and discards the only copy of their session, so a switch that
         // cannot actually resolve credentials must fail instead of proceeding.
-        if account.tokens.is_empty() {
+        if !account.tokens.has_usable_credentials() {
             return Err(AccountError::MissingCredentials(id.to_owned()));
         }
+        if account.credential_state == CredentialState::NeedsReauth {
+            return Err(AccountError::RequiresReauthentication(id.to_owned()));
+        }
+
+        let auth_path = self.auth_json_path();
+        let _auth_lock = FileLock::acquire(&auth_path)?;
 
         // Read existing auth.json if any to preserve other untouched fields (like OPENAI_API_KEY if present)
         let mut auth_doc: serde_json::Map<String, serde_json::Value> =
@@ -764,7 +1030,6 @@ impl AccountManager {
         // Backup existing auth.json before writing. A backup contains a live
         // refresh token, so old copies are pruned to a small bounded set and each
         // one is written through an atomic, 0600 temp file.
-        let auth_path = self.auth_json_path();
         if auth_path.exists() {
             self.write_auth_backup(&auth_path)?;
         } else if let Some(parent) = auth_path.parent() {
@@ -851,6 +1116,34 @@ impl AccountManager {
         self: &Arc<Self>,
         account_id: &str,
     ) -> Result<ManagedAccount, AccountError> {
+        self.refresh_account_token_inner(account_id, None).await
+    }
+
+    async fn refresh_account_token_if_unchanged(
+        self: &Arc<Self>,
+        account_id: &str,
+        observed_tokens: &AccountTokens,
+    ) -> Result<ManagedAccount, AccountError> {
+        self.refresh_account_token_inner(account_id, Some(observed_tokens.clone()))
+            .await
+    }
+
+    async fn refresh_account_token_inner(
+        self: &Arc<Self>,
+        account_id: &str,
+        observed_tokens: Option<AccountTokens>,
+    ) -> Result<ManagedAccount, AccountError> {
+        let refresh_lock = self.refresh_lock_for(account_id);
+        let _in_process_guard = refresh_lock.lock().await;
+
+        // Hold the accounts-store lock over the bounded network round trip so
+        // another OmniBridge process cannot rotate the same refresh token at
+        // the same time. The in-process lock above coalesces local callers.
+        let store_path = self.store_path.clone();
+        let _disk_guard = tokio::task::spawn_blocking(move || FileLock::acquire(store_path))
+            .await
+            .map_err(|error| AccountError::RefreshFailed(error.to_string()))??;
+
         let account_id_owned = account_id.to_owned();
         let this = self.clone();
         let mut file = tokio::task::spawn_blocking(move || this.load_file())
@@ -862,18 +1155,42 @@ impl AccountManager {
             .position(|a| a.id == account_id_owned)
             .ok_or_else(|| AccountError::NotFound(account_id_owned.clone()))?;
 
+        // A caller that observed a 401 may have raced another refresh. If the
+        // account has already changed since that observation, use the rotated
+        // bundle instead of consuming the new refresh token a second time.
+        if let Some(observed_tokens) = observed_tokens
+            && file.accounts[acc_idx].tokens != observed_tokens
+            && file.accounts[acc_idx].tokens.access_token.is_some()
+        {
+            return Ok(file.accounts[acc_idx].clone());
+        }
+
+        // Re-check after taking the refresh lock: a user may have switched to
+        // this account while the usage request was in flight. Codex remains
+        // the sole refresh owner for the active auth.json session.
+        let active_check = {
+            let this = self.clone();
+            tokio::task::spawn_blocking(move || this.check_active_status())
+                .await
+                .map_err(|error| AccountError::RefreshFailed(error.to_string()))??
+        };
+        if active_check.is_logged_in
+            && active_check.matched_account_id.as_deref() == Some(account_id)
+        {
+            return Err(AccountError::RequiresReauthentication(account_id_owned));
+        }
+
         let refresh_token = file.accounts[acc_idx]
             .tokens
             .refresh_token
             .as_deref()
-            .ok_or_else(|| {
-                AccountError::RefreshFailed("No refresh_token available for this account".into())
-            })?;
+            .map(str::to_owned)
+            .ok_or_else(|| AccountError::RequiresReauthentication(account_id_owned.clone()))?;
 
         let form_body = form_urlencoded::Serializer::new(String::new())
             .append_pair("grant_type", "refresh_token")
             .append_pair("client_id", OPENAI_CLIENT_ID)
-            .append_pair("refresh_token", refresh_token)
+            .append_pair("refresh_token", &refresh_token)
             .finish();
 
         let resp = self
@@ -887,11 +1204,17 @@ impl AccountManager {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // Bound the error snippet too: `text()` buffers the whole body, and
-            // only a short message is ever shown.
             let err_text = read_bounded_error_text(resp).await;
+            let (code, message) = oauth_error_details(&err_text);
+            if is_reauthentication_code(code.as_deref(), status) {
+                return Err(AccountError::ReauthenticationRequired {
+                    account_id: account_id_owned,
+                    code: code.unwrap_or_else(|| "refresh_unauthorized".into()),
+                    message,
+                });
+            }
             return Err(AccountError::RefreshFailed(format!(
-                "HTTP {status}: {err_text}"
+                "HTTP {status}: {message}"
             )));
         }
 
@@ -899,34 +1222,79 @@ impl AccountManager {
         let new_access_token = token_resp
             .get("access_token")
             .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
             .map(String::from);
         let new_refresh_token = token_resp
             .get("refresh_token")
             .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
             .map(String::from);
         let new_id_token = token_resp
             .get("id_token")
             .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(String::from);
+        let response_account_id = token_resp
+            .get("account_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
             .map(String::from);
 
+        let new_access_token = new_access_token.ok_or_else(|| {
+            AccountError::RefreshFailed(
+                "the token endpoint returned 200 without a usable access_token".into(),
+            )
+        })?;
+
         let acc = &mut file.accounts[acc_idx];
-        if let Some(at) = new_access_token {
-            acc.tokens.access_token = Some(at);
-        }
+        acc.tokens.access_token = Some(new_access_token);
         if let Some(rt) = new_refresh_token {
             acc.tokens.refresh_token = Some(rt);
         }
         if let Some(it) = new_id_token {
-            if let Ok(profile) = parse_id_token_claims(&it) {
-                if profile.email.is_some() {
-                    acc.email = profile.email;
+            let profile = parse_id_token_claims(&it).map_err(|error| {
+                AccountError::RefreshFailed(format!("the refreshed id_token is invalid: {error}"))
+            })?;
+            if let (Some(old), Some(new)) = (&acc.email, &profile.email)
+                && !old.eq_ignore_ascii_case(new)
+            {
+                return Err(AccountError::AccountIdentityMismatch(format!(
+                    "email changed from `{old}` to `{new}`"
+                )));
+            }
+            if let Some(new_account_id) = profile.chatgpt_account_id.as_deref() {
+                if let Some(old) = acc.account_id.as_deref()
+                    && old != new_account_id
+                {
+                    return Err(AccountError::AccountIdentityMismatch(format!(
+                        "account id changed from `{old}` to `{new_account_id}`"
+                    )));
                 }
-                if profile.plan_type.is_some() {
-                    acc.plan_type = profile.plan_type;
-                }
+                acc.account_id = Some(new_account_id.to_owned());
+                acc.tokens.account_id = Some(new_account_id.to_owned());
+            }
+            if let Some(email) = profile.email {
+                acc.email = Some(email);
+            }
+            if profile.plan_type.is_some() {
+                acc.plan_type = profile.plan_type;
             }
             acc.tokens.id_token = Some(it);
         }
+        if let Some(new_account_id) = response_account_id {
+            if let Some(old) = acc.account_id.as_deref()
+                && old != new_account_id
+            {
+                return Err(AccountError::AccountIdentityMismatch(format!(
+                    "account id changed from `{old}` to `{new_account_id}`"
+                )));
+            }
+            acc.account_id = Some(new_account_id.clone());
+            acc.tokens.account_id = Some(new_account_id);
+        }
+        acc.credential_state = CredentialState::Ready;
+        acc.credential_issue = None;
+        acc.usage_issue = None;
         acc.last_refresh = Some(chrono_iso_now());
         acc.updated_at = now_secs();
 
@@ -937,54 +1305,32 @@ impl AccountManager {
             .await
             .map_err(|error| AccountError::RefreshFailed(error.to_string()))??;
 
-        // If this refreshed account happens to be the active one in auth.json, sync it
-        let active = self.check_active_status().unwrap_or(ActiveAccountStatus {
-            is_logged_in: false,
-            email: None,
-            plan_type: None,
-            account_id: None,
-            matched_account_id: None,
-            auth_mode: None,
-        });
-        if active.matched_account_id.as_deref() == Some(account_id) {
-            // The refresh just persisted new tokens for the account Codex is
-            // logged in as, so `auth.json` must be re-synced or Codex keeps
-            // presenting the old (expired) access token and stays broken.
-            // Swallowing this error hid that: the refresh looked successful while
-            // the live session was left stale.
-            self.switch_to_account(account_id).map_err(|error| {
-                AccountError::RefreshFailed(format!(
-                    "refreshed the stored tokens for `{account_id}` but could not update \
-                     auth.json, so Codex will keep using the expired access token: {error}"
-                ))
-            })?;
-        }
-
         Ok(updated_acc)
     }
 
-    /// Fetch usage / rate limits for a given account. If 401 Unauthorized is returned,
-    /// attempt token refresh and retry once.
+    /// Fetch usage / rate limits for a given account. The active account uses
+    /// the live token from `auth.json`; inactive accounts may refresh their own
+    /// managed token, but never the active Codex-owned session.
     pub async fn fetch_usage(
         self: &Arc<Self>,
         account_id: &str,
     ) -> Result<AccountUsageSnapshot, AccountError> {
-        let account = {
-            let this = self.clone();
-            let account_id_owned = account_id.to_owned();
-            tokio::task::spawn_blocking(move || {
-                let file = this.load_file()?;
-                file.accounts
-                    .into_iter()
-                    .find(|a| a.id == account_id_owned)
-                    .ok_or_else(|| AccountError::NotFound(account_id_owned))
-            })
-            .await
-            .map_err(|error| AccountError::UsageCheckFailed {
-                status: 500,
-                message: error.to_string(),
-            })??
-        };
+        let result = self.fetch_usage_inner(account_id).await;
+        if let Err(error) = &result
+            && let Err(record_error) = self.record_usage_failure_offloaded(account_id, error).await
+        {
+            eprintln!(
+                "codex-mp: could not persist usage failure for `{account_id}`: {record_error}"
+            );
+        }
+        result
+    }
+
+    async fn fetch_usage_inner(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> Result<AccountUsageSnapshot, AccountError> {
+        let (account, active_live_auth) = self.load_account_for_usage_offloaded(account_id).await?;
 
         match self.do_fetch_usage(&account).await {
             Ok(snapshot) => {
@@ -993,15 +1339,110 @@ impl AccountManager {
                 Ok(snapshot)
             }
             Err(AccountError::UsageCheckFailed { status: 401, .. }) => {
-                // Token might be expired, try refreshing
-                let refreshed = self.refresh_account_token(account_id).await?;
-                let snapshot = self.do_fetch_usage(&refreshed).await?;
+                // Codex may have rotated its live token between the first
+                // read and the 401. Re-read once, but never refresh it here.
+                let (latest, latest_is_active) =
+                    self.load_account_for_usage_offloaded(account_id).await?;
+                if latest_is_active && (active_live_auth || latest.tokens != account.tokens) {
+                    return self.retry_usage_once(account_id, latest).await;
+                }
+                if active_live_auth || latest_is_active {
+                    return Err(AccountError::ReauthenticationRequired {
+                        account_id: account_id.to_owned(),
+                        code: "live_session_unauthorized".into(),
+                        message: "the live Codex session was rejected by the usage endpoint".into(),
+                    });
+                }
+
+                // Another request may have completed a refresh while this one
+                // was waiting. Reuse its rotated token rather than refreshing
+                // a second time.
+                if latest.tokens != account.tokens {
+                    return self.retry_usage_once(account_id, latest).await;
+                }
+
+                let refreshed = self
+                    .refresh_account_token_if_unchanged(account_id, &account.tokens)
+                    .await?;
+                self.retry_usage_once(account_id, refreshed).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn retry_usage_once(
+        self: &Arc<Self>,
+        account_id: &str,
+        account: ManagedAccount,
+    ) -> Result<AccountUsageSnapshot, AccountError> {
+        match self.do_fetch_usage(&account).await {
+            Ok(snapshot) => {
                 self.save_usage_snapshot_offloaded(account_id, snapshot.clone())
                     .await?;
                 Ok(snapshot)
             }
-            Err(e) => Err(e),
+            Err(AccountError::UsageCheckFailed { status: 401, .. }) => {
+                Err(AccountError::ReauthenticationRequired {
+                    account_id: account_id.to_owned(),
+                    code: "usage_unauthorized".into(),
+                    message: "the usage endpoint rejected the refreshed credential".into(),
+                })
+            }
+            Err(error) => Err(error),
         }
+    }
+
+    fn load_account_for_usage(
+        &self,
+        account_id: &str,
+    ) -> Result<(ManagedAccount, bool), AccountError> {
+        let file = self.load_file()?;
+        let account = file
+            .accounts
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| AccountError::NotFound(account_id.to_owned()))?;
+        let active = self.check_active_status()?;
+        if active.is_logged_in
+            && active.auth_mode.as_deref() == Some("chatgpt")
+            && active.matched_account_id.as_deref() == Some(account_id)
+        {
+            let _auth_lock = FileLock::acquire(self.auth_json_path())?;
+            let auth = self
+                .read_active_auth()?
+                .ok_or_else(|| AccountError::AuthJsonInvalid("auth.json disappeared".into()))?;
+            let tokens_value = auth
+                .get("tokens")
+                .cloned()
+                .ok_or_else(|| AccountError::AuthJsonInvalid("tokens field missing".into()))?;
+            let live_tokens: AccountTokens =
+                serde_json::from_value(tokens_value).map_err(|error| {
+                    AccountError::AuthJsonInvalid(format!("invalid tokens: {error}"))
+                })?;
+            if live_tokens.has_usable_credentials() {
+                let mut live_account = account;
+                if live_tokens.account_id.is_some() {
+                    live_account.account_id = live_tokens.account_id.clone();
+                }
+                live_account.tokens = live_tokens;
+                return Ok((live_account, true));
+            }
+        }
+        Ok((account, false))
+    }
+
+    async fn load_account_for_usage_offloaded(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> Result<(ManagedAccount, bool), AccountError> {
+        let this = self.clone();
+        let account_id = account_id.to_owned();
+        tokio::task::spawn_blocking(move || this.load_account_for_usage(&account_id))
+            .await
+            .map_err(|error| AccountError::UsageCheckFailed {
+                status: 500,
+                message: error.to_string(),
+            })?
     }
 
     /// `save_usage_snapshot` is keyring-backed, so it must not run on an async
@@ -1019,6 +1460,58 @@ impl AccountManager {
                 status: 500,
                 message: error.to_string(),
             })?
+    }
+
+    async fn record_usage_failure_offloaded(
+        self: &Arc<Self>,
+        account_id: &str,
+        error: &AccountError,
+    ) -> Result<(), AccountError> {
+        let issue = AccountIssue {
+            code: error.public_code().to_owned(),
+            message: error.public_message(),
+            occurred_at: now_secs(),
+        };
+        let needs_reauth = issue.code == "reauth_required";
+        let this = self.clone();
+        let account_id = account_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            this.record_usage_failure(&account_id, issue, needs_reauth)
+        })
+        .await
+        .map_err(|error| AccountError::UsageCheckFailed {
+            status: 500,
+            message: error.to_string(),
+        })?
+    }
+
+    fn record_usage_failure(
+        &self,
+        account_id: &str,
+        issue: AccountIssue,
+        needs_reauth: bool,
+    ) -> Result<(), AccountError> {
+        let (mut file, _lock) = self.load_file_locked()?;
+        if let Some(account) = file
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+        {
+            // A slower failed request must not overwrite a successful usage
+            // snapshot or a newer credential rotation that completed after it
+            // started.
+            if account.updated_at > issue.occurred_at {
+                return Ok(());
+            }
+            account.usage_issue = Some(issue.clone());
+            if needs_reauth {
+                account.credential_state = CredentialState::NeedsReauth;
+                account.credential_issue = Some(issue);
+            }
+            account.updated_at = now_secs();
+            self.save_file(&file)?;
+        }
+        Ok(())
     }
 
     async fn do_fetch_usage(
@@ -1065,6 +1558,7 @@ impl AccountManager {
         let (mut file, _lock) = self.load_file_locked()?;
         if let Some(acc) = file.accounts.iter_mut().find(|a| a.id == account_id) {
             acc.usage = Some(snapshot);
+            acc.usage_issue = None;
             acc.updated_at = now_secs();
             self.save_file(&file)?;
         }
@@ -1218,6 +1712,60 @@ pub fn parse_id_token_claims(id_token: &str) -> Result<ProfileInfo, AccountError
     })
 }
 
+/// Validate the minimum identity and credential material required for a
+/// managed official account. JWT signatures are still validated by OpenAI when
+/// the token is used; this local check only prevents obviously incomplete or
+/// malformed imports from becoming indistinguishable from a healthy account.
+fn validate_import_tokens(tokens: &AccountTokens) -> Result<ProfileInfo, AccountError> {
+    if !tokens.has_usable_credentials() {
+        return Err(AccountError::InvalidToken(
+            "an account import must contain an access_token or refresh_token".into(),
+        ));
+    }
+
+    let profile = match tokens.id_token.as_deref() {
+        Some(id_token) => parse_id_token_claims(id_token)?,
+        None => ProfileInfo::default(),
+    };
+    if let (Some(explicit), Some(claimed)) = (
+        tokens.account_id.as_deref(),
+        profile.chatgpt_account_id.as_deref(),
+    ) && explicit != claimed
+    {
+        return Err(AccountError::InvalidToken(
+            "the supplied account_id does not match the id_token identity".into(),
+        ));
+    }
+    let has_identity = tokens.account_id.is_some()
+        || profile.email.is_some()
+        || profile.chatgpt_account_id.is_some();
+    if !has_identity {
+        return Err(AccountError::InvalidToken(
+            "an account import must contain an account_id or a parseable id_token identity".into(),
+        ));
+    }
+    Ok(profile)
+}
+
+fn parse_usage_window(value: &serde_json::Value) -> Option<UsageWindow> {
+    let used = value.get("used_percent").and_then(|value| value.as_u64())?;
+    let window_secs = value
+        .get("limit_window_seconds")
+        .and_then(|value| value.as_u64())?;
+    Some(UsageWindow {
+        used_percent: used.min(100) as u32,
+        limit_window_seconds: window_secs,
+        reset_after_seconds: value
+            .get("reset_after_seconds")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        reset_at: value
+            .get("reset_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+    })
+}
+
 pub fn parse_wham_usage_response(val: &serde_json::Value) -> AccountUsageSnapshot {
     let plan_type = val
         .get("plan_type")
@@ -1228,46 +1776,17 @@ pub fn parse_wham_usage_response(val: &serde_json::Value) -> AccountUsageSnapsho
     let mut secondary_weekly: Option<UsageWindow> = None;
 
     if let Some(rate_limit) = val.get("rate_limit") {
-        if let Some(pw) = rate_limit.get("primary_window") {
-            let window_secs = pw
-                .get("limit_window_seconds")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let used = pw.get("used_percent").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let reset_after = pw
-                .get("reset_after_seconds")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let reset_at = pw.get("reset_at").and_then(|v| v.as_u64()).unwrap_or(0);
-            let w = UsageWindow {
-                used_percent: used,
-                limit_window_seconds: window_secs,
-                reset_after_seconds: reset_after,
-                reset_at,
-            };
-            if window_secs <= 18000 {
-                primary_5h = Some(w);
+        if let Some(pw) = rate_limit.get("primary_window")
+            && let Some(window) = parse_usage_window(pw)
+        {
+            if window.limit_window_seconds <= 18000 {
+                primary_5h = Some(window);
             } else {
-                secondary_weekly = Some(w);
+                secondary_weekly = Some(window);
             }
         }
         if let Some(sw) = rate_limit.get("secondary_window").filter(|v| !v.is_null()) {
-            let window_secs = sw
-                .get("limit_window_seconds")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let used = sw.get("used_percent").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let reset_after = sw
-                .get("reset_after_seconds")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let reset_at = sw.get("reset_at").and_then(|v| v.as_u64()).unwrap_or(0);
-            secondary_weekly = Some(UsageWindow {
-                used_percent: used,
-                limit_window_seconds: window_secs,
-                reset_after_seconds: reset_after,
-                reset_at,
-            });
+            secondary_weekly = parse_usage_window(sw);
         }
     }
 
@@ -1292,7 +1811,7 @@ pub fn parse_wham_usage_response(val: &serde_json::Value) -> AccountUsageSnapsho
                 let used = pw
                     .and_then(|p| p.get("used_percent"))
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                    .map(|v| v.min(100) as u32);
                 let reset_after = pw
                     .and_then(|p| p.get("reset_after_seconds"))
                     .and_then(|v| v.as_u64());
@@ -2073,6 +2592,143 @@ mod tests {
         assert!(parsed.reserve.is_some());
         assert!(parsed.reserve.as_ref().unwrap().limit_reached);
         assert_eq!(parsed.reserve.as_ref().unwrap().used_percent, Some(100));
+
+        let malformed = parse_wham_usage_response(&serde_json::json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 110}
+            }
+        }));
+        assert!(malformed.primary_5h.is_none());
+        assert!(malformed.secondary_weekly.is_none());
+    }
+
+    #[test]
+    fn active_status_requires_official_auth_mode_and_usable_identity() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex_home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let manager = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
+
+        fs::write(
+            manager.auth_json_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "api_key",
+                "tokens": {"access_token": "not-an-official-session"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let status = manager.check_active_status().unwrap();
+        assert!(!status.is_logged_in);
+        assert_eq!(status.auth_mode.as_deref(), Some("api_key"));
+
+        fs::write(
+            manager.auth_json_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "not-enough-identity"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!manager.check_active_status().unwrap().is_logged_in);
+    }
+
+    #[test]
+    fn account_import_rejects_incomplete_identity_and_marks_access_only() {
+        let dir = tempdir().unwrap();
+        let manager = AccountManager::with_credential_store(
+            dir.path().join("accounts.json"),
+            dir.path().join("codex_home"),
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
+
+        let incomplete = manager.import_or_update_account(
+            AccountTokens {
+                id_token: None,
+                access_token: Some("access-only".into()),
+                refresh_token: None,
+                account_id: None,
+            },
+            None,
+            Some("Incomplete".into()),
+        );
+        assert!(matches!(incomplete, Err(AccountError::InvalidToken(_))));
+
+        let account = manager
+            .import_or_update_account(
+                AccountTokens {
+                    id_token: None,
+                    access_token: Some("access-only".into()),
+                    refresh_token: None,
+                    account_id: Some("account-1".into()),
+                },
+                None,
+                Some("Access only".into()),
+            )
+            .unwrap();
+        assert_eq!(account.credential_state, CredentialState::AccessOnly);
+    }
+
+    #[test]
+    fn usage_loader_prefers_live_auth_for_the_active_account() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("accounts.json");
+        let codex_home = dir.path().join("codex_home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let manager = AccountManager::with_credential_store(
+            &store_path,
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        );
+
+        let account = manager
+            .import_or_update_account(
+                AccountTokens {
+                    id_token: None,
+                    access_token: Some("managed-access".into()),
+                    refresh_token: Some("managed-refresh".into()),
+                    account_id: Some("account-1".into()),
+                },
+                None,
+                Some("Primary".into()),
+            )
+            .unwrap();
+        fs::write(
+            manager.auth_json_path(),
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "live-access",
+                    "refresh_token": "live-refresh",
+                    "account_id": "account-1"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (loaded, is_active) = manager.load_account_for_usage(&account.id).unwrap();
+        assert!(is_active);
+        assert_eq!(loaded.tokens.access_token.as_deref(), Some("live-access"));
+        assert_eq!(loaded.tokens.refresh_token.as_deref(), Some("live-refresh"));
+    }
+
+    #[test]
+    fn invalidated_refresh_is_publicly_classified_as_reauth() {
+        let error = AccountError::ReauthenticationRequired {
+            account_id: "account-1".into(),
+            code: "refresh_token_invalidated".into(),
+            message: "Your session has ended".into(),
+        };
+        assert_eq!(error.public_code(), "reauth_required");
+        assert!(error.public_message().contains("重新登录"));
+        assert!(!error.public_message().contains("Your session has ended"));
     }
 
     #[test]

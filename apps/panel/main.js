@@ -1077,13 +1077,13 @@ function wavyStateClass(percent) {
 
 // Primary quota uses the Expressive wavy indicator; secondary rows use the
 // compact 4dp linear one.
-function renderUsageMetric(title, windowData, { variant = "linear" } = {}) {
+function renderUsageMetric(title, windowData, { variant = "linear", emptyLabel = "无数据 / 未开启" } = {}) {
   if (!windowData) {
     return `
       <div class="m3-progress">
         <div class="m3-progress__head">
           <span class="m3-label-medium">${escapeHtml(title)}</span>
-          <span class="m3-body-small m3-text-muted">无数据 / 未开启</span>
+          <span class="m3-body-small m3-text-muted">${escapeHtml(emptyLabel)}</span>
         </div>
         <div class="m3-progress__track">
           <div class="m3-progress__indicator" style="--m3-progress-value: 0"></div>
@@ -1159,6 +1159,28 @@ function renderReserveMetric(reserve) {
     used_percent: percent,
     reset_after_seconds: reserve.reset_after_seconds,
   });
+}
+
+function formatUsageUpdatedAt(seconds) {
+  if (!seconds) return "";
+  const date = new Date(Number(seconds) * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return `上次成功查询：${date.toLocaleString()}`;
+}
+
+function usageStatusLabel(acc) {
+  switch (acc.usage_status) {
+    case "fresh":
+      return formatUsageUpdatedAt(acc.usage && acc.usage.updated_at) || "额度已更新";
+    case "stale":
+      return `${formatUsageUpdatedAt(acc.usage && acc.usage.updated_at) || "已有历史额度"}，当前查询失败`;
+    case "reauth_required":
+      return "额度查询需要重新登录官方账号";
+    case "error":
+      return "额度查询失败，尚无可显示的成功数据";
+    default:
+      return "尚未成功查询额度";
+  }
 }
 
 // --- state placeholders ----------------------------------------------------
@@ -1503,6 +1525,13 @@ function renderAccountCard(acc) {
   const planLabel = knownPlanClasses.has(plan) ? plan.toUpperCase() : "方案未知";
   const planClass = sanitizePlanClass(plan);
   const usage = acc.usage;
+  const credentialNeedsReauth = acc.credential_state === "needs_reauth";
+  const credentialNotice = credentialNeedsReauth
+    ? (acc.credential_issue && acc.credential_issue.message)
+      || "托管凭证已失效，请重新登录后保存当前账号。"
+    : (acc.credential_state === "access_only"
+      ? "当前仅保存了访问令牌，令牌过期后需要重新保存当前账号。"
+      : "");
 
   card.innerHTML = `
     <div class="m3-account-card-header">
@@ -1520,6 +1549,11 @@ function renderAccountCard(acc) {
       ${renderUsageMetric("5 小时窗口额度", usage ? usage.primary_5h : null)}
       ${renderUsageMetric("7 天周额度", usage ? usage.secondary_weekly : null)}
       ${renderReserveMetric(usage ? usage.reserve : null)}
+    </div>
+
+    <div class="m3-account-health m3-body-small ${credentialNeedsReauth ? "m3-text-error" : "m3-text-variant"}">
+      <span>${escapeHtml(credentialNotice || usageStatusLabel(acc))}</span>
+      ${credentialNeedsReauth ? '<button class="m3-btn m3-btn-outlined m3-btn-xs recapture-account-btn" type="button">重新保存当前账号</button>' : ""}
     </div>
 
     <div class="m3-account-actions">
@@ -1547,6 +1581,9 @@ function renderAccountCard(acc) {
   `;
 
   applyTooltips(card);
+
+  const recaptureBtn = card.querySelector(".recapture-account-btn");
+  if (recaptureBtn) recaptureBtn.onclick = () => handleCaptureAccount();
 
   const switchBtn = card.querySelector(".switch-acc-btn");
   if (switchBtn) {
@@ -1647,7 +1684,7 @@ async function refreshAccounts() {
     cachedAccounts = accounts || [];
 
     // 总览：当前生效账号
-    if (active && active.is_logged_in && active.email) {
+    if (active && active.is_logged_in && active.auth_mode === "chatgpt" && active.email) {
       metricVal.textContent = active.email;
       const activePlan = String(active.plan_type || "").trim().toLowerCase();
       metricPlan.textContent = "方案: " + (knownPlanClasses.has(activePlan) ? activePlan.toUpperCase() : "未知");
@@ -1659,14 +1696,19 @@ async function refreshAccounts() {
     // 总览：即时额度
     const activeAccObj = cachedAccounts.find((a) => a.is_active);
     if (activeAccObj && activeAccObj.usage) {
+      const activeHealth = activeAccObj.credential_state === "needs_reauth"
+        ? (activeAccObj.credential_issue && activeAccObj.credential_issue.message)
+          || "托管凭证已失效，请重新登录后保存当前账号。"
+        : usageStatusLabel(activeAccObj);
       overviewUsageContainer.innerHTML = `
         <div class="m3-usage-grid">
           ${renderUsageMetric("5 小时窗口额度", activeAccObj.usage.primary_5h, { variant: "wavy" })}
           ${renderUsageMetric("7 天周额度", activeAccObj.usage.secondary_weekly, { variant: "wavy" })}
           ${renderReserveMetric(activeAccObj.usage.reserve)}
         </div>
+        <p class="m3-body-small ${activeAccObj.credential_state === "needs_reauth" ? "m3-text-error" : "m3-text-variant"}">${escapeHtml(activeHealth)}</p>
       `;
-    } else if (active && active.is_logged_in) {
+    } else if (active && active.is_logged_in && active.auth_mode === "chatgpt") {
       overviewUsageContainer.innerHTML = `
         <p class="m3-body-medium m3-text-variant">
           当前正生效账号：<strong>${escapeHtml(active.email)}</strong>（${escapeHtml(knownPlanClasses.has(String(active.plan_type || "").trim().toLowerCase()) ? String(active.plan_type).toUpperCase() : "方案未知")}）。请保存当前账号后查看精准额度。
@@ -2559,11 +2601,11 @@ importForm.addEventListener("submit", async (e) => {
     const payload = {
       name: name ? String(name).trim() : null,
       auth_json: parsed.tokens ? parsed : null,
-      tokens: parsed.tokens ? null : (parsed.access_token || parsed.id_token ? parsed : null),
+      tokens: parsed.tokens ? null : (parsed.access_token || parsed.refresh_token ? parsed : null),
     };
 
     if (!payload.auth_json && !payload.tokens) {
-      throw new Error("JSON 中既未包含 tokens 对象，也未包含 access_token/id_token 字段");
+      throw new Error("JSON 中既未包含 tokens 对象，也未包含 access_token/refresh_token 字段");
     }
 
     const res = await api("/api/v1/accounts/import", {

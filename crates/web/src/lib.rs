@@ -1854,6 +1854,15 @@ async fn api_import_account(
     let (tokens, last_refresh) = if let Some(t) = payload.tokens {
         (t, None)
     } else if let Some(aj) = payload.auth_json {
+        if aj.get("auth_mode").and_then(|value| value.as_str()) != Some("chatgpt") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "auth_json must use the official `chatgpt` auth_mode"
+                })),
+            )
+                .into_response();
+        }
         let tokens_obj = match aj.get("tokens") {
             Some(tok) => tok.clone(),
             None => {
@@ -1923,7 +1932,11 @@ async fn api_switch_account(
             .switch_to_account(&account_id)
             .map_err(|e| e.to_string())?;
         let restart_report = if restart_codex {
-            accounts.restart_codex_processes().ok()
+            Some(
+                accounts
+                    .restart_codex_processes()
+                    .map_err(|e| e.to_string())?,
+            )
         } else {
             None
         };
@@ -2019,20 +2032,30 @@ async fn api_fetch_account_usage(
     State(state): State<WebState>,
     axum::extract::Path(account_id): axum::extract::Path<String>,
 ) -> Response {
-    // `fetch_usage` builds its own blocking boundary for the keyring work it
-    // does, but it is still an async fn on `AccountManager`.
-    let accounts = state.accounts.clone();
-    let result = tokio::spawn(async move { accounts.fetch_usage(&account_id).await })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()));
+    let result = state.accounts.fetch_usage(&account_id).await;
     match result {
         Ok(snapshot) => Json(snapshot).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(error) => {
+            let code = error.public_code();
+            let status = match code {
+                "reauth_required" => StatusCode::CONFLICT,
+                "usage_rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+                // This is the managed account's OAuth status, not the panel's
+                // browser session. A 401 would make the SPA open its admin
+                // login dialog and hide the real account repair action.
+                "usage_unauthorized" => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": code,
+                    "message": error.public_message(),
+                    "account_id": account_id,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2995,7 +3018,8 @@ mod tests {
                 "auth_mode": "chatgpt",
                 "tokens": {
                     "access_token": "access-secret",
-                    "refresh_token": "refresh-secret"
+                    "refresh_token": "refresh-secret",
+                    "account_id": "account-secret-test"
                 }
             }))
             .unwrap(),
