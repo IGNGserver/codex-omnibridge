@@ -1284,7 +1284,19 @@ async fn api_catalog_sync(State(state): State<WebState>) -> Response {
         )
             .into_response();
     }
-    Json(serde_json::json!({"catalog_path": clean_verbatim_path(&paths.catalog).display().to_string()})).into_response()
+    // `build_and_install` refreshes the official model allow-list in the
+    // registry as part of the catalog transaction. A running Router keeps an
+    // immutable in-memory snapshot, however, so it must reload *after* the
+    // transaction has committed. Reloading only after provider/model edits
+    // leaves the custom route working while newly discovered official models
+    // still return `model ... was not found` until the next restart.
+    let reload_warning = reload_router_if_running(&state).await;
+    mutation_response(
+        serde_json::json!({
+            "catalog_path": clean_verbatim_path(&paths.catalog).display().to_string()
+        }),
+        reload_warning,
+    )
 }
 
 async fn api_list_providers(State(state): State<WebState>) -> Response {
@@ -1329,7 +1341,7 @@ fn mutation_response(payload: serde_json::Value, reload_warning: Option<String>)
 /// The registry file is already saved, so a later Router start picks the change
 /// up regardless. But a *failed* reload means a currently-running Router keeps
 /// serving the previous revision: the panel reports success while the model the
-/// user just added returns 404. That used to be discarded with `let _ =`, so
+/// user just changed returns 404. That used to be discarded with `let _ =`, so
 /// nothing anywhere recorded it. The failure is now logged and surfaced to the
 /// caller's response so the operator knows the Router must be restarted.
 async fn reload_router_if_running(state: &WebState) -> Option<String> {
@@ -1338,7 +1350,7 @@ async fn reload_router_if_running(state: &WebState) -> Option<String> {
         Ok(()) => None,
         Err(error) => {
             eprintln!(
-                "codex-mp: the provider change was saved, but the running router did not \
+                "codex-mp: the registry change was saved, but the running router did not \
                  reload it ({error}); restart the router to apply it"
             );
             Some(error.to_string())
@@ -2623,6 +2635,82 @@ mod tests {
             body.get("router_reload_warning").is_some(),
             "a failed reload must be reported to the panel: {body}"
         );
+    }
+
+    /// Regression: catalog sync updates the official model allow-list after a
+    /// provider/model mutation has already reloaded the Router. Without a
+    /// second reload here, the running Router keeps the old allow-list: the
+    /// custom model works, but switching to a newly discovered official model
+    /// returns `model ... was not found` until the next restart.
+    #[tokio::test]
+    async fn catalog_sync_reloads_after_committing_official_model_ids() {
+        let dir = tempdir().unwrap();
+        let registry_path = dir.path().join("providers.json");
+        ProviderRegistry::empty(&registry_path).save().unwrap();
+
+        // `build_and_install` invokes the configured Codex binary for both
+        // `--version` and `debug models`; this tiny executable supplies a
+        // schema-valid official catalog for both calls.
+        let official_catalog = r#"{"models":[{"slug":"gpt-5.6-luna","display_name":"GPT-5.6 Luna","shell_type":"unified_exec","model_messages":{"persistent_instructions":"safe","instructions_template":"safe"},"supported_reasoning_levels":[{"effort":"low","description":"low"}],"supports_search_tool":false,"experimental_supported_tools":[]}]}"#;
+        let fake_codex = dir.path().join(if cfg!(windows) {
+            "fake-codex.cmd"
+        } else {
+            "fake-codex"
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                &fake_codex,
+                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", official_catalog),
+            )
+            .unwrap();
+            fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            fs::write(
+                &fake_codex,
+                format!("@echo off\r\necho {}\r\n", official_catalog),
+            )
+            .unwrap();
+        }
+
+        // A dead but well-formed endpoint lets the test observe that the
+        // handler attempted the post-commit reload. The catalog transaction
+        // itself must still succeed and return HTTP 200 with a warning.
+        let endpoint_file = dir.path().join("router-endpoint.json");
+        fs::write(
+            &endpoint_file,
+            serde_json::json!({
+                "schema_version": 1,
+                "base_url": "http://127.0.0.1:1",
+                "capability_token": "test-capability"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = WebState::with_local_token(
+            registry_path.clone(),
+            endpoint_file,
+            PathBuf::from("codex-mp"),
+            fake_codex,
+            "test-local-token".to_owned(),
+        );
+
+        let response = api_catalog_sync(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body.get("router_reload_warning").is_some(),
+            "catalog sync must report a failed post-commit reload: {body}"
+        );
+
+        let registry = ProviderRegistry::load(registry_path).unwrap();
+        assert_eq!(registry.official_model_ids(), &["gpt-5.6-luna"]);
     }
 
     /// Regression: the panel calls `ProviderManager`'s mutating methods directly

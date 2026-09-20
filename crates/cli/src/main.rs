@@ -411,8 +411,8 @@ async fn main() -> Result<()> {
         Command::Models => list_models(&registry_path, &cli.codex_bin),
         Command::Setup => setup_guide(),
         Command::Doctor => doctor(&registry_path, &cli.codex_bin),
-        Command::Sync => sync(&registry_path, &cli.codex_bin),
-        Command::Repair => repair_integration(&registry_path, &cli.codex_bin),
+        Command::Sync => sync(&registry_path, &cli.codex_bin).await,
+        Command::Repair => repair_integration(&registry_path, &cli.codex_bin).await,
         Command::Restore => restore_integration(&registry_path),
         Command::Uninstall(args) => uninstall(&registry_path, args).await,
         Command::Status => status(&registry_path, &cli.codex_bin),
@@ -756,11 +756,16 @@ fn list_models(path: &PathBuf, codex_bin: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync(path: &PathBuf, codex_bin: &Path) -> Result<()> {
+async fn sync(path: &PathBuf, codex_bin: &Path) -> Result<()> {
     let registry = ProviderRegistry::load(path)?;
     let paths = IntegrationPaths::for_registry(path);
     let catalog_binary = catalog_binary_for(path, codex_bin)?;
     let manifest = build_and_install(&paths, &registry, &catalog_binary)?;
+    // `sync` updates the official model allow-list as part of the catalog
+    // transaction. A running Router serves an in-memory snapshot, so reload it
+    // only after the transaction commits; otherwise custom models may continue
+    // to work while newly discovered official models 404 until a restart.
+    reload_running_router(path).await?;
     println!("merged catalog: {}", paths.catalog.display());
     println!(
         "managed Codex field: {} = {}",
@@ -770,11 +775,12 @@ fn sync(path: &PathBuf, codex_bin: &Path) -> Result<()> {
     Ok(())
 }
 
-fn repair_integration(path: &PathBuf, codex_bin: &Path) -> Result<()> {
+async fn repair_integration(path: &PathBuf, codex_bin: &Path) -> Result<()> {
     let registry = ProviderRegistry::load(path)?;
     let paths = IntegrationPaths::for_registry(path);
     let catalog_binary = catalog_binary_for(path, codex_bin)?;
     let manifest = repair(&paths, &registry, &catalog_binary)?;
+    reload_running_router(path).await?;
     println!(
         "repaired catalog integration for {}",
         manifest.codex_version.as_deref().unwrap_or("unknown Codex")
