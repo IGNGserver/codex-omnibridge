@@ -910,11 +910,20 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), std::io::Er
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    // Apply the private mode/DACL while the file is still the uniquely named
+    // temporary file. On Windows, setting the DACL after replacing the live
+    // destination can race with a reader or the platform scanner and return
+    // ERROR_ACCESS_DENIED under concurrent registry updates. Securing the
+    // temporary file first preserves the same invariant without touching the
+    // destination after the atomic replacement.
+    if let Err(error) = set_private_permissions(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     if let Err(error) = atomic_replace(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    set_private_permissions(path)?;
     // Make the rename itself durable, so a crash cannot lose the directory entry
     // while a later write survives.
     #[cfg(unix)]
