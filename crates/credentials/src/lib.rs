@@ -18,50 +18,6 @@ use thiserror::Error;
 
 const DEFAULT_SERVICE: &str = "dev.codex-multiprovider";
 
-fn set_private_file_permissions(path: &std::path::Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(windows)]
-    {
-        let system_dir = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "SystemRoot is not set; cannot secure the credential fallback",
-                )
-            })?
-            .join("System32");
-        let principal = std::process::Command::new(system_dir.join("whoami.exe"))
-            .output()?
-            .stdout;
-        let principal = String::from_utf8_lossy(&principal).trim().to_owned();
-        if principal.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "whoami.exe returned no Windows principal",
-            ));
-        }
-        let output = std::process::Command::new(system_dir.join("icacls.exe"))
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{principal}:F"))
-            .output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            ));
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    let _ = path;
-    Ok(())
-}
-
 /// References already reported as served by an environment override.
 ///
 /// Compares against nothing but its own contents, so it is only used to keep the
@@ -119,7 +75,7 @@ fn write_private_json_atomic(path: &Path, contents: &str) -> Result<(), std::io:
                     let _ = fs::remove_file(&temporary);
                     return Err(error);
                 }
-                set_private_file_permissions(path)?;
+                codex_mp_core::set_private_permissions(path)?;
                 #[cfg(unix)]
                 fs::File::open(parent)?.sync_all()?;
                 return Ok(());
@@ -346,12 +302,11 @@ impl CredentialStore for NativeCredentialStore {
             && let Ok(_guard) = codex_mp_core::FileLock::acquire(&fallback_file)
             && let Ok(s) = fs::read_to_string(&fallback_file)
             && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
+            && map.remove(reference).is_some()
         {
-            if map.remove(reference).is_some() {
-                removed_from_file = true;
-                if let Ok(json_str) = serde_json::to_string(&map) {
-                    let _ = write_private_json_atomic(&fallback_file, &json_str);
-                }
+            removed_from_file = true;
+            if let Ok(json_str) = serde_json::to_string(&map) {
+                let _ = write_private_json_atomic(&fallback_file, &json_str);
             }
         }
 

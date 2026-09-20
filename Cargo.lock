@@ -597,7 +597,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codex-mp-catalog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codex-mp-core",
  "serde",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "libc",
@@ -645,11 +645,12 @@ dependencies = [
  "thiserror",
  "url",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "codex-mp-credentials"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codex-mp-core",
  "keyring",
@@ -661,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codex-mp-core",
  "directories",
@@ -675,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-integration"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "codex-mp-catalog",
@@ -693,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-manager"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "codex-mp-core",
@@ -714,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-protocol-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -729,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "brotli",
@@ -756,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "codex-mp-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
