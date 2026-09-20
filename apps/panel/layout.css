@@ -760,6 +760,14 @@
   border-radius: var(--md-sys-shape-corner-small);
 }
 
+.m3-account-health {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--md-sys-space-8);
+  flex-wrap: wrap;
+}
+
 .m3-account-actions {
   display: flex;
   align-items: center;
