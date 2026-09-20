@@ -739,11 +739,25 @@ impl FileLock {
                 .open(&path)
             {
                 Ok(mut handle) => {
-                    handle.write_all(std::process::id().to_string().as_bytes())?;
+                    if let Err(error) = handle.write_all(std::process::id().to_string().as_bytes())
+                    {
+                        drop(handle);
+                        remove_file_with_retries(&path);
+                        if !is_transient_file_lock_error(&error)
+                            || std::time::Instant::now() >= deadline
+                        {
+                            return Err(error);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        continue;
+                    }
                     with_held_locks(|held| held.insert(path.clone(), current_thread));
                     return Ok(Self { path, owner: true });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        || is_transient_file_lock_error(&error) =>
+                {
                     if lock_is_abandoned(&path) {
                         // Reclaim by *renaming* to a unique name: `rename` is
                         // atomic, so exactly one waiter wins and the others fall
@@ -754,11 +768,14 @@ impl FileLock {
                         // Someone else may have reclaimed it first; either way
                         // we simply retry `create_new`.
                         if fs::rename(&path, &stale).is_ok() {
-                            let _ = fs::remove_file(&stale);
+                            remove_file_with_retries(&stale);
                         }
                         continue;
                     }
                     if std::time::Instant::now() >= deadline {
+                        if error.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(error);
+                        }
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
                             format!("timed out waiting for lock `{}`", path.display()),
@@ -772,6 +789,38 @@ impl FileLock {
     }
 }
 
+/// Windows file scanners can briefly deny access while a lock file is being
+/// created or removed. These are contention errors, not evidence that the
+/// state directory is permanently unusable, so callers retry them within their
+/// existing bounded wait.
+fn is_transient_file_lock_error(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Remove a lock file while tolerating the same short Windows sharing window
+/// that can affect its creation. Failure remains best-effort: the PID and stale
+/// age checks will make an abandoned lock reclaimable later.
+fn remove_file_with_retries(path: &Path) {
+    const MAX_ATTEMPTS: usize = 20;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::remove_file(path) {
+            Ok(()) => return,
+            Err(error) if is_transient_file_lock_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
         if !self.owner {
@@ -781,7 +830,7 @@ impl Drop for FileLock {
         // Remove by path regardless of which thread is running this `Drop`: the
         // entry belongs to the guard, not to the thread that happens to drop it.
         with_held_locks(|held| held.remove(&self.path));
-        let _ = fs::remove_file(&self.path);
+        remove_file_with_retries(&self.path);
     }
 }
 
