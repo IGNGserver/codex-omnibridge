@@ -36,6 +36,7 @@ const selfBumping = [
   "add_provider(",
   "remove_provider(",
   "add_model(",
+  "edit_provider_with_auth(",
   "edit_model(",
   "remove_model(",
   "set_official_model_ids(",

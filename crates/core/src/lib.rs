@@ -1368,46 +1368,119 @@ pub fn set_private_permissions(path: &Path) -> Result<(), std::io::Error> {
     }
     #[cfg(windows)]
     {
-        // Windows has no portable std-only equivalent of mode 0600. Use the
-        // system ACL utility without a shell: remove inherited entries and
-        // grant the current Windows principal full access to this file.
-        let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "SystemRoot is not set; cannot secure a Windows private file",
-            )
-        })?;
-        let system_dir = PathBuf::from(system_root).join("System32");
-        let principal = std::process::Command::new(system_dir.join("whoami.exe"))
-            .output()?
-            .stdout;
-        let principal = String::from_utf8_lossy(&principal).trim().to_owned();
-        if principal.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "whoami.exe returned no Windows principal",
-            ));
-        }
-        let output = std::process::Command::new(system_dir.join("icacls.exe"))
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("{principal}:F"))
-            .output()?;
-        if !output.status.success() {
-            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                if message.is_empty() {
-                    "icacls.exe could not secure the private file".to_owned()
-                } else {
-                    message
-                },
-            ));
-        }
+        set_private_permissions_windows(path)?;
     }
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// Apply a private DACL without going through `whoami.exe`/`icacls.exe`.
+///
+/// Those utilities speak in the user's console code page. Decoding their
+/// output as UTF-8 and feeding the decoded account name back to `icacls`
+/// breaks as soon as a Windows account or computer name contains non-ASCII
+/// characters; the Router then exits before it can bind its loopback port.
+/// Using the current process token's SID keeps the whole operation Unicode- and
+/// locale-independent.
+#[cfg(windows)]
+fn set_private_permissions_windows(path: &Path) -> Result<(), std::io::Error> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    fn win32_error(code: u32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code as i32)
+    }
+
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let mut required = 0u32;
+        // The first call deliberately asks for the required buffer size.
+        let _ = unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required) };
+        if required == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // A u64-backed buffer gives TOKEN_USER the alignment it requires while
+        // still allowing Windows to return a variable-sized SID payload.
+        let words = (required as usize + size_of::<u64>() - 1) / size_of::<u64>();
+        let mut token_buffer = vec![0u64; words];
+        let mut returned = 0u32;
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                token_buffer.as_mut_ptr().cast::<c_void>(),
+                (token_buffer.len() * size_of::<u64>()) as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let token_user = unsafe { &*(token_buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+        unsafe { BuildTrusteeWithSidW(&mut trustee, token_user.User.Sid) };
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: 0,
+            Trustee: trustee,
+        };
+        let mut acl = null_mut();
+        let acl_status = unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) };
+        if acl_status != 0 {
+            return Err(win32_error(acl_status));
+        }
+
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let security_status = unsafe {
+            SetNamedSecurityInfoW(
+                path_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        unsafe {
+            let _ = LocalFree(acl.cast());
+        }
+        if security_status != 0 {
+            return Err(win32_error(security_status));
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
 }
 
 /// Strip Windows verbatim (`\\?\` or `\\?\UNC\`) prefix if present, returning a normal path.
@@ -2003,6 +2076,18 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_permissions_support_unicode_paths() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("能力文件-测试");
+        fs::write(&path, b"secret").unwrap();
+
+        set_private_permissions(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
     }
 
     #[test]

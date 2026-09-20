@@ -1,6 +1,6 @@
 {
   "name": "codex-omnibridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex OmniBridge - Native Desktop Application with Electron and Rust Core",
   "main": "apps/electron/main.js",
   "scripts": {

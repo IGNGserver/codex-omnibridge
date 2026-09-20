@@ -217,6 +217,9 @@ impl ProviderManager {
         self.edit_provider_with_auth(id, name, base_url, protocol, enabled, None, api_key)
     }
 
+    // Keep the mutation arguments explicit so the legacy `edit_provider`
+    // wrapper and the web API can share one atomic implementation.
+    #[allow(clippy::too_many_arguments)]
     pub fn edit_provider_with_auth(
         &self,
         id: &str,
