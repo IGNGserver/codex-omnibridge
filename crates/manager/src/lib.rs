@@ -12,9 +12,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
+use codex_mp_core::run_with_timeout;
 use codex_mp_core::{
     AuthStrategy, CoreError, CustomModel, ModelCapabilities, ModelEdit, ProviderConfig,
-    ProviderProtocol, ProviderRegistry,
+    ProviderProtocol, ProviderRegistry, read_to_string_limited,
 };
 use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
 use codex_mp_router::{CAPABILITY_HEADER, RouterEndpoint, RouterError, load_router_endpoint};
@@ -24,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -37,6 +40,12 @@ const STARTUP_LOCK_STALE: Duration = Duration::from_secs(120);
 /// Health/lifecycle probes must not block on a stale endpoint whose loopback
 /// port was since reallocated to a service that accepts and then stalls.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Registry reads run on Tokio's blocking pool, where a timed-out task cannot
+/// be cancelled. Keep one such probe alive at most and let startup release its
+/// cross-process lock if the underlying filesystem stalls.
+const REGISTRY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(windows)]
+const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Keep startup diagnostics useful without allowing a broken Router to fill
 /// memory or leak a credential into the web status response.
 const MAX_ROUTER_STARTUP_DIAGNOSTIC_BYTES: usize = 4 * 1024;
@@ -57,14 +66,22 @@ pub enum ProviderManagerError {
     MissingModelList,
     #[error("provider response contained no usable model ids")]
     EmptyModelList,
+    #[error("provider model discovery is unavailable: {0}")]
+    HttpClientUnavailable(String),
     #[error("model `{0}` was not returned by provider")]
     ModelNotDiscovered(String),
+    #[error("provider model metadata is invalid: {0}")]
+    InvalidModelMetadata(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveredModel {
     pub upstream_model_id: String,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,6 +112,10 @@ pub struct ProviderSummary {
 /// A model list is a small document; anything larger is a hostile or broken
 /// provider, and `text()` would buffer all of it into memory.
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DISCOVERED_MODELS: usize = 4096;
+const MAX_MODEL_ID_CHARS: usize = 512;
+const MAX_REASONING_LEVELS: usize = 32;
+const MAX_REASONING_LEVEL_CHARS: usize = 64;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -106,42 +127,20 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// receive the user's key verbatim for the `x-api-key` and custom-header auth
 /// strategies. A plain `Client::new()` also has no timeout, which let a hung
 /// provider wedge the panel request that triggered discovery.
-fn build_discovery_client() -> Client {
+fn build_discovery_client() -> Result<Client, String> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(DISCOVERY_TIMEOUT)
         .build()
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "codex-mp: could not build the hardened discovery client ({error}); \
-                 retrying without a request timeout"
-            );
-            // Keep the security-critical knob (no redirects) even in the retry.
-            Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| {
-                    // Last resort, and a genuine downgrade: `Client::new()` uses
-                    // reqwest's default policy, which FOLLOWS redirects, so a
-                    // provider could bounce the discovery request (and the API key
-                    // attached to it) to an arbitrary host. Say so loudly instead
-                    // of leaving a silent security regression — the router's
-                    // equivalent fallback already reports it in the same terms.
-                    eprintln!(
-                        "codex-mp: FATAL: no hardened discovery client available; \
-                         provider redirects will be followed during model discovery"
-                    );
-                    Client::new()
-                })
-        })
+        .map_err(|error| format!("could not build the hardened discovery client: {error}"))
 }
 
 pub struct ProviderManager {
     registry_path: PathBuf,
     credentials: Arc<dyn CredentialStore>,
-    http_client: Client,
+    http_client: Option<Client>,
+    http_client_error: Option<Arc<str>>,
 }
 
 impl ProviderManager {
@@ -153,10 +152,23 @@ impl ProviderManager {
         registry_path: impl Into<PathBuf>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        let (http_client, http_client_error) = match build_discovery_client() {
+            Ok(client) => (Some(client), None),
+            Err(error) => {
+                eprintln!("codex-mp: {error}; provider model discovery is unavailable");
+                (
+                    None,
+                    Some(Arc::<str>::from(format!(
+                        "provider model discovery unavailable: {error}"
+                    ))),
+                )
+            }
+        };
         Self {
             registry_path: registry_path.into(),
             credentials,
-            http_client: build_discovery_client(),
+            http_client,
+            http_client_error,
         }
     }
 
@@ -201,7 +213,7 @@ impl ProviderManager {
         self.save_provider_change(&registry, &previous, &reference, api_key.as_ref())?;
         let provider = registry
             .provider(&provider_id)
-            .expect("provider was added before save");
+            .ok_or_else(|| CoreError::ProviderNotFound(provider_id.clone()))?;
         Ok(provider_summary(provider))
     }
 
@@ -258,11 +270,10 @@ impl ProviderManager {
         // kept resolving to the previous secret until the Router restarted.
         registry.bump_generation();
         self.save_provider_change(&registry, &previous, &reference, api_key.as_ref())?;
-        Ok(provider_summary(
-            registry
-                .provider(id)
-                .expect("provider was validated before save"),
-        ))
+        let provider = registry
+            .provider(id)
+            .ok_or_else(|| CoreError::ProviderNotFound(id.to_owned()))?;
+        Ok(provider_summary(provider))
     }
 
     pub fn remove_provider(
@@ -324,7 +335,15 @@ impl ProviderManager {
         )
         .await?;
         let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-        let mut request = self.http_client.get(url);
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            ProviderManagerError::HttpClientUnavailable(
+                self.http_client_error
+                    .as_deref()
+                    .unwrap_or("provider model discovery unavailable")
+                    .to_owned(),
+            )
+        })?;
+        let mut request = http_client.get(url);
         // Probe with the provider's *configured* auth strategy. Hardcoding a
         // Bearer token broke discovery for every api_key/header provider.
         if let Some((name, value)) = provider
@@ -349,18 +368,25 @@ impl ProviderManager {
                 ),
             });
         }
-        let body = response.text().await?;
-        if body.len() > MAX_DISCOVERY_RESPONSE_BYTES {
-            return Err(ProviderManagerError::Http {
-                status: status.as_u16(),
-                message: format!(
-                    "provider returned {} bytes, which exceeds the \
-                     {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list",
-                    body.len()
-                ),
-            });
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(MAX_DISCOVERY_RESPONSE_BYTES as u64) as usize,
+        );
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > MAX_DISCOVERY_RESPONSE_BYTES {
+                return Err(ProviderManagerError::Http {
+                    status: status.as_u16(),
+                    message: format!(
+                        "provider returned more than the {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list"
+                    ),
+                });
+            }
+            body.extend_from_slice(&chunk);
         }
-        let value: serde_json::Value = serde_json::from_str(&body)?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
         if !status.is_success() {
             return Err(ProviderManagerError::Http {
                 status: status.as_u16(),
@@ -403,20 +429,19 @@ impl ProviderManager {
                 .display_name
                 .as_deref()
                 .unwrap_or(&discovered_model.upstream_model_id);
-            registry.add_model(CustomModel::new(
+            registry.add_model(CustomModel::with_metadata(
                 id,
                 &discovered_model.upstream_model_id,
                 &format!("{provider_name} / {display}"),
+                discovered_model.capabilities.clone(),
+                discovered_model.reasoning_levels.clone(),
             )?)?;
         }
         registry.save()?;
-        Ok(registry
+        let provider = registry
             .provider(id)
-            .expect("provider was validated before import")
-            .models
-            .iter()
-            .map(model_summary)
-            .collect())
+            .ok_or_else(|| CoreError::ProviderNotFound(id.to_owned()))?;
+        Ok(provider.models.iter().map(model_summary).collect())
     }
 
     pub fn add_model(
@@ -427,10 +452,34 @@ impl ProviderManager {
         context_window: Option<u64>,
         capabilities: ModelCapabilities,
     ) -> Result<ModelSummary, ProviderManagerError> {
+        self.add_model_with_metadata(
+            provider_id,
+            upstream_model_id,
+            display_name,
+            context_window,
+            capabilities,
+            Vec::new(),
+        )
+    }
+
+    pub fn add_model_with_metadata(
+        &self,
+        provider_id: &str,
+        upstream_model_id: &str,
+        display_name: &str,
+        context_window: Option<u64>,
+        capabilities: ModelCapabilities,
+        reasoning_levels: Vec<String>,
+    ) -> Result<ModelSummary, ProviderManagerError> {
         let (mut registry, _registry_lock) = self.load_registry_locked()?;
-        let mut model = CustomModel::new(provider_id, upstream_model_id, display_name)?;
+        let mut model = CustomModel::with_metadata(
+            provider_id,
+            upstream_model_id,
+            display_name,
+            capabilities,
+            reasoning_levels,
+        )?;
         model.context_window = context_window;
-        model.capabilities = capabilities;
         registry.add_model(model.clone())?;
         registry.save()?;
         Ok(model_summary(&model))
@@ -455,7 +504,7 @@ impl ProviderManager {
                     .iter()
                     .find(|model| model.logical_model_id == logical_model_id)
             })
-            .expect("model was validated before save");
+            .ok_or_else(|| CoreError::ModelNotFound(logical_model_id.to_owned()))?;
         Ok(model_summary(model))
     }
 
@@ -642,14 +691,28 @@ fn parse_discovered_models(
         .or_else(|| value.get("data").and_then(serde_json::Value::as_array))
         .or_else(|| value.get("models").and_then(serde_json::Value::as_array))
         .ok_or(ProviderManagerError::MissingModelList)?;
+    if list.len() > MAX_DISCOVERED_MODELS {
+        return Err(ProviderManagerError::Http {
+            status: 200,
+            message: format!(
+                "provider returned {} models, exceeding the {MAX_DISCOVERED_MODELS} item limit",
+                list.len()
+            ),
+        });
+    }
     let mut models = Vec::with_capacity(list.len());
     for item in list {
         if let Some(upstream_model_id) = item.as_str() {
             let upstream_model_id = upstream_model_id.trim();
             if !upstream_model_id.is_empty() {
+                if upstream_model_id.chars().count() > MAX_MODEL_ID_CHARS {
+                    continue;
+                }
                 models.push(DiscoveredModel {
                     upstream_model_id: upstream_model_id.to_owned(),
                     display_name: None,
+                    capabilities: ModelCapabilities::default(),
+                    reasoning_levels: Vec::new(),
                 });
             }
             continue;
@@ -665,19 +728,271 @@ fn parse_discovered_models(
         else {
             continue;
         };
+        if upstream_model_id.chars().count() > MAX_MODEL_ID_CHARS {
+            continue;
+        }
         let display_name = ["display_name", "name"]
             .iter()
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .filter(|value| value.chars().count() <= MAX_MODEL_ID_CHARS);
+        let reasoning_levels = parse_reasoning_levels(object)?;
+        let capabilities = parse_model_capabilities(object, &reasoning_levels);
         models.push(DiscoveredModel {
             upstream_model_id: upstream_model_id.to_owned(),
             display_name,
+            capabilities,
+            reasoning_levels,
         });
     }
     if models.is_empty() && !list.is_empty() {
         return Err(ProviderManagerError::EmptyModelList);
     }
     Ok(models)
+}
+
+fn parse_model_capabilities(
+    object: &serde_json::Map<String, serde_json::Value>,
+    reasoning_levels: &[String],
+) -> ModelCapabilities {
+    let mut capabilities = ModelCapabilities::default();
+
+    for (field, aliases) in [
+        ("text", &["text", "supports_text"][..]),
+        (
+            "images",
+            &[
+                "images",
+                "image",
+                "supports_images",
+                "supports_image",
+                "supports_vision",
+                "vision",
+            ][..],
+        ),
+        (
+            "files",
+            &[
+                "files",
+                "file",
+                "supports_files",
+                "supports_file",
+                "supports_documents",
+            ][..],
+        ),
+        ("audio", &["audio", "supports_audio"][..]),
+        ("video", &["video", "supports_video"][..]),
+        (
+            "tools",
+            &[
+                "tools",
+                "supports_tools",
+                "tool_calling",
+                "supports_tool_calls",
+                "function_calling",
+            ][..],
+        ),
+        ("streaming", &["streaming", "supports_streaming"][..]),
+    ] {
+        if let Some(value) = first_bool(object, aliases) {
+            match field {
+                "text" => capabilities.text = value,
+                "images" => capabilities.images = value,
+                "files" => capabilities.files = value,
+                "audio" => capabilities.audio = value,
+                "video" => capabilities.video = value,
+                "tools" => capabilities.tools = value,
+                "streaming" => capabilities.streaming = value,
+                // The field names come from the table immediately above. Keep
+                // this branch harmless if that table is extended without a
+                // matching assignment here; malformed provider metadata must
+                // never panic the discovery worker.
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(modalities) = collect_modalities(object) {
+        capabilities.text = modalities.contains("text");
+        capabilities.images = modalities.contains("image");
+        capabilities.files = modalities.contains("file");
+        capabilities.audio = modalities.contains("audio");
+        capabilities.video = modalities.contains("video");
+    }
+
+    let explicit_reasoning = first_bool(
+        object,
+        &[
+            "reasoning",
+            "supports_reasoning",
+            "supports_thinking",
+            "thinking",
+        ],
+    );
+    capabilities.reasoning = explicit_reasoning.unwrap_or(!reasoning_levels.is_empty());
+    capabilities
+}
+
+fn first_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    aliases: &[&str],
+) -> Option<bool> {
+    let nested = object
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object);
+    aliases.iter().find_map(|alias| {
+        object
+            .get(*alias)
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| {
+                nested
+                    .and_then(|value| value.get(*alias))
+                    .and_then(serde_json::Value::as_bool)
+            })
+    })
+}
+
+fn collect_modalities(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BTreeSet<String>> {
+    let mut values = BTreeSet::new();
+    let mut found = false;
+    let nested = object
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object);
+    for key in ["input_modalities", "supported_modalities", "modalities"] {
+        for source in [Some(object), nested] {
+            let Some(value) = source.and_then(|source| source.get(key)) else {
+                continue;
+            };
+            found = true;
+            collect_modality_value(value, &mut values);
+        }
+    }
+    if let Some(value) = object.get("capabilities")
+        && !value.is_object()
+    {
+        found = true;
+        collect_modality_value(value, &mut values);
+    }
+    found.then_some(values)
+}
+
+fn collect_modality_value(value: &serde_json::Value, values: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(item) = item.as_str()
+                    && let Some(modality) = canonical_modality(item)
+                {
+                    values.insert(modality.to_owned());
+                }
+            }
+        }
+        serde_json::Value::String(item) => {
+            if let Some(modality) = canonical_modality(item) {
+                values.insert(modality.to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonical_modality(value: &str) -> Option<&'static str> {
+    let value = value.trim().to_ascii_lowercase().replace('-', "_");
+    match value.as_str() {
+        "text" | "text_input" => Some("text"),
+        "image" | "images" | "vision" | "image_input" => Some("image"),
+        "file" | "files" | "document" | "documents" | "file_input" => Some("file"),
+        "audio" | "audio_input" => Some("audio"),
+        "video" | "video_input" => Some("video"),
+        _ => None,
+    }
+}
+
+fn parse_reasoning_levels(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>, ProviderManagerError> {
+    let nested = object
+        .get("capabilities")
+        .and_then(serde_json::Value::as_object);
+    let keys = [
+        "supported_reasoning_levels",
+        "reasoning_levels",
+        "reasoning_efforts",
+        "supported_reasoning_efforts",
+        "reasoning_effort",
+    ];
+    let mut levels = Vec::new();
+    for key in keys {
+        for source in [Some(object), nested] {
+            let Some(value) = source.and_then(|source| source.get(key)) else {
+                continue;
+            };
+            collect_reasoning_levels(value, &mut levels).map_err(|error| {
+                ProviderManagerError::InvalidModelMetadata(format!("{key}: {error}"))
+            })?;
+        }
+    }
+    if levels.len() > MAX_REASONING_LEVELS {
+        return Err(ProviderManagerError::InvalidModelMetadata(format!(
+            "more than {MAX_REASONING_LEVELS} reasoning levels"
+        )));
+    }
+    let mut normalized = Vec::with_capacity(levels.len());
+    let mut seen = BTreeSet::new();
+    for level in levels {
+        let level = level.trim();
+        if level.is_empty()
+            || level.chars().any(char::is_control)
+            || level.chars().count() > MAX_REASONING_LEVEL_CHARS
+        {
+            return Err(ProviderManagerError::InvalidModelMetadata(
+                "reasoning levels must be non-empty, short, and free of control characters".into(),
+            ));
+        }
+        if !seen.insert(level.to_owned()) {
+            continue;
+        }
+        normalized.push(level.to_owned());
+    }
+    Ok(normalized)
+}
+
+fn collect_reasoning_levels(
+    value: &serde_json::Value,
+    levels: &mut Vec<String>,
+) -> Result<(), &'static str> {
+    match value {
+        serde_json::Value::String(level) => levels.push(level.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_reasoning_level_item(item, levels)?;
+            }
+        }
+        serde_json::Value::Object(_) => collect_reasoning_level_item(value, levels)?,
+        _ => return Err("must be a string, object, or array"),
+    }
+    Ok(())
+}
+
+fn collect_reasoning_level_item(
+    value: &serde_json::Value,
+    levels: &mut Vec<String>,
+) -> Result<(), &'static str> {
+    if let Some(level) = value.as_str() {
+        levels.push(level.to_owned());
+        return Ok(());
+    }
+    let Some(object) = value.as_object() else {
+        return Err("reasoning level entries must be strings or objects");
+    };
+    let level = ["effort", "level", "name"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+        .ok_or("reasoning level objects need an effort, level, or name field")?;
+    levels.push(level.to_owned());
+    Ok(())
 }
 
 fn restore_secret(
@@ -724,6 +1039,10 @@ pub enum ManagerError {
     },
     #[error("router request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("router probe client is unavailable: {0}")]
+    ClientUnavailable(String),
+    #[error("router recovery deferred because the provider registry could not be read promptly")]
+    RegistryProbeUnavailable,
     #[error("router reload returned HTTP {status}: {message}")]
     ReloadFailed { status: u16, message: String },
     #[error("router shutdown returned HTTP {status}: {message}")]
@@ -753,8 +1072,99 @@ enum EndpointHealth {
     Current,
     /// Reachable and ours, but built from an older registry revision.
     StaleGeneration,
-    /// Not reachable, not ours, or the local registry cannot be read.
+    /// The endpoint is not reachable or does not identify as this Router.
     Unreachable,
+    /// The local registry read failed, timed out, or another timed-out read is
+    /// still occupying the single probe slot. Restarting without its generation
+    /// would risk replacing a healthy Router while storage is under pressure.
+    RegistryUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockingProbeError {
+    Busy,
+    TimedOut,
+    TaskFailed,
+}
+
+async fn run_bounded_blocking_probe<T, F>(
+    slots: Arc<Semaphore>,
+    timeout_after: Duration,
+    operation: F,
+) -> Result<T, BlockingProbeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = slots
+        .try_acquire_owned()
+        .map_err(|_| BlockingProbeError::Busy)?;
+    let task = tokio::task::spawn_blocking(move || {
+        // A JoinHandle timeout does not stop a blocking closure. Retaining this
+        // permit inside the closure prevents repeated health checks from
+        // accumulating blocked worker threads.
+        let _permit = permit;
+        operation()
+    });
+    match timeout(timeout_after, task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(BlockingProbeError::TaskFailed),
+        Err(_) => Err(BlockingProbeError::TimedOut),
+    }
+}
+
+async fn read_bounded_probe_json(mut response: reqwest::Response) -> Result<serde_json::Value, ()> {
+    const MAX_PROBE_BYTES: usize = 64 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROBE_BYTES as u64)
+    {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_PROBE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if bytes.len() + chunk.len() > MAX_PROBE_BYTES {
+            return Err(());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ())
+}
+
+async fn read_bounded_error_text(mut response: reqwest::Response) -> String {
+    const MAX_ERROR_BYTES: usize = 8 * 1024;
+    let mut bytes = Vec::with_capacity(MAX_ERROR_BYTES);
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_BYTES.saturating_sub(bytes.len());
+                let keep = remaining.min(chunk.len());
+                bytes.extend_from_slice(&chunk[..keep]);
+                if keep < chunk.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                if bytes.is_empty() {
+                    return format!("response body could not be read: {error}");
+                }
+                break;
+            }
+        }
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("... (truncated)");
+    }
+    text
 }
 
 /// Cross-process startup lock.
@@ -794,9 +1204,10 @@ impl StartupLock {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        // A previous holder died without cleaning up.
-                        let _ = std::fs::remove_file(&path);
+                    if lock_is_stale(&path) && reclaim_stale_lock(&path) {
+                        // Rename-and-remove the exact stale inode. A plain
+                        // remove_file here could delete a fresh lock created by
+                        // another waiter between the stale check and removal.
                         continue;
                     }
                     if tokio::time::Instant::now() >= deadline {
@@ -822,6 +1233,29 @@ fn lock_path_for(endpoint_file: &Path) -> PathBuf {
     endpoint_file.with_extension("lock")
 }
 
+fn reclaim_stale_lock(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("router.lock");
+    let reclaimed = parent.join(format!(
+        ".{name}.reclaim-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    match std::fs::rename(path, &reclaimed) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(reclaimed);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 /// A lock is stale when its PID is gone, or when it is older than
 /// `STARTUP_LOCK_STALE`. The age check matters when the PID was reused.
 fn lock_is_stale(path: &Path) -> bool {
@@ -834,7 +1268,7 @@ fn lock_is_stale(path: &Path) -> bool {
     {
         return true;
     }
-    let Ok(contents) = std::fs::read_to_string(path) else {
+    let Ok(contents) = read_to_string_limited(path, 4096) else {
         return false;
     };
     match contents.trim().parse::<u32>() {
@@ -856,14 +1290,21 @@ fn process_is_alive(pid: u32) -> bool {
     // `tasklist` is the only dependency-free probe available here. A failure to
     // run it reports "alive", which is the safe direction: the age check is the
     // backstop.
-    std::process::Command::new("tasklist.exe")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .map(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            text.contains(&format!("\"{pid}\""))
-        })
-        .unwrap_or(true)
+    run_with_timeout(
+        std::process::Command::new("tasklist.exe").args([
+            "/FI",
+            &format!("PID eq {pid}"),
+            "/NH",
+            "/FO",
+            "CSV",
+        ]),
+        PROCESS_PROBE_TIMEOUT,
+    )
+    .map(|output| {
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.contains(&format!("\"{pid}\""))
+    })
+    .unwrap_or(true)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -875,7 +1316,9 @@ pub struct RouterSupervisor {
     executable: PathBuf,
     registry_path: PathBuf,
     endpoint_file: PathBuf,
-    client: Client,
+    client: Option<Client>,
+    client_error: Option<String>,
+    registry_probe_slots: Arc<Semaphore>,
     child: Option<Child>,
     owns_endpoint: bool,
     reused_endpoint: bool,
@@ -905,6 +1348,19 @@ impl RouterSupervisor {
         registry_path: impl Into<PathBuf>,
         endpoint_file: impl Into<PathBuf>,
     ) -> Self {
+        let (client, client_error) = match Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(PROBE_TIMEOUT)
+            .connect_timeout(PROBE_TIMEOUT)
+            .build()
+        {
+            Ok(client) => (Some(client), None),
+            Err(error) => {
+                let message = format!("could not build the hardened router-probe client: {error}");
+                eprintln!("codex-mp: {message}; router lifecycle probes are unavailable");
+                (None, Some(message))
+            }
+        };
         Self {
             executable: executable.into(),
             registry_path: registry_path.into(),
@@ -914,18 +1370,9 @@ impl RouterSupervisor {
             // Redirects are refused: these requests carry the Router capability
             // token, and reqwest's default policy would resend them (body
             // included) to whatever host a 307/308 names.
-            client: Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(PROBE_TIMEOUT)
-                .connect_timeout(PROBE_TIMEOUT)
-                .build()
-                .unwrap_or_else(|_| {
-                    eprintln!(
-                        "codex-mp: FATAL: no hardened router-probe client available; \
-                         redirects will be followed"
-                    );
-                    Client::new()
-                }),
+            client,
+            client_error,
+            registry_probe_slots: Arc::new(Semaphore::new(1)),
             child: None,
             owns_endpoint: false,
             reused_endpoint: false,
@@ -1010,21 +1457,30 @@ impl RouterSupervisor {
                 // change made outside the running Router (e.g. a CLI
                 // `provider add` while the panel's Router serves traffic).
                 EndpointHealth::StaleGeneration => {
-                    if self.request_reload(&endpoint).await.is_ok()
-                        && matches!(
-                            self.endpoint_health(&endpoint).await,
-                            EndpointHealth::Current
-                        )
-                    {
-                        self.reused_endpoint = true;
-                        self.active_endpoint = Some(endpoint.clone());
-                        return Ok(endpoint);
+                    if self.request_reload(&endpoint).await.is_ok() {
+                        match self.endpoint_health(&endpoint).await {
+                            EndpointHealth::Current => {
+                                self.reused_endpoint = true;
+                                self.active_endpoint = Some(endpoint.clone());
+                                return Ok(endpoint);
+                            }
+                            EndpointHealth::RegistryUnavailable => {
+                                return Err(ManagerError::RegistryProbeUnavailable);
+                            }
+                            EndpointHealth::StaleGeneration | EndpointHealth::Unreachable => {}
+                        }
                     }
                     // Reload refused or did not take: fall through and replace it,
                     // but stop the old one first so it cannot linger.
                     let _ = self.request_shutdown(&endpoint).await;
                 }
                 EndpointHealth::Unreachable => {}
+                EndpointHealth::RegistryUnavailable => {
+                    // Keep the existing endpoint and release StartupLock rather
+                    // than spawning/replacing a Router without knowing whether
+                    // it already has the current registry generation.
+                    return Err(ManagerError::RegistryProbeUnavailable);
+                }
             }
         }
         remove_stale_endpoint(&self.endpoint_file)?;
@@ -1161,13 +1617,24 @@ impl RouterSupervisor {
     async fn endpoint_health(&self, endpoint: &RouterEndpoint) -> EndpointHealth {
         // A registry we cannot read must not be treated as "any generation is
         // fine": that accepted a Router built from a corrupt/unreadable registry.
-        let Ok(expected_generation) = codex_mp_core::ProviderRegistry::load(&self.registry_path)
-            .map(|registry| registry.generation())
-        else {
+        let registry_path = self.registry_path.clone();
+        let expected_generation = match run_bounded_blocking_probe(
+            self.registry_probe_slots.clone(),
+            REGISTRY_PROBE_TIMEOUT,
+            move || {
+                codex_mp_core::ProviderRegistry::load(registry_path)
+                    .map(|registry| registry.generation())
+            },
+        )
+        .await
+        {
+            Ok(Ok(generation)) => generation,
+            _ => return EndpointHealth::RegistryUnavailable,
+        };
+        let Some(client) = self.client.as_ref() else {
             return EndpointHealth::Unreachable;
         };
-        let request = self
-            .client
+        let request = client
             .get(format!("{}/readyz", endpoint.base_url))
             .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
             .send();
@@ -1177,7 +1644,7 @@ impl RouterSupervisor {
         if !response.status().is_success() {
             return EndpointHealth::Unreachable;
         }
-        let Ok(payload) = response.json::<serde_json::Value>().await else {
+        let Ok(payload) = read_bounded_probe_json(response).await else {
             return EndpointHealth::Unreachable;
         };
         if payload.get("instance").and_then(serde_json::Value::as_str) != Some("omnibridge") {
@@ -1201,8 +1668,14 @@ impl RouterSupervisor {
 
     /// Ask the Router at `endpoint` to reload its registry.
     async fn request_reload(&self, endpoint: &RouterEndpoint) -> Result<(), ManagerError> {
-        let response = self
-            .client
+        let client = self.client.as_ref().ok_or_else(|| {
+            ManagerError::ClientUnavailable(
+                self.client_error
+                    .clone()
+                    .unwrap_or_else(|| "router probe client unavailable".into()),
+            )
+        })?;
+        let response = client
             .post(format!("{}/admin/reload", endpoint.base_url))
             .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
             .send()
@@ -1211,14 +1684,20 @@ impl RouterSupervisor {
             return Ok(());
         }
         let status = response.status().as_u16();
-        let message = response.text().await.unwrap_or_default();
+        let message = read_bounded_error_text(response).await;
         Err(ManagerError::ReloadFailed { status, message })
     }
 
     /// Ask the Router at `endpoint` to stop.
     async fn request_shutdown(&self, endpoint: &RouterEndpoint) -> Result<(), ManagerError> {
-        let response = self
-            .client
+        let client = self.client.as_ref().ok_or_else(|| {
+            ManagerError::ClientUnavailable(
+                self.client_error
+                    .clone()
+                    .unwrap_or_else(|| "router probe client unavailable".into()),
+            )
+        })?;
+        let response = client
             .post(format!("{}/admin/shutdown", endpoint.base_url))
             .header(CAPABILITY_HEADER, endpoint.capability_token.expose_secret())
             .send()
@@ -1227,7 +1706,7 @@ impl RouterSupervisor {
             return Ok(());
         }
         let status = response.status().as_u16();
-        let message = response.text().await.unwrap_or_default();
+        let message = read_bounded_error_text(response).await;
         Err(ManagerError::ShutdownFailed { status, message })
     }
 
@@ -1436,6 +1915,30 @@ mod tests {
     use codex_mp_credentials::MemoryCredentialStore;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn registry_probe_timeout_keeps_a_stuck_worker_bounded() {
+        let slots = Arc::new(Semaphore::new(1));
+        let result = run_bounded_blocking_probe(slots.clone(), Duration::from_millis(25), || {
+            std::thread::sleep(Duration::from_millis(180));
+            7_u8
+        })
+        .await;
+
+        assert_eq!(result, Err(BlockingProbeError::TimedOut));
+        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(
+            run_bounded_blocking_probe(slots.clone(), Duration::from_secs(1), || 8_u8).await,
+            Err(BlockingProbeError::Busy),
+            "a timed-out blocking read must not spawn another worker while it is still running"
+        );
+
+        let permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned())
+            .await
+            .expect("the simulated blocking read never released its slot")
+            .expect("the registry probe semaphore was closed");
+        drop(permit);
+    }
 
     #[tokio::test]
     async fn stop_removes_stale_endpoint() {
@@ -2169,7 +2672,7 @@ mod tests {
         };
         assert_eq!(
             supervisor.endpoint_health(&endpoint).await,
-            EndpointHealth::Unreachable,
+            EndpointHealth::RegistryUnavailable,
             "a Router was accepted as healthy while the local registry was unreadable"
         );
     }

@@ -4,14 +4,15 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_mp_catalog::{discover_official_catalog, merge_catalog};
 use codex_mp_core::{
     AuthStrategy, CustomModel, ModelEdit, ProviderConfig, ProviderProtocol, ProviderRegistry,
-    command_for_executable, default_registry_path, executable_variants, resolve_executable,
+    command_for_executable, default_registry_path, executable_variants, read_to_string_limited,
+    resolve_executable,
 };
 use codex_mp_credentials::{CredentialStoreError, NativeCredentialStore};
 use codex_mp_desktop::{
@@ -26,6 +27,68 @@ use codex_mp_router::{RouterConfig, RouterState, serve};
 use secrecy::SecretString;
 
 mod tray;
+
+const MAX_CLI_STATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Secrets read from a pipe must be bounded as well as secrets read from
+/// files. A missing EOF on stdin must not let a caller grow this process until
+/// the allocator or the OS kills it.
+const MAX_CLI_SECRET_INPUT_BYTES: usize = 1024 * 1024;
+const ROUTER_HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+const ROUTER_RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const ROUTER_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Prevent a persistently broken Router from being stopped and respawned on
+/// every health tick. The backoff is reset as soon as a healthy endpoint is
+/// observed, so a transient failure recovers quickly while an OOM, corrupt
+/// registry, or broken executable cannot create a restart storm.
+#[derive(Debug)]
+struct RouterRecoveryBackoff {
+    next_attempt: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for RouterRecoveryBackoff {
+    fn default() -> Self {
+        Self {
+            next_attempt: None,
+            delay: ROUTER_RECOVERY_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl RouterRecoveryBackoff {
+    fn healthy(&mut self) {
+        self.next_attempt = None;
+        self.delay = ROUTER_RECOVERY_INITIAL_BACKOFF;
+    }
+
+    fn due(&self) -> bool {
+        self.next_attempt
+            .is_none_or(|next_attempt| Instant::now() >= next_attempt)
+    }
+
+    fn attempted(&mut self) {
+        self.next_attempt = Some(Instant::now() + self.delay);
+        self.delay = (self.delay * 2).min(ROUTER_RECOVERY_MAX_BACKOFF);
+    }
+}
+
+async fn recover_router_with_backoff(
+    supervisor: &mut RouterSupervisor,
+    backoff: &mut RouterRecoveryBackoff,
+) {
+    if !backoff.due() {
+        return;
+    }
+    match supervisor.restart().await {
+        Ok(endpoint) => eprintln!(
+            "codex-mp: Router recovery attempt started a new process at {}",
+            endpoint.base_url
+        ),
+        Err(error) => eprintln!("codex-mp: Router recovery failed: {error}"),
+    }
+    backoff.attempted();
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -461,13 +524,14 @@ fn desktop_launcher_config_path() -> Result<Option<PathBuf>> {
 }
 
 async fn run_desktop_launcher(config_path: &Path) -> Result<()> {
-    let config: DesktopLauncherConfig = serde_json::from_str(&fs::read_to_string(config_path)?)
-        .with_context(|| {
-            format!(
-                "reading Desktop launcher configuration: {}",
-                config_path.display()
-            )
-        })?;
+    let config: DesktopLauncherConfig =
+        serde_json::from_str(&read_to_string_limited(config_path, MAX_CLI_STATE_BYTES)?)
+            .with_context(|| {
+                format!(
+                    "reading Desktop launcher configuration: {}",
+                    config_path.display()
+                )
+            })?;
     if config.schema_version != 1 {
         bail!(
             "unsupported Desktop launcher configuration schema: {}",
@@ -684,6 +748,7 @@ async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
                     } else {
                         args.context_window.map(Some)
                     },
+                    ..ModelEdit::default()
                 },
             )?;
             registry.save()?;
@@ -1155,7 +1220,32 @@ async fn run_manager(path: &Path, args: ManagerArgs) -> Result<()> {
     println!("manager is running; press Ctrl-C to stop the Router");
     // Waiting on Ctrl-C alone meant SIGTERM (systemd stop, `kill`, a container
     // stop) skipped `stop()` entirely and left the Router running as an orphan.
-    wait_for_shutdown_signal().await;
+    // Keep a small watchdog here too: the manager can survive while its child is
+    // OOM-killed or wedges on a local endpoint fault.
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut health_tick = tokio::time::interval(ROUTER_HEALTH_INTERVAL);
+    let mut recovery_backoff = RouterRecoveryBackoff::default();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = health_tick.tick() => {
+                match supervisor.status().await {
+                    Ok(status) if status.running && status.healthy => {
+                        recovery_backoff.healthy();
+                    }
+                    Ok(status) => {
+                        eprintln!("codex-mp: managed Router is unhealthy (running={}, healthy={}); recovery is subject to backoff", status.running, status.healthy);
+                        recover_router_with_backoff(&mut supervisor, &mut recovery_backoff).await;
+                    }
+                    Err(error) => {
+                        eprintln!("codex-mp: Router health probe failed: {error}; recovery is subject to backoff");
+                        recover_router_with_backoff(&mut supervisor, &mut recovery_backoff).await;
+                    }
+                }
+            }
+        }
+    }
     supervisor.stop().await?;
     println!("router stopped and endpoint file removed");
     Ok(())
@@ -1233,7 +1323,44 @@ async fn launch(path: &Path, args: LaunchArgs) -> Result<ExitStatus> {
     command
         .args(args.args)
         .env("CODEX_MP_ROUTER_ENDPOINT_FILE", &endpoint_file);
-    let status = command.status().await;
+    let mut codex_process = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = supervisor.stop().await;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to start stock Codex binary '{}' (Router endpoint: {})",
+                    codex_binary.display(),
+                    endpoint.base_url
+                )
+            });
+        }
+    };
+    // A one-shot `status().await` left the Router unmonitored for the entire
+    // Codex session. Probe it periodically and restart it if a local failure
+    // strands the foreground session.
+    let mut health_tick = tokio::time::interval(ROUTER_HEALTH_INTERVAL);
+    let mut recovery_backoff = RouterRecoveryBackoff::default();
+    let status = loop {
+        tokio::select! {
+            status = codex_process.wait() => break status,
+            _ = health_tick.tick() => {
+                match supervisor.status().await {
+                    Ok(status) if status.running && status.healthy => {
+                        recovery_backoff.healthy();
+                    }
+                    Ok(status) => {
+                        eprintln!("codex-mp: managed Router is unhealthy (running={}, healthy={}); recovery is subject to backoff", status.running, status.healthy);
+                        recover_router_with_backoff(&mut supervisor, &mut recovery_backoff).await;
+                    }
+                    Err(error) => {
+                        eprintln!("codex-mp: Router health probe failed: {error}; recovery is subject to backoff");
+                        recover_router_with_backoff(&mut supervisor, &mut recovery_backoff).await;
+                    }
+                }
+            }
+        }
+    };
     let stop_result = supervisor.stop().await;
     stop_result?;
     let status = status.with_context(|| {
@@ -1305,8 +1432,7 @@ async fn web_command(registry_path: &Path, codex_bin: &Path, command: WebCommand
             let pwd = if let Some(p) = args.password {
                 p
             } else if args.stdin {
-                let mut buffer = String::new();
-                io::stdin().read_to_string(&mut buffer)?;
+                let buffer = read_limited_to_string(io::stdin(), MAX_CLI_SECRET_INPUT_BYTES)?;
                 buffer.trim().to_string()
             } else {
                 bail!("please provide a password or pass --stdin / --clear");
@@ -1493,12 +1619,13 @@ async fn resume(
         );
     }
     let paths = IntegrationPaths::for_registry(registry_path);
-    let config = fs::read_to_string(&paths.codex_config).with_context(|| {
-        format!(
-            "reading the managed stock Codex config {}; run `codex-mp sync` first",
-            paths.codex_config.display()
-        )
-    })?;
+    let config =
+        read_to_string_limited(&paths.codex_config, MAX_CLI_STATE_BYTES).with_context(|| {
+            format!(
+                "reading the managed stock Codex config {}; run `codex-mp sync` first",
+                paths.codex_config.display()
+            )
+        })?;
     let parsed: toml::Value = toml::from_str(&config).with_context(|| {
         format!(
             "parsing the managed stock Codex config {}; no files were changed",
@@ -1927,13 +2054,7 @@ async fn fetch_models(path: &PathBuf, args: FetchModelsArgs) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "codex-mp: FATAL: no hardened model-discovery client available; \
-                 provider redirects will be followed"
-            );
-            reqwest::Client::new()
-        });
+        .context("could not build the hardened model-discovery client")?;
     let mut request = client.get(url);
     // Probe with the provider's *configured* auth strategy; always sending a
     // Bearer token broke discovery for api_key/header providers.
@@ -1957,15 +2078,22 @@ async fn fetch_models(path: &PathBuf, args: FetchModelsArgs) -> Result<()> {
              {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list"
         );
     }
-    let body = response.text().await?;
-    if body.len() > MAX_DISCOVERY_RESPONSE_BYTES {
-        bail!(
-            "provider returned {} bytes, which exceeds the \
-             {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list",
-            body.len()
-        );
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_DISCOVERY_RESPONSE_BYTES as u64) as usize,
+    );
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_DISCOVERY_RESPONSE_BYTES {
+            bail!(
+                "provider returned more than the {MAX_DISCOVERY_RESPONSE_BYTES} byte limit for a model list"
+            );
+        }
+        body.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value = serde_json::from_str(&body)
+    let value: serde_json::Value = serde_json::from_slice(&body)
         .with_context(|| format!("provider returned non-JSON response (HTTP {status})"))?;
     if !status.is_success() {
         bail!(
@@ -2150,8 +2278,7 @@ fn read_secret(use_stdin: bool, env_name: Option<String>) -> Result<Option<Secre
         return Ok(Some(SecretString::from(value)));
     }
     if use_stdin {
-        let mut value = String::new();
-        io::stdin().read_to_string(&mut value)?;
+        let value = read_limited_to_string(io::stdin(), MAX_CLI_SECRET_INPUT_BYTES)?;
         let value = value.trim_end_matches(['\r', '\n']).to_owned();
         if value.is_empty() {
             bail!("stdin did not contain an API key");
@@ -2159,6 +2286,22 @@ fn read_secret(use_stdin: bool, env_name: Option<String>) -> Result<Option<Secre
         return Ok(Some(SecretString::from(value)));
     }
     Ok(None)
+}
+
+/// Read a UTF-8 value from a possibly unbounded stream without allowing the
+/// stream to grow the process indefinitely. Reading one byte past the limit
+/// lets us distinguish an exact-limit value from an oversized value while
+/// still returning promptly when the producer does not close its pipe.
+fn read_limited_to_string(mut reader: impl Read, max_bytes: usize) -> Result<String> {
+    let mut value = String::new();
+    let read = reader
+        .by_ref()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_string(&mut value)?;
+    if read > max_bytes {
+        bail!("stdin input exceeds the {max_bytes} byte limit");
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -2192,5 +2335,31 @@ mod tests {
     fn parses_top_level_string_array() {
         let value = serde_json::json!(["qwen3.8", "deepseek-v4"]);
         assert_eq!(parse_discovered_models(&value).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn router_recovery_backoff_grows_and_resets_after_health() {
+        let mut backoff = RouterRecoveryBackoff::default();
+        assert!(backoff.due());
+        backoff.attempted();
+        assert!(!backoff.due());
+        assert_eq!(backoff.delay, Duration::from_secs(4));
+        backoff.healthy();
+        assert!(backoff.due());
+        assert_eq!(backoff.delay, ROUTER_RECOVERY_INITIAL_BACKOFF);
+    }
+
+    #[test]
+    fn bounded_stdin_reader_rejects_an_oversized_secret() {
+        let error = read_limited_to_string("12345".as_bytes(), 4).unwrap_err();
+        assert!(error.to_string().contains("4 byte limit"));
+    }
+
+    #[test]
+    fn bounded_stdin_reader_accepts_input_at_the_limit() {
+        assert_eq!(
+            read_limited_to_string("1234".as_bytes(), 4).unwrap(),
+            "1234"
+        );
     }
 }

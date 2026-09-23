@@ -17,8 +17,22 @@ const ctx = await browser.newContext({ viewport: { width: 1220, height: 950 } })
 const page = await ctx.newPage();
 
 const calls = [];
+const requestBodies = [];
 page.on("request", (r) => {
-  if (r.url().includes("/api/")) calls.push(`${r.method()} ${new URL(r.url()).pathname}`);
+  if (!r.url().includes("/api/")) return;
+  const route = new URL(r.url()).pathname;
+  calls.push(`${r.method()} ${route}`);
+  requestBodies.push({
+    method: r.method(),
+    route,
+    body: (() => {
+      try {
+        return JSON.parse(r.postData() || "{}");
+      } catch {
+        return {};
+      }
+    })(),
+  });
 });
 page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
 page.on("console", (m) => {
@@ -52,8 +66,18 @@ async function step(name, fn, expect = []) {
 const snackbarActive = () =>
   page.evaluate(() => document.querySelector("#m3-snackbar")?.classList.contains("active"));
 const view = (id) => page.click(`.m3-nav-item[data-target="${id}"]`).then(() => page.waitForTimeout(650));
+const lastRequestBody = (route) =>
+  [...requestBodies].reverse().find((request) => request.route === route)?.body;
 
 // ------------------------------------------------------------- overview -----
+await step("runtime version rendered", async () => {
+  const appVersion = await page.textContent("#app-version-label");
+  const settingsVersion = await page.textContent("#settings-version-info");
+  if (!appVersion.includes("v9.9.9-test") || !settingsVersion.includes("v9.9.9-test")) {
+    throw new Error(`version labels are stale: ${appVersion} / ${settingsVersion}`);
+  }
+}, ["/api/v1/app/version"]);
+
 await step("router status rendered", async () => {
   const t = await page.textContent("#router-state-text");
   if (!t.includes("正常")) throw new Error(`chip reads "${t}"`);
@@ -167,16 +191,20 @@ await step("discover panel expands", async () => {
   if (expanded !== "true") throw new Error("aria-expanded not updated");
 });
 
+// Everything below is scoped to the provider card that was just scanned:
+// `.import-selected-btn` exists once per card.
+const CARD = ".m3-provider-card:has(.m3-discover[data-open='true'])";
+
 await step("scan upstream models", async () => {
   await page.click(".fetch-discover-btn");
   await page.waitForTimeout(1300);
   const n = await page.evaluate(() => document.querySelectorAll(".m3-discover__checkbox").length);
   if (n === 0) throw new Error("no discovered models listed");
+  const tags = await page.locator(`${CARD} .m3-discover__items`).first().textContent();
+  if (!tags.includes("文件") || !tags.includes("音频") || !tags.includes("视频") || !tags.includes("思考")) {
+    throw new Error(`discovered capability tags are incomplete: ${tags}`);
+  }
 }, ["/discover"]);
-
-// Everything below is scoped to the provider card that was just scanned:
-// `.import-selected-btn` exists once per card.
-const CARD = ".m3-provider-card:has(.m3-discover[data-open='true'])";
 
 await step("import selected models", async () => {
   const boxes = await page.$$(`${CARD} .m3-discover__checkbox`);
@@ -253,7 +281,9 @@ await step("edit provider saves", async () => {
 }, ["/api/v1/providers/edit"]);
 
 await step("delete provider uses ONE confirm with the credential opt-in", async () => {
-  await page.click(".delete-provider-btn");
+  const addedProvider = page.locator(".m3-provider-card[data-provider-id='provider']");
+  if (!(await addedProvider.count())) throw new Error("the provider created by the fixture is missing");
+  await addedProvider.locator(".delete-provider-btn").click();
   await page.waitForTimeout(600);
   const state = await page.evaluate(() => {
     const d = document.querySelector("#confirm-dialog");
@@ -276,9 +306,84 @@ await step("add model manually", async () => {
   await page.selectOption("select[name='provider_id']", "newapi-primary");
   await page.fill("input[name='upstream_model_id']", "test-model");
   await page.fill("input[name='display_name']", "Test Model");
+  for (const name of ["cap_images", "cap_files", "cap_audio", "cap_video", "cap_tools"]) {
+    await page.check(`#m3-model-form input[name='${name}']`);
+  }
+  await page.check("#m3-model-form input[name='cap_reasoning']");
+  await page.check("#m3-model-form input[data-reasoning-level='low']");
+  await page.check("#m3-model-form input[data-reasoning-level='high']");
+  await page.fill("#m3-model-form input[data-reasoning-custom]", "balanced, ultra");
   await page.click("#m3-model-form button[type=submit]");
   await page.waitForTimeout(1100);
+  const payload = lastRequestBody("/api/v1/models/add");
+  const capabilities = payload?.capabilities || {};
+  for (const key of ["text", "images", "files", "audio", "video", "tools", "streaming", "reasoning"]) {
+    if (typeof capabilities[key] !== "boolean") throw new Error(`add payload is missing capabilities.${key}`);
+  }
+  if (!capabilities.text || !capabilities.streaming || !capabilities.reasoning) {
+    throw new Error(`default/add capability flags are wrong: ${JSON.stringify(capabilities)}`);
+  }
+  if (JSON.stringify(payload.reasoning_levels) !== JSON.stringify(["low", "high", "balanced", "ultra"])) {
+    throw new Error(`reasoning levels were not submitted in order: ${JSON.stringify(payload.reasoning_levels)}`);
+  }
 }, ["/api/v1/models/add"]);
+
+await step("model rows show every declared modality", async () => {
+  const row = page.locator(".m3-model-row").filter({ hasText: "Test Model" }).first();
+  const tags = await row.locator(".m3-model-tags").textContent();
+  for (const label of ["文本", "图片", "文件", "音频", "视频", "工具", "流式", "思考"]) {
+    if (!tags.includes(label)) throw new Error(`model row is missing ${label}: ${tags}`);
+  }
+});
+
+await step("edit model prefills complete capability metadata", async () => {
+  const row = page.locator(".m3-model-row").filter({ hasText: "Test Model" }).first();
+  await row.locator(".edit-model-btn").click();
+  await page.waitForTimeout(400);
+  for (const name of ["cap_text", "cap_images", "cap_files", "cap_audio", "cap_video", "cap_tools", "cap_streaming", "cap_reasoning"]) {
+    if (!(await page.isChecked(`#m3-edit-model-form input[name='${name}']`))) {
+      throw new Error(`edit form did not restore ${name}`);
+    }
+  }
+  for (const level of ["low", "high"]) {
+    if (!(await page.isChecked(`#m3-edit-model-form input[data-reasoning-level='${level}']`))) {
+      throw new Error(`edit form did not restore reasoning level ${level}`);
+    }
+  }
+  const custom = await page.inputValue("#m3-edit-model-form input[data-reasoning-custom]");
+  if (custom !== "balanced, ultra") throw new Error(`custom reasoning levels were not restored: ${custom}`);
+  await page.fill("#m3-edit-model-form input[name='display_name']", "Test Model Edited");
+  await page.click("#m3-edit-model-submit");
+  await page.waitForTimeout(1100);
+  const payload = lastRequestBody("/api/v1/models/edit");
+  if (!payload?.capabilities?.video || !payload?.capabilities?.reasoning) {
+    throw new Error(`edit payload lost capabilities: ${JSON.stringify(payload)}`);
+  }
+  if (JSON.stringify(payload.reasoning_levels) !== JSON.stringify(["low", "high", "balanced", "ultra"])) {
+    throw new Error(`edit payload lost reasoning levels: ${JSON.stringify(payload.reasoning_levels)}`);
+  }
+}, ["/api/v1/models/edit"]);
+
+await step("disabling reasoning clears and disables all reasoning levels", async () => {
+  const row = page.locator(".m3-model-row").filter({ hasText: "Test Model Edited" }).first();
+  await row.locator(".edit-model-btn").click();
+  await page.waitForTimeout(400);
+  await page.uncheck("#m3-edit-model-form input[name='cap_reasoning']");
+  const state = await page.evaluate(() => {
+    const form = document.querySelector("#m3-edit-model-form");
+    const controls = form.querySelector("[data-reasoning-controls]");
+    return {
+      disabled: controls.disabled,
+      levels: [...form.querySelectorAll("[data-reasoning-level]:checked")].map((input) => input.value),
+      custom: form.querySelector("[data-reasoning-custom]").value,
+    };
+  });
+  if (!state.disabled || state.levels.length || state.custom) {
+    throw new Error(`reasoning controls were not cleared: ${JSON.stringify(state)}`);
+  }
+  await page.click("#close-edit-model-btn");
+  await page.waitForTimeout(300);
+});
 
 // ------------------------------------------------------------- settings -----
 await step("open settings view", () => view("view-settings"));

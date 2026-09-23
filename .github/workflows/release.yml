@@ -90,6 +90,11 @@ jobs:
     name: Build (${{ matrix.target.os }})
     needs: validate
     runs-on: ${{ matrix.target.runner }}
+    env:
+      # Keep the version shown by the embedded Rust panel aligned with the
+      # release input. Electron receives the same value through npm version
+      # below; local builds fall back to the workspace package version.
+      CODEX_MP_APP_VERSION: ${{ needs.validate.outputs.package_version }}
     strategy:
       fail-fast: false
       matrix:

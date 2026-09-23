@@ -3,13 +3,17 @@ Description=Codex MultiProvider OmniBridge router
 Documentation=https://github.com/IGNGserver/codex-multiprovider
 After=network-online.target
 Wants=network-online.target
+# A persistently failing binary must not hit systemd's default burst limit and
+# remain stopped forever. RestartSec below still spaces retries out; disabling
+# the start-rate window keeps recovery continuous after an OOM or bad update.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 Environment=CODEX_MP_REGISTRY=__REGISTRY_PATH__
 ExecStart=__CLI_PATH__ --registry __REGISTRY_PATH__ router --port 8787 --endpoint-file __ENDPOINT_FILE__
 Restart=on-failure
-RestartSec=2s
+RestartSec=3s
 KillSignal=SIGINT
 UMask=0077
 StandardOutput=journal

@@ -375,9 +375,10 @@ fn strip_media_from_tool_value_at_depth(
                 return 1;
             }
 
-            value
-                .as_object_mut()
-                .expect("object match arm must remain an object")
+            let Some(object) = value.as_object_mut() else {
+                return 0;
+            };
+            object
                 .get_mut("content")
                 .map(|content| {
                     strip_media_from_tool_value_at_depth(

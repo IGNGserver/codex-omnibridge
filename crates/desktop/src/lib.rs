@@ -14,8 +14,11 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(windows, target_os = "macos"))]
+use codex_mp_core::run_with_timeout;
 use codex_mp_core::{
-    FileLock, atomic_replace, clean_verbatim_path, default_registry_path, set_private_permissions,
+    FileLock, atomic_replace, clean_verbatim_path, default_registry_path, read_to_string_limited,
+    set_private_permissions,
 };
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
@@ -29,6 +32,16 @@ pub const DESKTOP_LAUNCHER_CONFIG_FILE: &str = "codex-mp-desktop-launcher.json";
 const DESKTOP_MANIFEST_FILE: &str = "desktop-integration.json";
 const RUNTIME_DIR: &str = "desktop-runtime";
 const CODE_MODE_HOST: &str = "codex-code-mode-host";
+const MAX_DESKTOP_STATE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(any(windows, target_os = "macos"))]
+const DESKTOP_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[cfg(any(windows, target_os = "macos"))]
+fn run_desktop_command(
+    command: &mut std::process::Command,
+) -> Result<std::process::ExitStatus, DesktopError> {
+    Ok(run_with_timeout(command, DESKTOP_COMMAND_TIMEOUT)?.status)
+}
 
 #[derive(Debug, Error)]
 pub enum DesktopError {
@@ -330,7 +343,8 @@ pub struct DesktopInstallResult {
 pub fn load_manifest(path: impl AsRef<Path>) -> Result<DesktopManifest, DesktopError> {
     let path = path.as_ref();
     reject_symlink(path)?;
-    let manifest: DesktopManifest = serde_json::from_str(&fs::read_to_string(path)?)?;
+    let manifest: DesktopManifest =
+        serde_json::from_str(&read_to_string_limited(path, MAX_DESKTOP_STATE_BYTES)?)?;
     if !matches!(
         manifest.schema_version,
         2 | 3 | DESKTOP_MANIFEST_SCHEMA_VERSION
@@ -1032,7 +1046,7 @@ fn detect_orphaned_launcher(
     manifest_path: &Path,
     version: &str,
 ) -> Option<PathBuf> {
-    let contents = fs::read_to_string(entrypoint).ok()?;
+    let contents = read_to_string_limited(entrypoint, MAX_DESKTOP_STATE_BYTES).ok()?;
     if !contents.contains(LAUNCHER_MARKER) {
         return None;
     }
@@ -1309,7 +1323,8 @@ fn verify_launcher_config(manifest: &DesktopManifest) -> Result<(), DesktopError
             {
                 return Err(DesktopError::RuntimeInvalid(path.display().to_string()));
             }
-            let config: DesktopLauncherConfig = serde_json::from_str(&fs::read_to_string(path)?)?;
+            let config: DesktopLauncherConfig =
+                serde_json::from_str(&read_to_string_limited(path, MAX_DESKTOP_STATE_BYTES)?)?;
             if config.schema_version != 1
                 || config.manager_binary != manifest.codex_mp_binary
                 || config.app_server_binary != manifest.patched_app_server
@@ -1395,9 +1410,15 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("reg.exe")
-            .args(["QUERY", r"HKCU\Environment", "/v", "CODEX_CLI_PATH"])
-            .output()?;
+        let output = run_with_timeout(
+            std::process::Command::new("reg.exe").args([
+                "QUERY",
+                r"HKCU\Environment",
+                "/v",
+                "CODEX_CLI_PATH",
+            ]),
+            DESKTOP_COMMAND_TIMEOUT,
+        )?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -1417,9 +1438,10 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("launchctl")
-            .args(["getenv", "CODEX_CLI_PATH"])
-            .output()?;
+        let output = run_with_timeout(
+            std::process::Command::new("launchctl").args(["getenv", "CODEX_CLI_PATH"]),
+            DESKTOP_COMMAND_TIMEOUT,
+        )?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -1435,19 +1457,20 @@ fn read_desktop_override() -> Result<Option<PathBuf>, DesktopError> {
 fn set_desktop_override(path: &Path) -> Result<(), DesktopError> {
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("reg.exe")
-            .args([
-                "ADD",
-                r"HKCU\Environment",
-                "/v",
-                "CODEX_CLI_PATH",
-                "/t",
-                "REG_SZ",
-                "/d",
-            ])
-            .arg(path)
-            .args(["/f"])
-            .status()?;
+        let status = run_desktop_command(
+            std::process::Command::new("reg.exe")
+                .args([
+                    "ADD",
+                    r"HKCU\Environment",
+                    "/v",
+                    "CODEX_CLI_PATH",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                ])
+                .arg(path)
+                .args(["/f"]),
+        )?;
         if !status.success() {
             return Err(DesktopError::RuntimeInvalid(
                 "unable to set the Windows user CODEX_CLI_PATH override".to_owned(),
@@ -1457,10 +1480,11 @@ fn set_desktop_override(path: &Path) -> Result<(), DesktopError> {
     }
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("launchctl")
-            .args(["setenv", "CODEX_CLI_PATH"])
-            .arg(path)
-            .status()?;
+        let status = run_desktop_command(
+            std::process::Command::new("launchctl")
+                .args(["setenv", "CODEX_CLI_PATH"])
+                .arg(path),
+        )?;
         if !status.success() {
             return Err(DesktopError::RuntimeInvalid(
                 "unable to set the macOS launchctl CODEX_CLI_PATH override".to_owned(),
@@ -1507,9 +1531,13 @@ fn restore_desktop_override(
     }
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("reg.exe")
-            .args(["DELETE", r"HKCU\Environment", "/v", "CODEX_CLI_PATH", "/f"])
-            .status()?;
+        let status = run_desktop_command(std::process::Command::new("reg.exe").args([
+            "DELETE",
+            r"HKCU\Environment",
+            "/v",
+            "CODEX_CLI_PATH",
+            "/f",
+        ]))?;
         if !status.success() {
             return Err(DesktopError::RuntimeInvalid(
                 "unable to remove the Windows user CODEX_CLI_PATH override".to_owned(),
@@ -1519,9 +1547,9 @@ fn restore_desktop_override(
     }
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("launchctl")
-            .args(["unsetenv", "CODEX_CLI_PATH"])
-            .status()?;
+        let status = run_desktop_command(
+            std::process::Command::new("launchctl").args(["unsetenv", "CODEX_CLI_PATH"]),
+        )?;
         if !status.success() {
             return Err(DesktopError::RuntimeInvalid(
                 "unable to remove the macOS launchctl CODEX_CLI_PATH override".to_owned(),
@@ -1556,9 +1584,12 @@ $sent = [CodexMpEnvironmentBroadcast]::SendMessageTimeout(
     [ref]$result)
 if ($sent -eq [IntPtr]::Zero) { exit 1 }
 "#;
-    let status = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .status()?;
+    let status = run_desktop_command(std::process::Command::new("powershell.exe").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        script,
+    ]))?;
     if !status.success() {
         return Err(DesktopError::RuntimeInvalid(
             "unable to broadcast the Windows environment change".to_owned(),
@@ -1599,10 +1630,11 @@ fn persist_macos_environment_override(path: Option<&Path>) -> Result<(), Desktop
 
     // Always unload first so a reload picks up the new contents. `bootout`
     // fails harmlessly when nothing is loaded.
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("gui/{}", unsafe { libc::getuid() })])
-        .arg(&plist_path)
-        .status();
+    let _ = run_desktop_command(
+        std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{}", unsafe { libc::getuid() })])
+            .arg(&plist_path),
+    );
 
     match path {
         Some(target) => {
@@ -1632,10 +1664,11 @@ fn persist_macos_environment_override(path: Option<&Path>) -> Result<(), Desktop
             // Load it so the override survives a logout. A failure here is
             // reported rather than swallowed: without it the "persistence" is a
             // file nothing reads.
-            let status = std::process::Command::new("launchctl")
-                .args(["bootstrap", &format!("gui/{}", unsafe { libc::getuid() })])
-                .arg(&plist_path)
-                .status()?;
+            let status = run_desktop_command(
+                std::process::Command::new("launchctl")
+                    .args(["bootstrap", &format!("gui/{}", unsafe { libc::getuid() })])
+                    .arg(&plist_path),
+            )?;
             if !status.success() {
                 return Err(DesktopError::RuntimeInvalid(format!(
                     "wrote the macOS environment override but could not load it ({})",
@@ -1749,8 +1782,9 @@ fn validate_build_metadata(
     app_server_binary: Option<&Path>,
 ) -> Result<BuildMetadata, DesktopError> {
     reject_symlink(path)?;
-    let metadata: BuildMetadata = serde_json::from_str(&fs::read_to_string(path)?)
-        .map_err(|error| DesktopError::BuildMetadata(format!("{}: {error}", path.display())))?;
+    let metadata: BuildMetadata =
+        serde_json::from_str(&read_to_string_limited(path, MAX_DESKTOP_STATE_BYTES)?)
+            .map_err(|error| DesktopError::BuildMetadata(format!("{}: {error}", path.display())))?;
     let binary_name = app_server_binary
         .and_then(|path| path.file_name())
         .and_then(|name| name.to_str());
@@ -1896,8 +1930,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hasher.update(bytes);
     let mut digest = String::with_capacity(64);
     for byte in hasher.finalize() {
-        FmtWrite::write_fmt(&mut digest, format_args!("{byte:02x}"))
-            .expect("writing a SHA-256 digest to a String cannot fail");
+        let _ = FmtWrite::write_fmt(&mut digest, format_args!("{byte:02x}"));
     }
     digest
 }
@@ -1915,8 +1948,7 @@ fn sha256_file(path: &Path) -> Result<String, DesktopError> {
     }
     let mut digest = String::with_capacity(64);
     for byte in hasher.finalize() {
-        FmtWrite::write_fmt(&mut digest, format_args!("{byte:02x}"))
-            .expect("writing a SHA-256 digest to a String cannot fail");
+        let _ = FmtWrite::write_fmt(&mut digest, format_args!("{byte:02x}"));
     }
     Ok(digest)
 }
@@ -1978,9 +2010,10 @@ fn active_pids(paths: &[&Path]) -> Vec<u32> {
 
     // Fast path: use tasklist.exe with CSV format and /NH (no header)
     // to quickly identify candidate PIDs by image name without PowerShell CIM overhead.
-    let tasklist_output = std::process::Command::new("tasklist.exe")
-        .args(["/FO", "CSV", "/NH"])
-        .output();
+    let tasklist_output = run_with_timeout(
+        std::process::Command::new("tasklist.exe").args(["/FO", "CSV", "/NH"]),
+        DESKTOP_COMMAND_TIMEOUT,
+    );
 
     if let Ok(output) = tasklist_output
         && output.status.success()
@@ -2022,10 +2055,15 @@ fn active_pids(paths: &[&Path]) -> Vec<u32> {
         let script = format!(
             "$ProgressPreference='SilentlyContinue'; Get-CimInstance Win32_Process -Filter \"{pid_filter}\" | Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress"
         );
-        if let Ok(output) = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        if let Ok(output) = run_with_timeout(
+            std::process::Command::new("powershell.exe").args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ]),
+            DESKTOP_COMMAND_TIMEOUT,
+        ) && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
         {
             let processes = value.as_array().cloned().unwrap_or_else(|| vec![value]);
             let mut pids = processes
@@ -2053,14 +2091,15 @@ fn active_pids(paths: &[&Path]) -> Vec<u32> {
     }
 
     // Fallback: full CIM scan
-    let output = std::process::Command::new("powershell.exe")
-        .args([
+    let output = run_with_timeout(
+        std::process::Command::new("powershell.exe").args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             "$ProgressPreference='SilentlyContinue'; Get-CimInstance Win32_Process | Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress",
-        ])
-        .output();
+        ]),
+        DESKTOP_COMMAND_TIMEOUT,
+    );
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -2100,10 +2139,10 @@ fn active_pids(paths: &[&Path]) -> Vec<u32> {
     if targets.is_empty() {
         return Vec::new();
     }
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,command="])
-        .output()
-    else {
+    let Ok(output) = run_with_timeout(
+        std::process::Command::new("ps").args(["-axo", "pid=,command="]),
+        DESKTOP_COMMAND_TIMEOUT,
+    ) else {
         return Vec::new();
     };
     let mut pids = String::from_utf8_lossy(&output.stdout)

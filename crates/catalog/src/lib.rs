@@ -14,6 +14,8 @@ use std::time::Duration;
 
 /// Deadline for reading the bundled catalog out of the Codex binary.
 const CATALOG_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CATALOG_MODELS: usize = 8192;
+const MAX_CATALOG_SLUG_CHARS: usize = 1024;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -91,6 +93,12 @@ pub fn validate_catalog(catalog: &Value) -> Result<(), CatalogError> {
         .get("models")
         .and_then(Value::as_array)
         .ok_or(CatalogError::InvalidShape)?;
+    if models.len() > MAX_CATALOG_MODELS {
+        return Err(CatalogError::UnsupportedSchema(
+            "<catalog>".into(),
+            format!("models array exceeds the {MAX_CATALOG_MODELS} item limit"),
+        ));
+    }
     // The checks below mirror Codex's own catalog schema. Presence alone is not
     // enough: `{"shell_type": null}` has the key but is rejected with
     // `invalid type: null, expected string or map`. Because stock Codex discards
@@ -112,6 +120,12 @@ pub fn validate_catalog(catalog: &Value) -> Result<(), CatalogError> {
             return Err(CatalogError::InvalidShape);
         };
         let slug = slug_of(model_object);
+        if slug != "<unknown>" && slug.chars().count() > MAX_CATALOG_SLUG_CHARS {
+            return Err(CatalogError::UnsupportedSchema(
+                "<catalog>".into(),
+                format!("model slug exceeds the {MAX_CATALOG_SLUG_CHARS} character limit"),
+            ));
+        }
 
         // `missing field ...` / `invalid type: null, expected string or map`.
         match model_object.get("shell_type") {
@@ -427,13 +441,26 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
         "supports_parallel_tool_calls".into(),
         Value::Bool(model.capabilities.tools),
     );
-    object.insert("input_modalities".into(), {
-        let mut modalities = vec![Value::String("text".into())];
-        if model.capabilities.images {
-            modalities.push(Value::String("image".into()));
-        }
-        Value::Array(modalities)
-    });
+    // Keep the advertised input contract aligned with the model registry.  The
+    // old implementation always claimed text + (optionally) image, which made
+    // file/audio/video-capable models impossible to configure truthfully and
+    // caused Codex to hide those inputs from the model picker.
+    object.insert(
+        "input_modalities".into(),
+        Value::Array(
+            [
+                (model.capabilities.text, "text"),
+                (model.capabilities.images, "image"),
+                (model.capabilities.files, "file"),
+                (model.capabilities.audio, "audio"),
+                (model.capabilities.video, "video"),
+            ]
+            .into_iter()
+            .filter(|(enabled, _)| *enabled)
+            .map(|(_, modality)| Value::String(modality.into()))
+            .collect(),
+        ),
+    );
     if let Some(context_window) = model.context_window {
         object.insert("context_window".into(), json!(context_window));
         object.insert("max_context_window".into(), json!(context_window));
@@ -448,11 +475,15 @@ fn custom_entry(template: &Value, provider_name: &str, model: &CustomModel) -> V
     // `reasoning_levels` to an empty vec, so this is reachable. Emit an empty
     // array instead of dropping the key: valid schema, and it truthfully says
     // "this model exposes no selectable reasoning levels".
-    let levels: Vec<Value> = model
-        .reasoning_levels
-        .iter()
-        .map(|effort| json!({ "effort": effort, "description": format!("{effort} reasoning") }))
-        .collect();
+    let levels: Vec<Value> = if model.capabilities.reasoning {
+        model
+            .reasoning_levels
+            .iter()
+            .map(|effort| json!({ "effort": effort, "description": format!("{effort} reasoning") }))
+            .collect()
+    } else {
+        Vec::new()
+    };
     object.insert("supported_reasoning_levels".into(), Value::Array(levels));
     match model.reasoning_levels.first() {
         Some(default) => {
@@ -599,6 +630,47 @@ mod tests {
         assert_eq!(custom["supports_search_tool"], false);
         assert!(custom["model_messages"].is_object());
         assert!(custom["base_instructions"].is_string());
+    }
+
+    #[test]
+    fn custom_entry_advertises_all_declared_input_modalities_in_stable_order() {
+        let dir = tempdir().unwrap();
+        let mut registry = ProviderRegistry::empty(dir.path().join("providers.json"));
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "omni", "NewAPI / Omni").unwrap();
+        model.capabilities.text = true;
+        model.capabilities.images = true;
+        model.capabilities.files = true;
+        model.capabilities.audio = true;
+        model.capabilities.video = true;
+        registry.add_model(model).unwrap();
+
+        let merged = merge_catalog(&official(), &registry).unwrap();
+        assert_eq!(
+            merged["models"][1]["input_modalities"],
+            json!(["text", "image", "file", "audio", "video"])
+        );
+    }
+
+    #[test]
+    fn reasoning_disabled_clears_catalog_reasoning_metadata() {
+        let dir = tempdir().unwrap();
+        let mut registry = ProviderRegistry::empty(dir.path().join("providers.json"));
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "plain", "NewAPI / Plain").unwrap();
+        model.reasoning_levels = vec!["low".into(), "high".into()];
+        model.capabilities.reasoning = false;
+        registry.add_model(model).unwrap();
+
+        let merged = merge_catalog(&official(), &registry).unwrap();
+        let custom = &merged["models"][1];
+        assert_eq!(custom["supported_reasoning_levels"], json!([]));
+        assert!(custom.get("default_reasoning_level").is_none());
+        assert_eq!(custom["supports_reasoning_summaries"], false);
     }
 
     /// Regression: a custom entry was rejected by stock Codex because three

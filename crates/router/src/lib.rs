@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codex_mp_core::{
-    AuthStrategy, LogicalModelRoute, ProviderConfig, ProviderProtocol, ProviderRegistry,
-    default_registry_path,
+    AuthStrategy, LogicalModelRoute, MAX_STATE_FILE_BYTES, ProviderConfig, ProviderProtocol,
+    ProviderRegistry, default_registry_path, read_to_string_limited,
 };
 use codex_mp_credentials::CredentialStore;
 use codex_mp_protocol_bridge::{
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
@@ -53,6 +53,18 @@ const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// make the router allocate without bound and be OOM-killed, taking every local
 /// Codex session with it.
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPSTREAM_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// Bound streams that outlive their request handler. Per-stream byte limits do
+/// not bound aggregate memory when many converted responses remain active.
+const MAX_ACTIVE_STREAMS: usize = 4;
+/// Bound the number of requests that may concurrently hold a fully buffered
+/// inbound body and translated JSON value. Streaming responses do not consume
+/// a slot after the handler returns, so long conversations are not serialized.
+const MAX_BUFFERED_REQUESTS: usize = 8;
+/// Bound concurrent non-streaming upstream bodies, each of which may be up to
+/// `MAX_UPSTREAM_RESPONSE_BYTES` before the JSON parser sees it.
+const MAX_BUFFERED_RESPONSES: usize = 4;
+const MAX_READYZ_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -104,45 +116,10 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// into an SSRF pivot, re-sending the user's conversation body to the redirect
 /// target. `Client::new()` follows up to ten redirects across arbitrary hosts and
 /// schemes and applies no timeout at all.
-fn build_upstream_client() -> Client {
-    match client_builder().build() {
-        Ok(client) => client,
-        Err(error) => {
-            // Never fall back to `Client::new()` here: that silently restores
-            // exactly the redirect-following, timeout-free policy this function
-            // exists to prevent, i.e. it fails *open* on a security control. A
-            // client without a TLS backend is still safe to build, so retry with
-            // the same hardening and only give up on the redirect/limit knobs if
-            // even that fails.
-            eprintln!(
-                "codex-mp: could not build the hardened upstream client ({error}); \
-                 retrying without connection pooling"
-            );
-            client_builder()
-                .pool_max_idle_per_host(0)
-                .build()
-                .unwrap_or_else(|error| {
-                    eprintln!(
-                        "codex-mp: upstream client construction failed ({error}); \
-                         redirects remain disabled and timeouts still apply"
-                    );
-                    Client::builder()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-                        .build()
-                        .unwrap_or_else(|_| {
-                            // Last resort. `Client::new()` is the only remaining
-                            // constructor; the router keeps working, and the
-                            // operator sees this line.
-                            eprintln!(
-                                "codex-mp: FATAL: no hardened upstream client available; \
-                                 upstream redirects will be followed"
-                            );
-                            Client::new()
-                        })
-                })
-        }
-    }
+fn build_upstream_client() -> Result<Client, String> {
+    client_builder()
+        .build()
+        .map_err(|error| format!("could not build the hardened upstream client: {error}"))
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
@@ -184,7 +161,8 @@ impl BoundedRouteMap {
 pub struct RouterState {
     pub registry: Arc<RwLock<ProviderRegistry>>,
     pub credentials: Arc<dyn CredentialStore>,
-    pub http_client: Client,
+    pub http_client: Option<Client>,
+    http_client_error: Option<Arc<str>>,
     capability_token: Option<Arc<SecretString>>,
     official_base_url: String,
     history: Arc<CodexChatHistoryStore>,
@@ -199,7 +177,20 @@ pub struct RouterState {
     /// by credential reference and invalidated whenever the registry generation
     /// moves, so a `provider edit` still takes effect immediately.
     credential_cache: Arc<StdMutex<CredentialCache>>,
+    credential_flights: Arc<StdMutex<CredentialFlightMap>>,
+    buffered_request_slots: Arc<Semaphore>,
+    buffered_response_slots: Arc<Semaphore>,
+    active_stream_slots: Arc<Semaphore>,
+    ready_fingerprints: Arc<StdMutex<ReadyFingerprints>>,
 }
+
+#[derive(Default, Clone)]
+struct ReadyFingerprints {
+    registry_sha256: Option<String>,
+    catalog_sha256: Option<String>,
+}
+
+type CredentialFlightMap = HashMap<(u64, String), Arc<tokio::sync::Mutex<()>>>;
 
 /// Credentials resolved during the current registry generation.
 #[derive(Default)]
@@ -251,10 +242,31 @@ impl RouterState {
         credentials: Arc<dyn CredentialStore>,
         capability_token: Option<SecretString>,
     ) -> Self {
+        let registry_path = registry.path().to_path_buf();
+        let catalog_path = registry_path
+            .parent()
+            .map(|parent| parent.join("models.json"));
+        let ready_fingerprints = ReadyFingerprints {
+            registry_sha256: file_sha256(&registry_path),
+            catalog_sha256: catalog_path.as_deref().and_then(file_sha256),
+        };
+        let (http_client, http_client_error) = match build_upstream_client() {
+            Ok(client) => (Some(client), None),
+            Err(error) => {
+                eprintln!("codex-mp: {error}; upstream traffic is temporarily unavailable");
+                (
+                    None,
+                    Some(Arc::<str>::from(format!(
+                        "upstream HTTP client unavailable: {error}"
+                    ))),
+                )
+            }
+        };
         Self {
             registry: Arc::new(RwLock::new(registry)),
             credentials,
-            http_client: build_upstream_client(),
+            http_client,
+            http_client_error,
             capability_token: capability_token.map(Arc::new),
             official_base_url: std::env::var("CODEX_MP_OFFICIAL_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_OFFICIAL_BASE_URL.into()),
@@ -262,7 +274,23 @@ impl RouterState {
             history_routes: Arc::new(StdMutex::new(BoundedRouteMap::default())),
             shutdown: Arc::new(Notify::new()),
             credential_cache: Arc::new(StdMutex::new(CredentialCache::default())),
+            credential_flights: Arc::new(StdMutex::new(HashMap::new())),
+            buffered_request_slots: Arc::new(Semaphore::new(MAX_BUFFERED_REQUESTS)),
+            buffered_response_slots: Arc::new(Semaphore::new(MAX_BUFFERED_RESPONSES)),
+            active_stream_slots: Arc::new(Semaphore::new(MAX_ACTIVE_STREAMS)),
+            ready_fingerprints: Arc::new(StdMutex::new(ready_fingerprints)),
         }
+    }
+
+    fn upstream_client(&self) -> Result<&Client, RouterError> {
+        self.http_client.as_ref().ok_or_else(|| {
+            RouterError::Upstream(
+                self.http_client_error
+                    .as_deref()
+                    .unwrap_or("upstream HTTP client unavailable")
+                    .to_owned(),
+            )
+        })
     }
 
     /// Override the official ChatGPT backend for a controlled fixture or a
@@ -288,7 +316,29 @@ impl RouterState {
                 return Ok(secret);
             }
         }
-        // Offloaded to a blocking thread: see `apply_custom_headers`.
+        let flight = {
+            let mut flights = self
+                .credential_flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            flights.retain(|(cached_generation, _), _| *cached_generation == generation);
+            flights
+                .entry((generation, reference.to_owned()))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _flight_guard = flight.lock().await;
+        {
+            let mut cache = self
+                .credential_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(secret) = cache.get(generation, reference) {
+                return Ok(secret);
+            }
+        }
+        // Offloaded to a bounded blocking thread pool: see
+        // `codex_mp_credentials::run_blocking`.
         let secret =
             codex_mp_credentials::get_blocking(self.credentials.clone(), reference.to_owned())
                 .await
@@ -326,10 +376,29 @@ impl RouterState {
 
     pub async fn reload_registry(&self) -> Result<usize, RouterError> {
         let path = self.registry.read().await.path().to_path_buf();
-        let registry = ProviderRegistry::load(path)
-            .map_err(|error| RouterError::Registry(error.to_string()))?;
-        let enabled_models = registry.enabled_custom_models().count();
+        let (registry, enabled_models, fingerprints) = tokio::task::spawn_blocking(move || {
+            let registry = ProviderRegistry::load(path)
+                .map_err(|error| RouterError::Registry(error.to_string()))?;
+            let enabled_models = registry.enabled_custom_models().count();
+            let registry_path = registry.path().to_path_buf();
+            let catalog_path = registry_path
+                .parent()
+                .map(|parent| parent.join("models.json"));
+            let fingerprints = ReadyFingerprints {
+                registry_sha256: file_sha256(&registry_path),
+                catalog_sha256: catalog_path.as_deref().and_then(file_sha256),
+            };
+            Ok::<_, RouterError>((registry, enabled_models, fingerprints))
+        })
+        .await
+        .map_err(|error| {
+            RouterError::Registry(format!("registry reload task failed: {error}"))
+        })??;
         *self.registry.write().await = registry;
+        *self
+            .ready_fingerprints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fingerprints;
         Ok(enabled_models)
     }
 }
@@ -432,10 +501,10 @@ pub fn load_router_endpoint(path: impl AsRef<Path>) -> Result<RouterEndpoint, Ro
             )));
         }
     }
-    let file: RouterEndpointFile = serde_json::from_str(
-        &fs::read_to_string(path).map_err(|error| RouterError::EndpointFile(error.to_string()))?,
-    )
-    .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    let contents = read_to_string_limited(path, MAX_READYZ_RESPONSE_BYTES as u64)
+        .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
+    let file: RouterEndpointFile = serde_json::from_str(&contents)
+        .map_err(|error| RouterError::EndpointFile(error.to_string()))?;
     if file.schema_version != ROUTER_ENDPOINT_SCHEMA_VERSION
         || file.capability_token.trim().is_empty()
     {
@@ -557,10 +626,11 @@ pub async fn serve(config: RouterConfig, state: RouterState) -> Result<(), Route
         let addr = listener
             .local_addr()
             .map_err(|error| RouterError::Bind(config.socket_addr(), error.to_string()))?;
-        let token = state
-            .capability_token
-            .as_deref()
-            .expect("capability token checked above");
+        let Some(token) = state.capability_token.as_deref() else {
+            // Keep the invariant defensive in case state construction changes
+            // between the validation above and endpoint-file publication.
+            return Err(RouterError::MissingCapabilityToken);
+        };
         write_router_endpoint(endpoint_file, addr, token)?;
     }
     let shutdown = state.shutdown.clone();
@@ -589,19 +659,23 @@ async fn readyz(State(state): State<RouterState>, headers: HeaderMap) -> Respons
         return response;
     }
     let registry = state.registry.read().await;
-    let registry_path = registry.path().to_path_buf();
-    let catalog_path = registry_path
-        .parent()
-        .map(|parent| parent.join("models.json"));
+    let generation = registry.generation();
+    let official_models = registry.official_model_ids().len();
+    let enabled_custom_models = registry.enabled_custom_models().count();
+    let fingerprints = state
+        .ready_fingerprints
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     Json(json!({
         "status": "ready",
         "instance": "omnibridge",
         "build_profile": ROUTER_BUILD_PROFILE,
-        "registry_generation": registry.generation(),
-        "registry_sha256": file_sha256(&registry_path),
-        "catalog_sha256": catalog_path.as_deref().and_then(file_sha256),
-        "official_models": registry.official_model_ids().len(),
-        "enabled_custom_models": registry.enabled_custom_models().count(),
+        "registry_generation": generation,
+        "registry_sha256": fingerprints.registry_sha256,
+        "catalog_sha256": fingerprints.catalog_sha256,
+        "official_models": official_models,
+        "enabled_custom_models": enabled_custom_models,
         "capability_header": CAPABILITY_HEADER,
     }))
     .into_response()
@@ -797,6 +871,17 @@ async fn forward_request_v2(
     if matches!(endpoint, OmniEndpoint::ImagesEdits) {
         return forward_multipart_request(state, headers, uri, body).await;
     }
+    let Some(_buffered_request_slot) = state
+        .buffered_request_slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router is at its bounded request-memory capacity; retry shortly".to_owned(),
+        );
+    };
     let _ = uri;
     if let Some(response) = require_json_content_type(&headers) {
         return response;
@@ -1057,8 +1142,11 @@ async fn forward_request_v2(
     };
     debug!(logical_model = %logical_model_id, route = ?route.route_class, endpoint = endpoint.label(), "routing OmniBridge request");
 
-    let mut builder = state
-        .http_client
+    let http_client = match state.upstream_client() {
+        Ok(client) => client,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+    };
+    let mut builder = http_client
         .post(upstream_url)
         // Per-request deadline rather than a client-wide one: a client timeout
         // would cut off long streaming turns. This at least bounds how long a
@@ -1111,8 +1199,36 @@ async fn forward_request_v2(
         requested_stream
     };
 
+    // Streaming response bodies outlive this handler, so the buffered-request
+    // slot below does not limit their aggregate working set. Fail fast once the
+    // small process-wide stream budget is full; the permit is moved into the
+    // response body and released when the body completes or the client drops it.
+    let mut active_stream_permit = if !status.is_success() || is_stream {
+        match state.active_stream_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "router is at its bounded streaming capacity; retry shortly".to_owned(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     if !status.is_success() {
-        return response_from_upstream(status, content_type, upstream.bytes_stream());
+        let Some(permit) = active_stream_permit.take() else {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router could not reserve a streaming response slot".to_owned(),
+            );
+        };
+        return response_from_upstream(
+            status,
+            content_type,
+            hold_stream_slot(bounded_upstream_stream(upstream.bytes_stream()), permit),
+        );
     }
 
     if convert_chat_response && is_stream {
@@ -1127,9 +1243,7 @@ async fn forward_request_v2(
             route_model.upstream_model_id.clone(),
             account_fingerprint,
         );
-        let input = upstream
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
+        let input = bounded_upstream_stream(upstream.bytes_stream());
         let converted = match chat_sse_to_responses_stream(input, context, original_request) {
             Ok(stream) => stream,
             Err(error) => return bridge_error_response(error),
@@ -1147,7 +1261,13 @@ async fn forward_request_v2(
             state.history.clone(),
             callback,
         );
-        let mut response = Response::new(Body::from_stream(converted));
+        let Some(permit) = active_stream_permit.take() else {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router could not reserve a streaming response slot".to_owned(),
+            );
+        };
+        let mut response = Response::new(Body::from_stream(hold_stream_slot(converted, permit)));
         *response.status_mut() = StatusCode::OK;
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -1157,9 +1277,7 @@ async fn forward_request_v2(
     }
 
     if is_stream {
-        let stream = upstream
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
+        let stream = bounded_upstream_stream(upstream.bytes_stream());
         let stream: Pin<
             Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>,
         > = if endpoint == OmniEndpoint::Responses {
@@ -1181,7 +1299,13 @@ async fn forward_request_v2(
         } else {
             Box::pin(stream)
         };
-        let mut response = Response::new(Body::from_stream(stream));
+        let Some(permit) = active_stream_permit.take() else {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router could not reserve a streaming response slot".to_owned(),
+            );
+        };
+        let mut response = Response::new(Body::from_stream(hold_stream_slot(stream, permit)));
         *response.status_mut() = status;
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -1194,6 +1318,17 @@ async fn forward_request_v2(
     // buggy or hostile provider (or one that ignores `stream` and returns a huge
     // document) could grow this process without bound. `content-length` is
     // advisory, so the stream is also truncated defensively.
+    let Some(_buffered_response_slot) = state
+        .buffered_response_slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router is at its bounded response-memory capacity; retry shortly".to_owned(),
+        );
+    };
     let upstream_json: Value = match read_bounded_json(upstream).await {
         Ok(value) => value,
         Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
@@ -1267,6 +1402,12 @@ fn build_reasoning_config(
     provider: Option<&ProviderConfig>,
     model: &codex_mp_core::CustomModel,
 ) -> Option<CodexChatReasoningConfig> {
+    // Provider URL heuristics are only a transport mapping. They must never
+    // override the explicit per-model capability selected by the user or
+    // discovered from provider metadata.
+    if !model.capabilities.reasoning {
+        return None;
+    }
     let base_url = provider
         .map(|p| p.base_url.to_ascii_lowercase())
         .unwrap_or_default();
@@ -1302,7 +1443,7 @@ fn build_reasoning_config(
                 Some(model.reasoning_levels.clone())
             },
         })
-    } else if model.capabilities.reasoning {
+    } else {
         Some(CodexChatReasoningConfig {
             supports_thinking: Some(true),
             supports_effort: Some(true),
@@ -1316,8 +1457,6 @@ fn build_reasoning_config(
                 Some(model.reasoning_levels.clone())
             },
         })
-    } else {
-        None
     }
 }
 
@@ -1496,7 +1635,7 @@ fn validate_official_authorization(headers: &HeaderMap) -> Result<(), Response> 
 fn response_from_upstream(
     status: reqwest::StatusCode,
     content_type: Option<HeaderValue>,
-    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
 ) -> Response {
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() =
@@ -1507,6 +1646,58 @@ fn response_from_upstream(
             .insert(header::CONTENT_TYPE, content_type);
     }
     response
+}
+
+/// Keep one active-stream permit alive for as long as the response body is alive.
+/// Dropping a client response early also drops the permit and unblocks retries.
+fn hold_stream_slot<S>(
+    stream: S,
+    permit: OwnedSemaphorePermit,
+) -> impl futures::Stream<Item = S::Item> + Send + 'static
+where
+    S: futures::Stream + Send + 'static,
+    S::Item: Send + 'static,
+{
+    futures::stream::unfold(
+        (Box::pin(stream), permit),
+        |(mut stream, permit)| async move { stream.next().await.map(|item| (item, (stream, permit))) },
+    )
+}
+
+fn bounded_upstream_stream<S>(
+    stream: S,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+{
+    futures::stream::unfold(
+        (Box::pin(stream), 0usize),
+        |(mut stream, total)| async move {
+            if total == usize::MAX {
+                return None;
+            }
+            let item = stream.next().await?;
+            match item {
+                Ok(chunk) => {
+                    if total.saturating_add(chunk.len()) > MAX_UPSTREAM_STREAM_BYTES {
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "upstream stream exceeds the {MAX_UPSTREAM_STREAM_BYTES} byte limit"
+                                ),
+                            )),
+                            (stream, usize::MAX),
+                        ))
+                    } else {
+                        let chunk_len = chunk.len();
+                        Some((Ok(chunk), (stream, total + chunk_len)))
+                    }
+                }
+                Err(error) => Some((Err(std::io::Error::other(error)), (stream, usize::MAX))),
+            }
+        },
+    )
 }
 
 /// Passthrough for endpoints whose contract is not JSON (`/v1/images/edits`).
@@ -1523,6 +1714,17 @@ async fn forward_multipart_request(
     uri: Option<axum::http::Uri>,
     body: Body,
 ) -> Response {
+    let Some(_buffered_request_slot) = state
+        .buffered_request_slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+    else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router is at its bounded request-memory capacity; retry shortly".to_owned(),
+        );
+    };
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .cloned()
@@ -1599,8 +1801,11 @@ async fn forward_multipart_request(
         Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
     };
 
-    let mut builder = state
-        .http_client
+    let http_client = match state.upstream_client() {
+        Ok(client) => client,
+        Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+    };
+    let mut builder = http_client
         .post(upstream_url)
         .timeout(UPSTREAM_READ_TIMEOUT)
         .header(header::CONTENT_TYPE, content_type)
@@ -1616,7 +1821,17 @@ async fn forward_multipart_request(
         Ok(upstream) => {
             let status = upstream.status();
             let response_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-            response_from_upstream(status, response_type, upstream.bytes_stream())
+            let Some(permit) = state.active_stream_slots.clone().try_acquire_owned().ok() else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "router is at its bounded streaming capacity; retry shortly".to_owned(),
+                );
+            };
+            response_from_upstream(
+                status,
+                response_type,
+                hold_stream_slot(bounded_upstream_stream(upstream.bytes_stream()), permit),
+            )
         }
         Err(error) => error_response(
             StatusCode::BAD_GATEWAY,
@@ -1675,9 +1890,21 @@ fn fingerprint(value: &str) -> String {
 }
 
 fn file_sha256(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+    let mut file = fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_STATE_FILE_BYTES {
+            return None;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Some(
         hasher
             .finalize()
@@ -1902,6 +2129,61 @@ mod tests {
     use codex_mp_core::{CustomModel, ProviderConfig};
     use codex_mp_credentials::{CredentialStoreError, MemoryCredentialStore};
     use secrecy::SecretString;
+
+    #[tokio::test]
+    async fn active_stream_slot_is_released_after_eof_or_client_drop() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let stream = hold_stream_slot(
+            futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"chunk"))]),
+            permit,
+        );
+        futures::pin_mut!(stream);
+
+        assert_eq!(slots.available_permits(), 0);
+        assert!(slots.clone().try_acquire_owned().is_err());
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"chunk")
+        );
+        assert_eq!(slots.available_permits(), 0);
+        assert!(stream.next().await.is_none());
+        assert_eq!(slots.available_permits(), 1);
+
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let pending = hold_stream_slot(
+            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>(),
+            permit,
+        );
+        assert_eq!(slots.available_permits(), 0);
+        drop(pending);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn reasoning_config_is_disabled_even_for_reasoning_named_providers() {
+        let mut model = CustomModel::new("openrouter", "deepseek-reasoner", "DeepSeek").unwrap();
+        model.reasoning_levels = vec!["low".into(), "high".into()];
+        model.capabilities.reasoning = false;
+        let provider = ProviderConfig::new("OpenRouter", "https://openrouter.ai/api/v1").unwrap();
+
+        assert!(build_reasoning_config(Some(&provider), &model).is_none());
+    }
+
+    #[test]
+    fn reasoning_config_uses_declared_levels_when_enabled() {
+        let mut model = CustomModel::new("custom", "model", "Model").unwrap();
+        model.capabilities.reasoning = true;
+        model.reasoning_levels = vec!["low".into(), "xhigh".into()];
+        let provider = ProviderConfig::new("Provider", "https://provider.example/v1").unwrap();
+
+        let config = build_reasoning_config(Some(&provider), &model).unwrap();
+        assert_eq!(
+            config.effort_levels,
+            Some(vec!["low".into(), "xhigh".into()])
+        );
+        assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+    }
 
     /// Counts `get` calls so a test can prove caching works.
     #[derive(Default)]

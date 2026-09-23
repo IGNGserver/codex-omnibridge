@@ -33,6 +33,19 @@ let sessionToken = (window.electronAPI && window.electronAPI.localToken)
   ? window.electronAPI.localToken
   : (queryToken || localStorage.getItem("codex_mp_token") || "");
 
+const API_REQUEST_TIMEOUT_MS = 15000;
+
+function fetchWithTimeout(url, options = {}, timeoutMs = API_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).catch((error) => {
+    if (error && error.name === "AbortError") {
+      throw new Error(`请求超时（${Math.ceil(timeoutMs / 1000)} 秒），后台可能正在恢复。`);
+    }
+    throw error;
+  }).finally(() => clearTimeout(timer));
+}
+
 const CATALOG_STATE_KEY = "codex_mp_catalog_state";
 let catalogState = (() => {
   try {
@@ -72,6 +85,7 @@ function resolveApiUrl(path) {
 }
 
 async function api(path, options = {}) {
+  const { timeoutMs = API_REQUEST_TIMEOUT_MS, ...fetchOptions } = options;
   const headers = {
     "Content-Type": "application/json",
     ...(options.headers || {}),
@@ -87,10 +101,10 @@ async function api(path, options = {}) {
     headers["X-Local-Token"] = activeToken;
   }
   const targetUrl = resolveApiUrl(path);
-  const response = await fetch(targetUrl, {
-    ...options,
+  const response = await fetchWithTimeout(targetUrl, {
+    ...fetchOptions,
     headers,
-  });
+  }, timeoutMs);
 
   if (response.status === 401) {
     if (window.electronAPI && window.electronAPI.isElectron) {
@@ -126,6 +140,58 @@ async function api(path, options = {}) {
   return data;
 }
 
+// ============================================================================
+// 1.1 版本信息
+// ============================================================================
+
+function normalizeAppVersion(value) {
+  const version = typeof value === "string" ? value.trim().replace(/^v/i, "") : "";
+  return version && version.length <= 64 ? version : "";
+}
+
+function renderAppVersion(appVersion, coreVersion) {
+  const appLabel = appVersion ? `v${appVersion}` : "版本未知";
+  const coreLabel = coreVersion ? `v${coreVersion}` : "版本未知";
+  const appVersionLabel = document.querySelector("#app-version-label");
+  const coreVersionLabel = document.querySelector("#core-version-label");
+  const settingsVersionChip = document.querySelector("#settings-version-chip");
+  const settingsVersionInfo = document.querySelector("#settings-version-info");
+
+  if (appVersionLabel) appVersionLabel.textContent = appLabel;
+  if (coreVersionLabel) coreVersionLabel.textContent = `OmniBridge Core ${coreLabel}`;
+  if (settingsVersionChip) settingsVersionChip.textContent = appLabel;
+  if (settingsVersionInfo) {
+    settingsVersionInfo.textContent =
+      `Codex OmniBridge 应用版本: ${appLabel} · Rust Core: ${coreLabel}`;
+  }
+}
+
+async function refreshAppVersion() {
+  // Electron's package version is the product version and is available even
+  // while the Rust process is still starting. The HTTP endpoint supplies the
+  // Rust version for the browser/headless panel and also lets us detect a
+  // packaging mismatch instead of showing a stale literal from index.html.
+  const desktopVersion = normalizeAppVersion(window.electronAPI?.appVersion);
+  let serverVersion = "";
+  let coreVersion = "";
+  try {
+    const response = await fetchWithTimeout(resolveApiUrl("/api/v1/app/version"), {
+      headers: { Accept: "application/json" },
+    });
+    if (response.ok) {
+      const data = await response.json();
+      serverVersion = normalizeAppVersion(data?.version);
+      coreVersion = normalizeAppVersion(data?.core_version);
+    }
+  } catch {
+    // A desktop panel can still show Electron's package version while the
+    // backend is starting. The normal status refresh reports backend errors.
+  }
+
+  const appVersion = desktopVersion || serverVersion || coreVersion;
+  renderAppVersion(appVersion, coreVersion || serverVersion || desktopVersion);
+}
+
 // ==========================================================================
 // 2. 对话框、Snackbar 与工具提示
 // ==========================================================================
@@ -146,6 +212,20 @@ function notify(text, error = false, action = null) {
   snackbarQueue.push({ text, error, action });
   if (!snackbarVisible) drainSnackbarQueue();
 }
+
+// Event-handler promises are easy to leave unobserved in a vanilla browser
+// app. Convert those failures into a visible, bounded notification instead of
+// letting a rejected fetch become a silent broken interaction.
+window.addEventListener("unhandledrejection", (event) => {
+  event.preventDefault();
+  const reason = event.reason;
+  const message = reason instanceof Error ? reason.message : String(reason || "未知错误");
+  console.error("[Panel] 未处理的异步错误:", reason);
+  notify(`操作失败：${message.slice(0, 256)}`, true);
+});
+window.addEventListener("error", (event) => {
+  console.error("[Panel] 页面运行时错误:", event.error || event.message);
+});
 
 const API_ERROR_LABELS = {
   WebAccessDisabled: "浏览器访问尚未开启，请到设置中开启并保存访问密码。",
@@ -453,11 +533,14 @@ function initM3Select(select) {
     else closeM3Select(state);
   });
   button.addEventListener("keydown", (event) => {
-    if (["ArrowDown", "ArrowUp", "Home", "End", "Enter", " ", "Escape"].includes(event.key)) {
+    if (["ArrowDown", "ArrowUp", "Home", "End", "Enter", " "].includes(event.key)) {
       event.preventDefault();
     }
     if (event.key === "Escape") {
-      closeM3Select(state);
+      if (!state.menu.hidden) {
+        event.preventDefault();
+        closeM3Select(state);
+      }
       return;
     }
     if (event.key === "ArrowDown") {
@@ -693,6 +776,110 @@ function escapeHtml(value) {
 
 function escapeAttr(value) {
   return escapeHtml(value);
+}
+
+const MODEL_CAPABILITY_DEFAULTS = Object.freeze({
+  reasoning: false,
+  text: true,
+  tools: false,
+  images: false,
+  files: false,
+  audio: false,
+  video: false,
+  streaming: true,
+});
+
+const MODEL_CAPABILITY_LABELS = Object.freeze([
+  ["text", "文本"],
+  ["images", "图片"],
+  ["files", "文件"],
+  ["audio", "音频"],
+  ["video", "视频"],
+  ["tools", "工具"],
+  ["streaming", "流式"],
+]);
+
+const COMMON_REASONING_LEVELS = new Set(["low", "medium", "high", "xhigh"]);
+
+function normalizeModelCapabilities(value) {
+  return { ...MODEL_CAPABILITY_DEFAULTS, ...(value || {}) };
+}
+
+function uniqueReasoningLevels(levels) {
+  return [...new Set((levels || []).map((level) => String(level).trim()).filter(Boolean))];
+}
+
+function modelCapabilityTagMarkup(model) {
+  const capabilities = normalizeModelCapabilities(model?.capabilities);
+  const tags = MODEL_CAPABILITY_LABELS
+    .filter(([key]) => capabilities[key])
+    .map(([, label]) => `<span class="m3-chip m3-chip--tertiary m3-chip--sm">${label}</span>`);
+  const levels = uniqueReasoningLevels(model?.reasoning_levels);
+  if (capabilities.reasoning) {
+    tags.push(
+      `<span class="m3-chip m3-chip--assist m3-chip--sm">思考${levels.length ? `: ${escapeHtml(levels.join(" / "))}` : ""}</span>`,
+    );
+  }
+  return tags.join("") || '<span class="m3-chip m3-chip--neutral m3-chip--sm">未声明能力</span>';
+}
+
+function syncModelReasoningControls(form) {
+  if (!form) return;
+  const reasoning = form.querySelector('[data-capability="reasoning"]');
+  const controls = form.querySelector("[data-reasoning-controls]");
+  const enabled = Boolean(reasoning?.checked);
+  if (controls) controls.disabled = !enabled;
+  if (!enabled) {
+    form.querySelectorAll("[data-reasoning-level]").forEach((input) => {
+      input.checked = false;
+    });
+    const custom = form.querySelector("[data-reasoning-custom]");
+    if (custom) custom.value = "";
+  }
+}
+
+function bindModelCapabilityForm(form) {
+  if (!form || form.dataset.modelCapabilityBound === "true") return;
+  form.dataset.modelCapabilityBound = "true";
+  form.querySelector('[data-capability="reasoning"]')?.addEventListener("change", () => {
+    syncModelReasoningControls(form);
+  });
+  syncModelReasoningControls(form);
+}
+
+function setModelCapabilityForm(form, capabilities, reasoningLevels) {
+  if (!form) return;
+  bindModelCapabilityForm(form);
+  const normalized = normalizeModelCapabilities(capabilities);
+  form.querySelectorAll("[data-capability]").forEach((input) => {
+    input.checked = Boolean(normalized[input.dataset.capability]);
+  });
+  const selectedLevels = uniqueReasoningLevels(reasoningLevels);
+  form.querySelectorAll("[data-reasoning-level]").forEach((input) => {
+    input.checked = selectedLevels.includes(input.value);
+  });
+  const customLevels = selectedLevels.filter((level) => !COMMON_REASONING_LEVELS.has(level));
+  const custom = form.querySelector("[data-reasoning-custom]");
+  if (custom) custom.value = customLevels.join(", ");
+  syncModelReasoningControls(form);
+}
+
+function readModelCapabilityForm(form) {
+  bindModelCapabilityForm(form);
+  syncModelReasoningControls(form);
+  const capabilities = normalizeModelCapabilities();
+  form.querySelectorAll("[data-capability]").forEach((input) => {
+    capabilities[input.dataset.capability] = Boolean(input.checked);
+  });
+  const levels = [...form.querySelectorAll("[data-reasoning-level]:checked")].map((input) => input.value);
+  const custom = form.querySelector("[data-reasoning-custom]");
+  if (capabilities.reasoning && custom?.value) {
+    levels.push(...custom.value.split(","));
+  }
+  return {
+    capabilities,
+    reasoning_levels: capabilities.reasoning ? uniqueReasoningLevels(levels) : [],
+  };
 }
 
 // `plan_type` originates from an imported ID-token claim, i.e. it is
@@ -1358,6 +1545,7 @@ let modelFilterQuery = "";
 let modelFilterEnabledOnly = false;
 let routerStatusPollTimer = null;
 let routerStatusRequestInFlight = false;
+let routerStatusFailureCount = 0;
 
 function scheduleRouterStatusPoll(delay = 1500) {
   if (routerStatusPollTimer) clearTimeout(routerStatusPollTimer);
@@ -1386,6 +1574,7 @@ async function refreshRouterStatus() {
       metricVal.textContent = "在线运行中";
       metricDesc.textContent = "官方与第三方模型分流正常";
       if (restartBtn) restartBtn.classList.remove("is-hidden");
+      routerStatusFailureCount = 0;
       pollAgain = false;
     } else if (status.running && status.starting) {
       badge.className = "m3-chip m3-chip--warning";
@@ -1415,6 +1604,7 @@ async function refreshRouterStatus() {
     }
     refreshSetupGuide();
   } catch {
+    routerStatusFailureCount += 1;
     lastRouterStatus = null;
     badge.className = "m3-chip m3-chip--warning";
     text.textContent = "后台路由状态未知";
@@ -1425,7 +1615,13 @@ async function refreshRouterStatus() {
     pollAgain = true;
   } finally {
     routerStatusRequestInFlight = false;
-    if (pollAgain) scheduleRouterStatusPoll();
+    if (pollAgain) {
+      const delay = Math.min(
+        30000,
+        1500 * 2 ** Math.min(routerStatusFailureCount, 5),
+      );
+      scheduleRouterStatusPoll(delay);
+    }
   }
 }
 
@@ -1622,7 +1818,7 @@ function renderAccountCard(acc) {
   const checkUsageBtn = card.querySelector(".check-usage-acc-btn");
   checkUsageBtn.onclick = () => withBusy(checkUsageBtn, async () => {
     try {
-      await api(`/api/v1/accounts/${acc.id}/usage`);
+      await fetchAccountUsage(acc.id);
       notify(`已更新【${acc.name}】的额度。`);
       await refreshAccounts();
     } catch (e) {
@@ -1745,6 +1941,62 @@ async function refreshAccounts() {
   }
 }
 
+let accountUsageRefreshPromise = null;
+const accountUsageRequests = new Map();
+
+// Bulk manual refresh and an account-card refresh can target the same account
+// at the same time. Reuse the in-flight request to avoid duplicate calls.
+function fetchAccountUsage(accountId) {
+  const existing = accountUsageRequests.get(accountId);
+  if (existing) return existing;
+
+  const request = api(`/api/v1/accounts/${accountId}/usage`).finally(() => {
+    if (accountUsageRequests.get(accountId) === request) {
+      accountUsageRequests.delete(accountId);
+    }
+  });
+  accountUsageRequests.set(accountId, request);
+  return request;
+}
+
+function refreshAllAccountUsage() {
+  if (accountUsageRefreshPromise) return accountUsageRefreshPromise;
+
+  const refresh = (async () => {
+    const accounts = cachedAccounts.length
+      ? cachedAccounts
+      : (await api("/api/v1/accounts")) || [];
+    const accountList = Array.isArray(accounts) ? accounts : [];
+    const results = [];
+    // Keep the browser and OAuth service from being flooded when a store has
+    // many accounts. A failed account must not prevent the remaining accounts
+    // from refreshing, but all requests should not start at once either.
+    for (let index = 0; index < accountList.length; index += 4) {
+      const batch = accountList.slice(index, index + 4);
+      results.push(...await Promise.allSettled(
+        batch.map((account) => fetchAccountUsage(account.id)),
+      ));
+    }
+
+    // Usage is persisted by the backend before each request resolves, so this
+    // single read renders a coherent snapshot for both the account page and
+    // the overview card.
+    await refreshAccounts();
+    return {
+      total: accountList.length,
+      failed: results.filter((result) => result.status === "rejected"),
+    };
+  })();
+
+  const trackedRefresh = refresh.finally(() => {
+    if (accountUsageRefreshPromise === trackedRefresh) {
+      accountUsageRefreshPromise = null;
+    }
+  });
+  accountUsageRefreshPromise = trackedRefresh;
+  return trackedRefresh;
+}
+
 // ==========================================================================
 // 8. 服务商与模型页面
 // ==========================================================================
@@ -1772,8 +2024,6 @@ function renderModelRow(model) {
   row.dataset.modelEnabled = String(model.enabled !== false);
 
   const contextText = model.context_window ? `${model.context_window} tokens` : "默认上下文";
-  const capabilities = model.capabilities || {};
-
   row.innerHTML = `
     <div class="m3-model-info">
       <div class="m3-model-title-row">
@@ -1782,8 +2032,7 @@ function renderModelRow(model) {
       </div>
       <div class="m3-model-tags">
         <span class="m3-chip m3-chip--neutral m3-chip--sm m3-numeric">${escapeHtml(contextText)}</span>
-        ${capabilities.images ? '<span class="m3-chip m3-chip--tertiary m3-chip--sm">图片</span>' : ""}
-        ${capabilities.tools ? '<span class="m3-chip m3-chip--assist m3-chip--sm">工具调用</span>' : ""}
+        ${modelCapabilityTagMarkup(model)}
       </div>
     </div>
     <div class="m3-model-actions">
@@ -1827,6 +2076,7 @@ function renderModelRow(model) {
     form.context_window.value = model.context_window || "";
     form.clear_context_window.checked = false;
     form.context_window.disabled = false;
+    setModelCapabilityForm(form, model.capabilities, model.reasoning_levels);
     openDialog("edit-model-dialog");
   };
 
@@ -1907,6 +2157,7 @@ function renderDiscoveredBox(provider) {
           <span class="m3-list-item__content">
             <span class="m3-list-item__headline">${escapeHtml(m.display_name || m.upstream_model_id)}</span>
             <span class="m3-list-item__support m3-mono">${escapeHtml(m.upstream_model_id)}</span>
+            <span class="m3-list-item__support m3-model-discovered-capabilities">${modelCapabilityTagMarkup(m)}</span>
           </span>
           <input type="checkbox" class="m3-discover__checkbox" value="${escapeAttr(m.upstream_model_id)}" aria-label="选择模型 ${escapeAttr(m.upstream_model_id)}" />
         `;
@@ -2001,7 +2252,9 @@ function renderProviderCard(provider) {
 
   const addModelBtn = card.querySelector(".add-model-to-provider-btn");
   addModelBtn.onclick = () => {
-    document.querySelector("#m3-model-form")?.reset();
+    const form = document.querySelector("#m3-model-form");
+    form?.reset();
+    setModelCapabilityForm(form, undefined, []);
     populateProviderSelect(provider.id);
     setM3SelectValue(document.querySelector("#add-model-provider-id"), provider.id);
     openDialog("add-model-dialog");
@@ -2216,7 +2469,7 @@ loginForm.addEventListener("submit", async (e) => {
     try {
       // Must go through resolveApiUrl(): under Electron the page is file://, so a
       // bare relative path resolves to file:///api/... and always fails.
-      const res = await fetch(resolveApiUrl("/api/v1/security/login"), {
+      const res = await fetchWithTimeout(resolveApiUrl("/api/v1/security/login"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password: pwd }),
@@ -2254,7 +2507,7 @@ logoutBtn.onclick = async () => {
     // Ask the backend to drop the session server-side. Clearing only the local
     // copy would leave a still-valid token in the server's session set.
     try {
-      await fetch(resolveApiUrl("/api/v1/security/logout"), {
+      await fetchWithTimeout(resolveApiUrl("/api/v1/security/logout"), {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${revoked}` },
       });
@@ -2308,7 +2561,8 @@ const restartCodexBtn = bindClick("#overview-restart-codex-btn");
 restartCodexBtn.onclick = () => withBusy(restartCodexBtn, async () => {
   try {
     const res = await api("/api/v1/accounts/restart-codex", { method: "POST" });
-    notify(`Codex 已重启（已清理 ${res.terminated_pids.length} 个残留进程）`);
+    const started = res.started_pid ? `，新 app-server PID ${res.started_pid}` : "";
+    notify(`Codex 已重启（已清理 ${res.terminated_pids.length} 个残留进程${started}）`);
     await refreshAccounts();
   } catch (err) {
     notify(err.message, true);
@@ -2337,17 +2591,14 @@ const refreshAllUsageBtn = bindClick("#refresh-all-accounts-usage-btn");
 refreshAllUsageBtn.onclick = () => withBusy(refreshAllUsageBtn, async () => {
   try {
     notify("正在批量查询各账号实时额度…");
-    const accounts = await api("/api/v1/accounts");
-    const results = await Promise.allSettled(
-      accounts.map((acc) => api(`/api/v1/accounts/${acc.id}/usage`)),
-    );
-    const failed = results.filter((result) => result.status === "rejected");
+    const { total, failed } = await refreshAllAccountUsage();
     if (failed.length) {
-      notify((accounts.length - failed.length) + "/" + accounts.length + " 个账号额度已更新，" + failed.length + " 个失败，请稍后重试。", true);
+      notify((total - failed.length) + "/" + total + " 个账号额度已更新，" + failed.length + " 个失败，请稍后重试。", true);
+    } else if (!total) {
+      notify("暂无托管账号可刷新");
     } else {
       notify("所有托管账号额度已更新");
     }
-    await refreshAccounts();
   } catch (err) {
     notify(err.message, true);
   }
@@ -2484,13 +2735,17 @@ addProviderForm.addEventListener("submit", async (e) => {
 
 bindClick("#open-add-model-dialog-btn").onclick = () => {
   populateProviderSelect();
-  document.querySelector("#m3-model-form").reset();
+  const form = document.querySelector("#m3-model-form");
+  form.reset();
+  setModelCapabilityForm(form, undefined, []);
   openDialog("add-model-dialog");
 };
 
 bindClick("#close-add-model-btn").onclick = () => closeDialog("add-model-dialog");
 
 const addModelForm = document.querySelector("#m3-model-form");
+bindModelCapabilityForm(addModelForm);
+setModelCapabilityForm(addModelForm, undefined, []);
 addModelForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = new FormData(addModelForm);
@@ -2505,6 +2760,7 @@ addModelForm.addEventListener("submit", async (e) => {
       const context = form.get("context_window");
       const displayName = String(form.get("display_name") || "").trim()
         || provider.name + " / " + upstreamModelId;
+      const metadata = readModelCapabilityForm(addModelForm);
       await api("/api/v1/models/add", {
         method: "POST",
         body: JSON.stringify({
@@ -2512,11 +2768,12 @@ addModelForm.addEventListener("submit", async (e) => {
           upstream_model_id: upstreamModelId,
           display_name: displayName,
           context_window: context ? Number(context) : null,
-          images: form.get("images") === "on",
-          tools: form.get("tools") === "on",
+          capabilities: metadata.capabilities,
+          reasoning_levels: metadata.reasoning_levels,
         }),
       });
       addModelForm.reset();
+      setModelCapabilityForm(addModelForm, undefined, []);
       closeDialog("add-model-dialog");
       await finishCatalogMutation("模型已添加");
     } catch (err) {
@@ -2527,6 +2784,8 @@ addModelForm.addEventListener("submit", async (e) => {
 
 const editModelForm = document.querySelector("#m3-edit-model-form");
 if (editModelForm) {
+  bindModelCapabilityForm(editModelForm);
+  setModelCapabilityForm(editModelForm, undefined, []);
   const contextInput = editModelForm.querySelector("[name='context_window']");
   const clearContext = editModelForm.querySelector("[name='clear_context_window']");
   clearContext?.addEventListener("change", () => {
@@ -2543,6 +2802,7 @@ if (editModelForm) {
         if (rawContext && (!Number.isSafeInteger(parsedContext) || parsedContext < 1)) {
           throw new Error("上下文长度必须是正整数");
         }
+        const metadata = readModelCapabilityForm(editModelForm);
         await api("/api/v1/models/edit", {
           method: "POST",
           body: JSON.stringify({
@@ -2550,6 +2810,8 @@ if (editModelForm) {
             display_name: String(form.get("display_name") || "").trim(),
             context_window: clearContext?.checked ? null : parsedContext,
             clear_context_window: Boolean(clearContext?.checked),
+            capabilities: metadata.capabilities,
+            reasoning_levels: metadata.reasoning_levels,
           }),
         });
         closeDialog("edit-model-dialog");
@@ -2842,4 +3104,5 @@ initM3Selects();
 applyTooltips();
 renderCatalogState();
 populateProviderSelect();
+void refreshAppVersion();
 refreshAll();

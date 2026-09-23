@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-VERSION="${1:-0.1.0}"
+DEFAULT_VERSION="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${PROJECT_DIR}/package.json" | head -n 1)"
+VERSION="${1:-${DEFAULT_VERSION}}"
 PACKAGE_VERSION="${VERSION#v}"
 ARCH="${2:-amd64}"
 PKG_NAME="codex-omnibridge_${PACKAGE_VERSION}_${ARCH}"

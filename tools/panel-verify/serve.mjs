@@ -112,7 +112,17 @@ const providers = [
         upstream_model_id: "gpt-5.2-codex",
         context_window: 400000,
         enabled: true,
-        capabilities: { images: true, tools: true },
+        capabilities: {
+          text: true,
+          images: true,
+          files: true,
+          audio: true,
+          video: true,
+          tools: true,
+          streaming: true,
+          reasoning: true,
+        },
+        reasoning_levels: ["low", "medium", "high", "xhigh"],
       },
       {
         logical_model_id: "gemini-3.8-flash",
@@ -120,7 +130,17 @@ const providers = [
         upstream_model_id: "gemini-3.8-flash",
         context_window: 1048576,
         enabled: true,
-        capabilities: { images: true, tools: false },
+        capabilities: {
+          text: true,
+          images: true,
+          files: true,
+          audio: false,
+          video: false,
+          tools: false,
+          streaming: true,
+          reasoning: false,
+        },
+        reasoning_levels: [],
       },
       {
         logical_model_id: "deepseek-v4.1",
@@ -128,7 +148,17 @@ const providers = [
         upstream_model_id: "deepseek-v4.1",
         context_window: null,
         enabled: false,
-        capabilities: { images: false, tools: true },
+        capabilities: {
+          text: true,
+          images: false,
+          files: false,
+          audio: false,
+          video: false,
+          tools: true,
+          streaming: true,
+          reasoning: true,
+        },
+        reasoning_levels: ["medium", "high"],
       },
     ],
   },
@@ -144,7 +174,17 @@ const providers = [
         upstream_model_id: "anthropic/claude-opus-4.6",
         context_window: 200000,
         enabled: true,
-        capabilities: { images: true, tools: true },
+        capabilities: {
+          text: true,
+          images: true,
+          files: true,
+          audio: false,
+          video: false,
+          tools: true,
+          streaming: true,
+          reasoning: false,
+        },
+        reasoning_levels: [],
       },
     ],
   },
@@ -158,15 +198,93 @@ const providers = [
 ];
 
 const discovered = [
-  { upstream_model_id: "gpt-5.2", display_name: "GPT-5.2", context_window: 400000 },
-  { upstream_model_id: "gpt-5.2-mini", display_name: "GPT-5.2 mini", context_window: 200000 },
-  { upstream_model_id: "o5-preview", display_name: "o5 Preview", context_window: 200000 },
-  { upstream_model_id: "qwen4-max", display_name: "Qwen4 Max", context_window: 131072 },
-  { upstream_model_id: "kimi-k3", display_name: "Kimi K3", context_window: 262144 },
+  {
+    upstream_model_id: "gpt-5.2",
+    display_name: "GPT-5.2",
+    context_window: 400000,
+    capabilities: {
+      text: true,
+      images: true,
+      files: true,
+      audio: true,
+      video: true,
+      tools: true,
+      streaming: true,
+      reasoning: true,
+    },
+    reasoning_levels: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    upstream_model_id: "gpt-5.2-mini",
+    display_name: "GPT-5.2 mini",
+    context_window: 200000,
+    capabilities: {
+      text: true,
+      images: true,
+      files: true,
+      audio: false,
+      video: false,
+      tools: true,
+      streaming: true,
+      reasoning: false,
+    },
+    reasoning_levels: [],
+  },
+  {
+    upstream_model_id: "o5-preview",
+    display_name: "o5 Preview",
+    context_window: 200000,
+    capabilities: {
+      text: true,
+      images: false,
+      files: true,
+      audio: false,
+      video: false,
+      tools: true,
+      streaming: true,
+      reasoning: true,
+    },
+    reasoning_levels: ["low", "medium", "high"],
+  },
+  {
+    upstream_model_id: "qwen4-max",
+    display_name: "Qwen4 Max",
+    context_window: 131072,
+    capabilities: {
+      text: true,
+      images: true,
+      files: true,
+      audio: true,
+      video: false,
+      tools: true,
+      streaming: true,
+      reasoning: true,
+    },
+    reasoning_levels: ["balanced", "deep"],
+  },
+  {
+    upstream_model_id: "kimi-k3",
+    display_name: "Kimi K3",
+    context_window: 262144,
+    capabilities: {
+      text: true,
+      images: false,
+      files: true,
+      audio: false,
+      video: true,
+      tools: false,
+      streaming: true,
+      reasoning: false,
+    },
+    reasoning_levels: [],
+  },
 ];
 
 // ------------------------------------------------------------- api handler --
 function readRoute(route) {
+  if (route === "/api/v1/app/version") {
+    return { version: "9.9.9-test", core_version: "9.9.9-test" };
+  }
   if (route === "/api/v1/router/status") {
     return { healthy: true, running: true, port: 31828 };
   }
@@ -224,7 +342,13 @@ function mockResponse(route, payload = {}) {
   if (route === "/api/v1/router/restart") return { healthy: true, running: true, port: 31828 };
   if (route === "/api/v1/security/login") return { token: "mock-session-token" };
   if (route === "/api/v1/security/update") return { token: "mock-session-token" };
-  if (route === "/api/v1/accounts/restart-codex") return { terminated_pids: [11, 22, 33] };
+  if (route === "/api/v1/accounts/restart-codex") {
+    return {
+      terminated_pids: [11, 22, 33],
+      started_pid: 44,
+      endpoint_file: "/tmp/mock-router-endpoint.json",
+    };
+  }
   if (route === "/api/v1/accounts/capture") return { name: "新收纳账号" };
   if (route === "/api/v1/accounts/import") return { name: "导入的账号" };
   if (route === "/api/v1/accounts/switch") return { account: { name: "已切换账号" } };
@@ -268,7 +392,19 @@ function mockResponse(route, payload = {}) {
       display_name: payload.display_name || (provider?.name || payload.provider_id) + " / " + payload.upstream_model_id,
       context_window: payload.context_window || null,
       enabled: true,
-      capabilities: { images: !!payload.images, tools: !!payload.tools },
+      capabilities: {
+        text: !!payload.capabilities?.text,
+        images: !!payload.capabilities?.images,
+        files: !!payload.capabilities?.files,
+        audio: !!payload.capabilities?.audio,
+        video: !!payload.capabilities?.video,
+        tools: !!payload.capabilities?.tools,
+        streaming: !!payload.capabilities?.streaming,
+        reasoning: !!payload.capabilities?.reasoning,
+      },
+      reasoning_levels: payload.capabilities?.reasoning
+        ? [...new Set(payload.reasoning_levels || [])]
+        : [],
     };
     provider?.models.push(model);
     return model;
@@ -284,7 +420,8 @@ function mockResponse(route, payload = {}) {
         display_name: item.display_name,
         context_window: item.context_window || null,
         enabled: true,
-        capabilities: { images: false, tools: false },
+        capabilities: { ...(item.capabilities || {}) },
+        reasoning_levels: [...(item.reasoning_levels || [])],
       });
     }
     return provider?.models || [];
@@ -302,6 +439,10 @@ function mockResponse(route, payload = {}) {
         if (payload.display_name) model.display_name = payload.display_name;
         if (payload.clear_context_window) model.context_window = null;
         else if (payload.context_window) model.context_window = payload.context_window;
+        if (payload.capabilities) model.capabilities = { ...payload.capabilities };
+        model.reasoning_levels = payload.capabilities?.reasoning
+          ? [...new Set(payload.reasoning_levels || [])]
+          : [];
         return model;
       }
     }

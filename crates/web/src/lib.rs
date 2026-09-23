@@ -3,7 +3,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -31,8 +32,13 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::time::timeout;
+use tower::BoxError;
+use tower::limit::ConcurrencyLimitLayer;
+use tower::load_shed::LoadShedLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
 #[derive(RustEmbed)]
@@ -95,6 +101,79 @@ const MAX_SESSIONS: usize = 1024;
 /// Above this, entries whose window has fully expired are swept, so a flood from
 /// rotating addresses cannot grow the map without bound.
 const LOGIN_MAX_TRACKED_IPS: usize = 4096;
+const WEB_BLOCKING_SLOTS: usize = 8;
+const WEB_BLOCKING_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WEB_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const WEB_MAX_IN_FLIGHT_REQUESTS: usize = 128;
+const WEB_NETWORK_SLOTS: usize = 8;
+const ROUTER_RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const ROUTER_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+static WEB_BLOCKING_POOL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static WEB_NETWORK_POOL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Throttle repeated Router start/restart attempts while the process is
+/// persistently broken. A start can succeed at the process level while the
+/// health endpoint remains unusable (for example because the registry is
+/// corrupt or the executable immediately crashes), so resetting this delay on
+/// a successful spawn would still create a stop/start storm.
+#[derive(Debug)]
+struct RouterRecoveryBackoff {
+    next_attempt: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for RouterRecoveryBackoff {
+    fn default() -> Self {
+        Self {
+            next_attempt: None,
+            delay: ROUTER_RECOVERY_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl RouterRecoveryBackoff {
+    fn reset(&mut self) {
+        self.next_attempt = None;
+        self.delay = ROUTER_RECOVERY_INITIAL_BACKOFF;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.next_attempt
+            .is_none_or(|next_attempt| now >= next_attempt)
+    }
+
+    fn retry_after(&self) -> Duration {
+        self.delay
+    }
+
+    fn attempted(&mut self, now: Instant) {
+        self.next_attempt = Some(now + self.delay);
+        self.delay = (self.delay * 2).min(ROUTER_RECOVERY_MAX_BACKOFF);
+    }
+}
+
+async fn run_web_blocking<T, F>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let slots = WEB_BLOCKING_POOL
+        .get_or_init(|| Arc::new(Semaphore::new(WEB_BLOCKING_SLOTS)))
+        .clone();
+    let permit = timeout(WEB_BLOCKING_TIMEOUT, slots.acquire_owned())
+        .await
+        .map_err(|_| "web blocking work is overloaded; retry shortly".to_owned())?
+        .map_err(|error| error.to_string())?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    });
+    timeout(WEB_BLOCKING_TIMEOUT, task)
+        .await
+        .map_err(|_| "web blocking operation timed out".to_owned())?
+        .map_err(|error| error.to_string())?
+}
 
 fn argon2_hasher() -> Argon2<'static> {
     // Argon2::default() is Argon2id v19 with Params::DEFAULT (19 MiB, t=2, p=1),
@@ -312,6 +391,12 @@ pub struct WebState {
     /// Paths derived from the *configured* registry, so the panel and the CLI
     /// always operate on the same catalog/manifest/config location.
     pub integration_paths: IntegrationPaths,
+    router_desired: Arc<AtomicBool>,
+}
+
+async fn load_registry_for_web(state: &WebState) -> Result<ProviderRegistry, String> {
+    let path = state.registry_path().to_path_buf();
+    run_web_blocking(move || ProviderRegistry::load(path).map_err(|error| error.to_string())).await
 }
 
 impl WebState {
@@ -365,6 +450,7 @@ impl WebState {
             ))),
             local_token: Arc::new(local_token),
             integration_paths,
+            router_desired: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -430,6 +516,7 @@ pub fn create_web_router(state: WebState) -> Router {
     // 无需鉴权的接口（登录和静态资源）
     Router::new()
         .route("/healthz", get(api_web_healthz))
+        .route("/api/v1/app/version", get(api_app_version))
         .route("/api/v1/security/status", get(api_security_status))
         .route("/api/v1/security/login", post(api_security_login))
         // Logout only removes the token that was presented, so it is safe to
@@ -444,7 +531,61 @@ pub fn create_web_router(state: WebState) -> Router {
         // SPA so client-side routing keeps working.
         .fallback(api_aware_fallback)
         .layer(cors_layer())
+        .layer(RequestBodyLimitLayer::new(MAX_WEB_REQUEST_BODY_BYTES))
+        // A final in-flight cap prevents a burst of future endpoints from
+        // allocating independently even when their individual paths have no
+        // expensive blocking operation.
+        // `ConcurrencyLimitLayer` waits for a permit in `poll_ready`. In an
+        // Axum server that can leave excess connections queued while they hold
+        // request state and buffers. Load shedding keeps overload bounded and
+        // lets clients retry with an explicit 503 instead. The error handler
+        // must be part of the same layer stack so Axum sees the final
+        // `Infallible` service error rather than Tower's `BoxError`.
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    handle_web_layer_error,
+                ))
+                .layer(LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(WEB_MAX_IN_FLIGHT_REQUESTS)),
+        )
         .with_state(state)
+}
+
+async fn handle_web_layer_error(error: BoxError) -> Response {
+    if error
+        .downcast_ref::<tower::load_shed::error::Overloaded>()
+        .is_some()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "ServiceUnavailable",
+                "message": "the control panel is busy; retry shortly",
+            })),
+        )
+            .into_response();
+    }
+
+    // Do not expose middleware internals to a browser. This path is not
+    // expected for the current router, but returning a response keeps an
+    // unexpected middleware failure from terminating the server task.
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "InternalServerError",
+            "message": "the control panel could not process the request",
+        })),
+    )
+        .into_response()
+}
+
+fn try_web_network_slot() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    WEB_NETWORK_POOL
+        .get_or_init(|| Arc::new(Semaphore::new(WEB_NETWORK_SLOTS)))
+        .clone()
+        .try_acquire_owned()
+        .ok()
 }
 
 /// Serve the SPA for client routes, but answer unknown API paths with a JSON 404.
@@ -509,7 +650,7 @@ async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let registry = match ProviderRegistry::load(state.registry_path()) {
+    let registry = match load_registry_for_web(&state).await {
         Ok(reg) => reg,
         Err(err) => {
             return (
@@ -711,7 +852,7 @@ async fn api_security_status(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let registry = match ProviderRegistry::load(state.registry_path()) {
+    let registry = match load_registry_for_web(&state).await {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1053,7 +1194,27 @@ async fn api_web_healthz() -> Response {
     .into_response()
 }
 
+/// Version shown by the panel. Release builds may provide the product version
+/// independently of the Rust workspace version (for example, a prerelease
+/// tag passed by the release workflow), while local builds fall back to the
+/// Cargo package version.
+const fn app_version() -> &'static str {
+    match option_env!("CODEX_MP_APP_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
+async fn api_app_version() -> Response {
+    Json(serde_json::json!({
+        "version": app_version(),
+        "core_version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
+}
+
 async fn api_router_restart(State(state): State<WebState>) -> Response {
+    state.router_desired.store(true, Ordering::Release);
     let mut supervisor = state.supervisor.lock().await;
     match supervisor.restart().await {
         Ok(endpoint) => Json(serde_json::json!({
@@ -1072,6 +1233,7 @@ async fn api_router_restart(State(state): State<WebState>) -> Response {
 }
 
 async fn api_router_stop(State(state): State<WebState>) -> Response {
+    state.router_desired.store(false, Ordering::Release);
     let mut supervisor = state.supervisor.lock().await;
     match supervisor.stop().await {
         Ok(()) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
@@ -1084,24 +1246,15 @@ async fn api_router_stop(State(state): State<WebState>) -> Response {
 }
 
 async fn api_desktop_status(State(state): State<WebState>) -> Response {
-    let paths = match DesktopPaths::discover() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
     let manifest = DesktopPaths::manifest_path_for_registry(state.registry_path());
-    match status_for(&paths, manifest) {
+    let result = run_web_blocking(move || {
+        let paths = DesktopPaths::discover().map_err(|error| error.to_string())?;
+        status_for(&paths, manifest).map_err(|error| error.to_string())
+    })
+    .await;
+    match result {
         Ok(status) => Json(status).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
 
@@ -1118,16 +1271,6 @@ async fn api_desktop_install(
     // endpoint without a body.
     payload: Option<axum::extract::Json<DesktopInstallReq>>,
 ) -> Response {
-    let desktop_paths = match DesktopPaths::discover() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
     let registry_path = state.registry_path().to_path_buf();
     let manifest_path = DesktopPaths::manifest_path_for_registry(&registry_path);
 
@@ -1182,91 +1325,59 @@ async fn api_desktop_install(
 
     let codex_mp_binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-mp"));
     let endpoint_file = default_router_endpoint_path();
-
-    let result = match codex_mp_desktop::install(&DesktopInstallOptions {
-        manifest_path: manifest_path.clone(),
-        app_server_binary,
-        build_metadata,
-        codex_mp_binary,
-        endpoint_file,
-    }) {
-        Ok(res) => res,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-
-    let registry = match ProviderRegistry::load(&registry_path) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
     let integration_paths = state.integration_paths.clone();
-    if let Err(e) = build_and_install(&integration_paths, &registry, &result.catalog_binary) {
-        let _ = codex_mp_desktop::restore(&desktop_paths, &manifest_path);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-
-    match status_for(&desktop_paths, manifest_path) {
+    let result = run_web_blocking(move || {
+        let desktop_paths = DesktopPaths::discover().map_err(|error| error.to_string())?;
+        let result = codex_mp_desktop::install(&DesktopInstallOptions {
+            manifest_path: manifest_path.clone(),
+            app_server_binary,
+            build_metadata,
+            codex_mp_binary,
+            endpoint_file,
+        })
+        .map_err(|error| error.to_string())?;
+        let registry = ProviderRegistry::load(&registry_path).map_err(|error| error.to_string())?;
+        if let Err(error) = build_and_install(&integration_paths, &registry, &result.catalog_binary)
+        {
+            let _ = codex_mp_desktop::restore(&desktop_paths, &manifest_path);
+            return Err(error.to_string());
+        }
+        status_for(&desktop_paths, manifest_path).map_err(|error| error.to_string())
+    })
+    .await;
+    match result {
         Ok(status) => Json(status).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
 }
 
 async fn api_desktop_restore(State(state): State<WebState>) -> Response {
-    let paths = match DesktopPaths::discover() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
     let manifest = DesktopPaths::manifest_path_for_registry(state.registry_path());
-    match codex_mp_desktop::restore(&paths, manifest) {
+    let result = run_web_blocking(move || {
+        let paths = DesktopPaths::discover().map_err(|error| error.to_string())?;
+        codex_mp_desktop::restore(&paths, manifest).map_err(|error| error.to_string())
+    })
+    .await;
+    match result {
         Ok(restored) => Json(serde_json::json!({"restored": restored})).into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
 }
 
 async fn api_catalog_sync(State(state): State<WebState>) -> Response {
-    let registry = match ProviderRegistry::load(state.registry_path()) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
     // Must follow the configured registry, otherwise `--registry <path>` would
     // make the panel write the catalog/manifest to the default location and
     // silently diverge from the CLI.
     let paths = state.integration_paths.clone();
+    let registry_path = state.registry_path().to_path_buf();
     let catalog_binary = match state.catalog_binary() {
         Ok(b) => b,
         Err(e) => {
@@ -1277,10 +1388,18 @@ async fn api_catalog_sync(State(state): State<WebState>) -> Response {
                 .into_response();
         }
     };
-    if let Err(e) = build_and_install(&paths, &registry, &catalog_binary) {
+    let operation_paths = paths.clone();
+    let operation_catalog_binary = catalog_binary.clone();
+    let result = run_web_blocking(move || {
+        let registry = ProviderRegistry::load(&registry_path).map_err(|error| error.to_string())?;
+        build_and_install(&operation_paths, &registry, &operation_catalog_binary)
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    if let Err(e) = result {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": e})),
         )
             .into_response();
     }
@@ -1300,7 +1419,13 @@ async fn api_catalog_sync(State(state): State<WebState>) -> Response {
 }
 
 async fn api_list_providers(State(state): State<WebState>) -> Response {
-    match state.providers.list_providers() {
+    match run_blocking_providers(&state, |providers| {
+        providers
+            .list_providers()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
         Ok(list) => Json(list).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1525,6 +1650,15 @@ async fn api_discover_models(
     State(state): State<WebState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let Some(_network_slot) = try_web_network_slot() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "model discovery is at its bounded network capacity; retry shortly"
+            })),
+        )
+            .into_response();
+    };
     match state.providers.discover_models(&id).await {
         Ok(models) => Json(models).into_response(),
         Err(e) => (
@@ -1541,31 +1675,58 @@ struct AddModelReq {
     upstream_model_id: String,
     display_name: String,
     context_window: Option<u64>,
-    images: bool,
-    tools: bool,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    text: Option<bool>,
+    #[serde(default, alias = "image")]
+    images: Option<bool>,
+    #[serde(default, alias = "file")]
+    files: Option<bool>,
+    #[serde(default)]
+    audio: Option<bool>,
+    #[serde(default)]
+    video: Option<bool>,
+    #[serde(default)]
+    tools: Option<bool>,
+    #[serde(default)]
+    streaming: Option<bool>,
+    #[serde(default)]
+    reasoning: Option<bool>,
+    #[serde(default)]
+    reasoning_levels: Option<Vec<String>>,
 }
 
 async fn api_add_model(
     State(state): State<WebState>,
     Json(payload): Json<AddModelReq>,
 ) -> Response {
-    let capabilities = ModelCapabilities {
-        images: payload.images,
-        tools: payload.tools,
-        ..ModelCapabilities::default()
-    };
+    let mut capabilities = payload.capabilities.unwrap_or_default();
+    apply_capability_fields(
+        &mut capabilities,
+        payload.text,
+        payload.images,
+        payload.files,
+        payload.audio,
+        payload.video,
+        payload.tools,
+        payload.streaming,
+        payload.reasoning,
+    );
     let provider_id = payload.provider_id;
     let upstream_model_id = payload.upstream_model_id;
     let display_name = payload.display_name;
     let context_window = payload.context_window;
+    let reasoning_levels = payload.reasoning_levels.unwrap_or_default();
     match run_blocking_providers(&state, move |providers| {
         providers
-            .add_model(
+            .add_model_with_metadata(
                 &provider_id,
                 &upstream_model_id,
                 &display_name,
                 context_window,
                 capabilities,
+                reasoning_levels,
             )
             .map_err(|e| e.to_string())
     })
@@ -1622,12 +1783,56 @@ struct EditModelReq {
     display_name: Option<String>,
     context_window: Option<u64>,
     clear_context_window: bool,
+    #[serde(default)]
+    capabilities: Option<ModelCapabilities>,
+    #[serde(default)]
+    text: Option<bool>,
+    #[serde(default, alias = "image")]
+    images: Option<bool>,
+    #[serde(default, alias = "file")]
+    files: Option<bool>,
+    #[serde(default)]
+    audio: Option<bool>,
+    #[serde(default)]
+    video: Option<bool>,
+    #[serde(default)]
+    tools: Option<bool>,
+    #[serde(default)]
+    streaming: Option<bool>,
+    #[serde(default)]
+    reasoning: Option<bool>,
+    #[serde(default)]
+    reasoning_levels: Option<Vec<String>>,
 }
 
 async fn api_edit_model(
     State(state): State<WebState>,
     Json(payload): Json<EditModelReq>,
 ) -> Response {
+    let capability_fields_present = payload.text.is_some()
+        || payload.images.is_some()
+        || payload.files.is_some()
+        || payload.audio.is_some()
+        || payload.video.is_some()
+        || payload.tools.is_some()
+        || payload.streaming.is_some()
+        || payload.reasoning.is_some();
+    let mut capabilities = payload
+        .capabilities
+        .or_else(|| capability_fields_present.then(ModelCapabilities::default));
+    if let Some(capabilities_value) = capabilities.as_mut() {
+        apply_capability_fields(
+            capabilities_value,
+            payload.text,
+            payload.images,
+            payload.files,
+            payload.audio,
+            payload.video,
+            payload.tools,
+            payload.streaming,
+            payload.reasoning,
+        );
+    }
     let edit = ModelEdit {
         display_name: payload.display_name,
         context_window: if payload.clear_context_window {
@@ -1635,6 +1840,8 @@ async fn api_edit_model(
         } else {
             payload.context_window.map(Some)
         },
+        capabilities,
+        reasoning_levels: payload.reasoning_levels,
     };
     let logical_model_id = payload.logical_model_id;
     match run_blocking_providers(&state, move |providers| {
@@ -1653,6 +1860,47 @@ async fn api_edit_model(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// These fields are kept as individual optional JSON properties for backwards
+// compatibility with the panel API. Grouping them into a transport struct
+// would change the wire shape, so keep the small, explicit adapter here.
+#[allow(clippy::too_many_arguments)]
+fn apply_capability_fields(
+    capabilities: &mut ModelCapabilities,
+    text: Option<bool>,
+    images: Option<bool>,
+    files: Option<bool>,
+    audio: Option<bool>,
+    video: Option<bool>,
+    tools: Option<bool>,
+    streaming: Option<bool>,
+    reasoning: Option<bool>,
+) {
+    if let Some(value) = text {
+        capabilities.text = value;
+    }
+    if let Some(value) = images {
+        capabilities.images = value;
+    }
+    if let Some(value) = files {
+        capabilities.files = value;
+    }
+    if let Some(value) = audio {
+        capabilities.audio = value;
+    }
+    if let Some(value) = video {
+        capabilities.video = value;
+    }
+    if let Some(value) = tools {
+        capabilities.tools = value;
+    }
+    if let Some(value) = streaming {
+        capabilities.streaming = value;
+    }
+    if let Some(value) = reasoning {
+        capabilities.reasoning = value;
     }
 }
 
@@ -1739,11 +1987,8 @@ async fn load_registry_locked_blocking(
     state: &WebState,
 ) -> Result<(ProviderRegistry, codex_mp_core::FileLock), String> {
     let path = state.registry_path().to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        ProviderRegistry::load_locked(path).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    run_web_blocking(move || ProviderRegistry::load_locked(path).map_err(|error| error.to_string()))
+        .await
 }
 
 /// Run a synchronous, keyring-touching closure off the async runtime.
@@ -1763,9 +2008,7 @@ where
     T: Send + 'static,
 {
     let providers = state.providers.clone();
-    tokio::task::spawn_blocking(move || operation(providers))
-        .await
-        .map_err(|error| error.to_string())?
+    run_web_blocking(move || operation(providers)).await
 }
 
 async fn run_blocking_account<T, F>(state: &WebState, operation: F) -> Result<T, String>
@@ -1774,9 +2017,7 @@ where
     T: Send + 'static,
 {
     let accounts = state.accounts.clone();
-    tokio::task::spawn_blocking(move || operation(&accounts))
-        .await
-        .map_err(|error| error.to_string())?
+    run_web_blocking(move || operation(&accounts)).await
 }
 
 async fn api_list_accounts(State(state): State<WebState>) -> Response {
@@ -2032,6 +2273,15 @@ async fn api_fetch_account_usage(
     State(state): State<WebState>,
     axum::extract::Path(account_id): axum::extract::Path<String>,
 ) -> Response {
+    let Some(_network_slot) = try_web_network_slot() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "account usage checks are at their bounded network capacity; retry shortly"
+            })),
+        )
+            .into_response();
+    };
     let result = state.accounts.fetch_usage(&account_id).await;
     match result {
         Ok(snapshot) => Json(snapshot).into_response(),
@@ -2060,6 +2310,74 @@ async fn api_fetch_account_usage(
 }
 
 // -------------------------------- Web Server 运行入口 -------------------------------- //
+
+fn spawn_router_recovery_monitor(state: &WebState) {
+    let supervisor = state.supervisor.clone();
+    let desired = state.router_desired.clone();
+    tokio::spawn(async move {
+        let mut recovery_backoff = RouterRecoveryBackoff::default();
+        let mut unhealthy_rounds = 0_u8;
+        loop {
+            if !desired.load(Ordering::Acquire) {
+                unhealthy_rounds = 0;
+                recovery_backoff.reset();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let now = Instant::now();
+            let result = {
+                let mut guard = supervisor.lock().await;
+                match guard.status().await {
+                    Ok(status) if status.running && status.healthy => {
+                        unhealthy_rounds = 0;
+                        recovery_backoff.reset();
+                        Ok(false)
+                    }
+                    Ok(status) if status.running => {
+                        unhealthy_rounds = unhealthy_rounds.saturating_add(1);
+                        if unhealthy_rounds < 3 || !recovery_backoff.due(now) {
+                            Ok(false)
+                        } else {
+                            unhealthy_rounds = 0;
+                            guard
+                                .restart()
+                                .await
+                                .map(|_| true)
+                                .map_err(|error| error.to_string())
+                        }
+                    }
+                    Ok(_) if recovery_backoff.due(now) => guard
+                        .start()
+                        .await
+                        .map(|_| true)
+                        .map_err(|error| error.to_string()),
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+
+            match result {
+                Ok(true) => {
+                    recovery_backoff.attempted(Instant::now());
+                    eprintln!("codex-mp: Router supervisor recovered the Router process");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let retry_delay = recovery_backoff.retry_after();
+                    recovery_backoff.attempted(Instant::now());
+                    eprintln!(
+                        "codex-mp: Router health/recovery attempt failed ({error}); retrying in {}s",
+                        retry_delay.as_secs(),
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
 
 pub async fn run_web_server(
     registry_path: PathBuf,
@@ -2143,26 +2461,11 @@ pub async fn run_web_server_with_local_token(
     );
     *state.listen_addr.write().await = local_addr;
 
-    // 自动在后台守护启动 Router（如果尚未启动）
-    //
-    // A failure here used to vanish. The panel still serves, but every custom
-    // model would fail because nothing is listening on the port `config.toml`
-    // advertises, and the operator had no clue why. Surface it on stderr and to
-    // any connected client.
-    let supervisor_clone = state.supervisor.clone();
-    tokio::spawn(async move {
-        match supervisor_clone.lock().await.start().await {
-            Ok(endpoint) => {
-                println!(" OmniBridge Router 已就绪: {}", endpoint.base_url);
-            }
-            Err(error) => {
-                eprintln!(
-                    "codex-mp: the web panel started but the Router did not ({error}); \
-                     custom models will not be reachable until it is started"
-                );
-            }
-        }
-    });
+    // Keep the panel usable while supervising the Router. Startup failures and
+    // later child/health failures are retried with backoff; an explicit Stop
+    // request flips `router_desired` so the monitor does not immediately undo a
+    // deliberate operator action.
+    spawn_router_recovery_monitor(&state);
 
     println!("============================================================");
     println!(" Codex MultiProvider Web 控制面板已启动！");
@@ -2226,6 +2529,126 @@ mod tests {
         assert!(verify_password(raw, &hash));
         assert!(!verify_password("wrong-password", &hash));
         assert!(!password_hash_needs_upgrade(&hash));
+    }
+
+    #[test]
+    fn router_recovery_backoff_grows_after_successful_attempts_and_resets_when_healthy() {
+        let start = Instant::now();
+        let mut backoff = RouterRecoveryBackoff::default();
+
+        assert!(backoff.due(start));
+        assert_eq!(backoff.retry_after(), ROUTER_RECOVERY_INITIAL_BACKOFF);
+
+        backoff.attempted(start);
+        assert!(!backoff.due(start + Duration::from_secs(1)));
+        assert!(backoff.due(start + ROUTER_RECOVERY_INITIAL_BACKOFF));
+        assert_eq!(backoff.retry_after(), Duration::from_secs(4));
+
+        backoff.attempted(start + ROUTER_RECOVERY_INITIAL_BACKOFF);
+        assert_eq!(backoff.retry_after(), Duration::from_secs(8));
+
+        for attempt in 0..8 {
+            backoff.attempted(start + Duration::from_secs(10 + attempt));
+        }
+        assert_eq!(backoff.retry_after(), ROUTER_RECOVERY_MAX_BACKOFF);
+
+        backoff.reset();
+        assert!(backoff.due(start));
+        assert_eq!(backoff.retry_after(), ROUTER_RECOVERY_INITIAL_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn web_concurrency_overload_is_shed_with_503() {
+        use axum::extract::State as ExtractState;
+        use tokio::sync::{Barrier, Semaphore};
+
+        #[derive(Clone)]
+        struct ProbeState {
+            started: Arc<Barrier>,
+            release: Arc<Semaphore>,
+        }
+
+        async fn hold_request(ExtractState(state): ExtractState<ProbeState>) -> &'static str {
+            state.started.wait().await;
+            let _permit = state
+                .release
+                .acquire()
+                .await
+                .expect("probe release semaphore must stay open");
+            "ok"
+        }
+
+        let state = ProbeState {
+            // The test task is the extra barrier participant. This lets it
+            // wait until every one of the 128 handler calls has acquired a
+            // permit before issuing the overload probe.
+            started: Arc::new(Barrier::new(WEB_MAX_IN_FLIGHT_REQUESTS + 1)),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        let started = state.started.clone();
+        let release = state.release.clone();
+        let app = Router::new()
+            .route("/probe", get(hold_request))
+            .with_state(state.clone())
+            .layer(
+                tower::ServiceBuilder::new()
+                    .layer(axum::error_handling::HandleErrorLayer::new(
+                        handle_web_layer_error,
+                    ))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(WEB_MAX_IN_FLIGHT_REQUESTS)),
+            );
+
+        let mut held_requests = Vec::with_capacity(WEB_MAX_IN_FLIGHT_REQUESTS);
+        for _ in 0..WEB_MAX_IN_FLIGHT_REQUESTS {
+            let service = app.clone();
+            held_requests.push(tokio::spawn(async move {
+                tower::ServiceExt::oneshot(
+                    service,
+                    Request::builder()
+                        .uri("/probe")
+                        .body(Body::empty())
+                        .expect("probe request must build"),
+                )
+                .await
+                .expect("held probe request must return a response")
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), started.wait())
+            .await
+            .expect("all in-flight probe handlers must start before overload is tested");
+
+        // All permits are held inside `hold_request`, so this request must not
+        // wait for one. It should be rejected by LoadShedLayer promptly.
+        let overloaded = tokio::time::timeout(
+            Duration::from_secs(1),
+            tower::ServiceExt::oneshot(
+                app,
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .expect("overload probe request must build"),
+            ),
+        )
+        .await;
+
+        release.add_permits(WEB_MAX_IN_FLIGHT_REQUESTS);
+        for request in held_requests {
+            let response = request.await.expect("held probe task must not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = overloaded
+            .expect("an overloaded request must return without waiting")
+            .expect("overloaded request must be converted to a response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("overload response body must be bounded");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("overload response must be JSON");
+        assert_eq!(payload["error"], "ServiceUnavailable");
     }
 
     #[test]
@@ -2544,6 +2967,28 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = tower::ServiceExt::oneshot(
+            create_web_router(state.clone()),
+            get("/api/v1/app/version"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let version: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            version["version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            version["core_version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
 
         // An unknown API path must be a JSON 404, not an HTML 200.
         let response =

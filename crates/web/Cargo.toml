@@ -23,11 +23,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
-tower-http.workspace = true
+tower = { workspace = true, features = ["limit", "load-shed"] }
+tower-http = { workspace = true, features = ["cors", "fs", "limit"] }
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 codex-mp-credentials = { path = "../credentials" }
 tempfile = "3.23"
-tower = { workspace = true, features = ["util"] }

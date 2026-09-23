@@ -19,11 +19,17 @@ use super::{
     },
 };
 use crate::json_canonical::canonicalize_tool_arguments_str;
-use crate::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::sse::{MAX_SSE_BLOCK_BYTES, append_utf8_safe_bounded, strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+const MAX_STREAM_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INLINE_THINK_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_OUTPUT_ITEMS: usize = 4096;
+const MAX_STREAM_TOOL_CALLS: usize = 1024;
 
 #[derive(Debug, Default)]
 struct TextItemState {
@@ -88,6 +94,7 @@ struct ChatToResponsesState {
     tool_context: CodexToolContext,
     /// 本回合因缺少合法函数名而被丢弃的工具调用数（见 `finalize_tools`）。
     dropped_tool_calls: usize,
+    stream_error: Option<String>,
 }
 
 impl Default for ChatToResponsesState {
@@ -109,6 +116,7 @@ impl Default for ChatToResponsesState {
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             dropped_tool_calls: 0,
+            stream_error: None,
         }
     }
 }
@@ -194,7 +202,10 @@ impl ChatToResponsesState {
                 events
             }
             InlineThinkMode::Detecting => {
-                self.inline_think.buffer.push_str(delta);
+                if !append_limited(&mut self.inline_think.buffer, delta, MAX_INLINE_THINK_BYTES) {
+                    self.stream_error = Some("inline reasoning buffer exceeded its limit".into());
+                    return Vec::new();
+                }
                 match leading_think_prefix_decision(&self.inline_think.buffer) {
                     ThinkPrefixDecision::NeedMore => Vec::new(),
                     ThinkPrefixDecision::Reasoning => {
@@ -211,7 +222,10 @@ impl ChatToResponsesState {
                 }
             }
             InlineThinkMode::Reasoning => {
-                self.inline_think.buffer.push_str(delta);
+                if !append_limited(&mut self.inline_think.buffer, delta, MAX_INLINE_THINK_BYTES) {
+                    self.stream_error = Some("inline reasoning buffer exceeded its limit".into());
+                    return Vec::new();
+                }
                 self.drain_complete_inline_think()
             }
         }
@@ -317,7 +331,10 @@ impl ChatToResponsesState {
             events.push(sse::reasoning_summary_part_added(output_index, &item_id));
         }
 
-        self.reasoning.text.push_str(delta);
+        if !append_limited(&mut self.reasoning.text, delta, MAX_STREAM_TEXT_BYTES) {
+            self.stream_error = Some("reasoning output exceeded its limit".into());
+            return events;
+        }
         let output_index = self.reasoning.output_index.unwrap_or(0);
         events.push(sse::reasoning_summary_text_delta(
             output_index,
@@ -342,7 +359,10 @@ impl ChatToResponsesState {
             events.push(sse::message_content_part_added(output_index, &item_id));
         }
 
-        self.text.text.push_str(delta);
+        if !append_limited(&mut self.text.text, delta, MAX_STREAM_TEXT_BYTES) {
+            self.stream_error = Some("text output exceeded its limit".into());
+            return events;
+        }
         let output_index = self.text.output_index.unwrap_or(0);
         events.push(sse::output_text_delta(
             output_index,
@@ -394,6 +414,10 @@ impl ChatToResponsesState {
             Some(index) => index as usize,
             None => self.resolve_tool_key_without_index(tool_call),
         };
+        if !self.tools.contains_key(&chat_index) && self.tools.len() >= MAX_STREAM_TOOL_CALLS {
+            self.stream_error = Some("stream contains too many tool calls".into());
+            return Vec::new();
+        }
         let id_delta = tool_call
             .get("id")
             .and_then(|v| v.as_str())
@@ -412,6 +436,7 @@ impl ChatToResponsesState {
         let mut output_index = None;
         let mut item_id = String::new();
         let current_name: String;
+        let mut arguments_overflow = false;
 
         {
             let state = self.tools.entry(chat_index).or_default();
@@ -425,8 +450,10 @@ impl ChatToResponsesState {
             {
                 state.name.clone_from(name);
             }
-            if !args_delta.is_empty() {
-                state.arguments.push_str(&args_delta);
+            if !args_delta.is_empty()
+                && !append_limited(&mut state.arguments, &args_delta, MAX_TOOL_ARGUMENT_BYTES)
+            {
+                arguments_overflow = true;
             }
             if state.reasoning_content.is_empty()
                 && let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty())
@@ -439,6 +466,9 @@ impl ChatToResponsesState {
                 item_id = state.item_id.clone();
             }
             current_name = state.name.clone();
+        }
+        if arguments_overflow {
+            self.stream_error = Some("tool arguments exceeded their limit".into());
         }
 
         let is_custom_tool = self.tool_context.is_custom_tool_chat_name(&current_name);
@@ -520,12 +550,22 @@ impl ChatToResponsesState {
             return;
         }
 
+        let mut overflowed = false;
         for state in self.tools.values_mut().filter(|state| !state.done) {
             if state.reasoning_content.is_empty() {
-                state.reasoning_content = delta.trim_start().to_string();
-            } else {
-                state.reasoning_content.push_str(delta);
+                if !append_limited(
+                    &mut state.reasoning_content,
+                    delta.trim_start(),
+                    MAX_STREAM_TEXT_BYTES,
+                ) {
+                    overflowed = true;
+                }
+            } else if !append_limited(&mut state.reasoning_content, delta, MAX_STREAM_TEXT_BYTES) {
+                overflowed = true;
             }
+        }
+        if overflowed {
+            self.stream_error = Some("tool reasoning exceeded its limit".into());
         }
     }
 
@@ -704,6 +744,11 @@ impl ChatToResponsesState {
                 events.push(event);
             }
 
+            if self.output_items.len() >= MAX_STREAM_OUTPUT_ITEMS {
+                self.stream_error = Some("stream contains too many output items".into());
+                break;
+            }
+
             let Some(state) = self.tools.get_mut(&key) else {
                 continue;
             };
@@ -774,6 +819,9 @@ impl ChatToResponsesState {
     }
 
     fn next_output_index(&mut self) -> u32 {
+        if self.next_output_index as usize >= MAX_STREAM_OUTPUT_ITEMS {
+            self.stream_error = Some("stream contains too many output items".into());
+        }
         let index = self.next_output_index;
         self.next_output_index += 1;
         index
@@ -791,6 +839,14 @@ impl ChatToResponsesState {
 
         sse::response_failed(&response)
     }
+}
+
+fn append_limited(target: &mut String, delta: &str, limit: usize) -> bool {
+    if target.len().saturating_add(delta.len()) > limit {
+        return false;
+    }
+    target.push_str(delta);
+    true
 }
 
 fn chat_delta_reasoning_text(delta: &Value) -> Option<String> {
@@ -848,7 +904,13 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_model<
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    if !append_utf8_safe_bounded(&mut buffer, &mut utf8_remainder, &bytes) {
+                        yield Ok(state.failed_event(
+                            format!("Upstream SSE event exceeds the {MAX_SSE_BLOCK_BYTES} byte limit"),
+                            Some("upstream_sse_too_large".to_owned()),
+                        ));
+                        break;
+                    }
 
                     while let Some(block) = take_sse_block(&mut buffer) {
                         if block.trim().is_empty() {
@@ -911,6 +973,11 @@ pub(crate) fn create_responses_sse_stream_from_chat_with_model<
 
                         for event in state.handle_chat_chunk(&chunk) {
                             yield Ok(event);
+                        }
+                        if let Some(error) = state.stream_error.take() {
+                            yield Ok(state.failed_event(error, Some("stream_limit_exceeded".into())));
+                            stream_failed = true;
+                            break;
                         }
                     }
 
