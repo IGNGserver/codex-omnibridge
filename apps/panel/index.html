@@ -41,7 +41,7 @@
             <img src="app-icon.png?v=3" alt="" width="40" height="40" draggable="false" />
           </div>
           <h1 class="m3-brand-title">Codex OmniBridge</h1>
-          <span class="m3-brand-version m3-label-small">v0.1.0</span>
+          <span class="m3-brand-version m3-label-small" id="app-version-label">版本读取中…</span>
         </div>
 
         <div class="m3-app-bar__trailing window-no-drag">
@@ -124,7 +124,7 @@
           </button>
 
           <div class="m3-nav-footer">
-            <span class="m3-label-small m3-text-muted">OmniBridge Core v0.1.0</span>
+            <span class="m3-label-small m3-text-muted" id="core-version-label">OmniBridge Core 版本读取中…</span>
             <span class="m3-body-small m3-text-variant">无头多模型桥接路由器</span>
           </div>
         </nav>
@@ -297,7 +297,7 @@
               <div class="m3-section-header">
                 <div class="m3-section-title-group">
                   <h2 class="m3-headline-small" id="accounts-heading">官方账号</h2>
-                  <p class="m3-body-medium">可选的账号托管与额度页。当前登录账号不保存也可以继续使用 Codex。</p>
+                  <p class="m3-body-medium">可选的账号托管与额度页。当前登录账号不保存也可以继续使用 Codex；已保存账号的额度每 5 分钟自动刷新。</p>
                 </div>
                 <div class="m3-section-actions">
                   <button class="m3-btn m3-btn-filled" id="capture-account-action-btn">
@@ -598,10 +598,10 @@
                       <h3 class="m3-title-large">关于与版本信息</h3>
                       <p class="m3-body-medium m3-quota-note">当前构建与运行环境版本</p>
                     </div>
-                    <div class="m3-chip m3-chip--neutral">v0.1.0</div>
+                    <div class="m3-chip m3-chip--neutral" id="settings-version-chip">版本读取中…</div>
                   </div>
                   <div class="m3-settings-row">
-                    <span class="m3-body-medium m3-settings-hint" id="settings-version-info">Codex OmniBridge 面板版本: v0.1.0 · Rust Core: v0.1.0</span>
+                    <span class="m3-body-medium m3-settings-hint" id="settings-version-info">正在读取版本信息…</span>
                   </div>
                 </div>
               </div>
@@ -752,17 +752,86 @@
             </div>
             <div class="m3-text-field__support"><span>例如 131072；留空表示使用默认值</span></div>
           </div>
-          <div class="m3-model-tags">
-            <label class="m3-checkbox">
-              <input type="checkbox" name="images" />
-              <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
-              <span class="m3-checkbox__label">图片与视觉输入</span>
-            </label>
-            <label class="m3-checkbox">
-              <input type="checkbox" name="tools" />
-              <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
-              <span class="m3-checkbox__label">允许工具调用</span>
-            </label>
+          <div class="m3-model-capability-form" data-model-capability-form>
+            <div class="m3-model-capability-section">
+              <span class="m3-body-small m3-text-variant">模型能力</span>
+              <div class="m3-model-tags">
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_text" data-capability="text" checked />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">文本</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_images" data-capability="images" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">图片</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_files" data-capability="files" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">文件</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_audio" data-capability="audio" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">音频</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_video" data-capability="video" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">视频</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_tools" data-capability="tools" />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">工具调用</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="cap_streaming" data-capability="streaming" checked />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">流式输出</span>
+                </label>
+              </div>
+            </div>
+            <div class="m3-model-capability-section">
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_reasoning" data-capability="reasoning" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">支持思考</span>
+              </label>
+              <fieldset class="m3-model-reasoning-levels" data-reasoning-controls disabled>
+                <legend class="m3-body-small m3-text-variant">可用思考档位</legend>
+                <div class="m3-model-tags">
+                  <label class="m3-checkbox">
+                    <input type="checkbox" name="reasoning_level" value="low" data-reasoning-level />
+                    <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                    <span class="m3-checkbox__label">low</span>
+                  </label>
+                  <label class="m3-checkbox">
+                    <input type="checkbox" name="reasoning_level" value="medium" data-reasoning-level />
+                    <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                    <span class="m3-checkbox__label">medium</span>
+                  </label>
+                  <label class="m3-checkbox">
+                    <input type="checkbox" name="reasoning_level" value="high" data-reasoning-level />
+                    <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                    <span class="m3-checkbox__label">high</span>
+                  </label>
+                  <label class="m3-checkbox">
+                    <input type="checkbox" name="reasoning_level" value="xhigh" data-reasoning-level />
+                    <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                    <span class="m3-checkbox__label">xhigh</span>
+                  </label>
+                </div>
+                <div class="m3-text-field m3-text-field--outlined">
+                  <div class="m3-text-field__control">
+                    <input class="m3-text-field__input" name="reasoning_levels_custom" placeholder=" " id="add-model-reasoning-levels-custom" data-reasoning-custom />
+                    <label class="m3-text-field__label" for="add-model-reasoning-levels-custom">自定义档位</label>
+                  </div>
+                  <div class="m3-text-field__support"><span>可用逗号分隔，例如 balanced, ultra</span></div>
+                </div>
+              </fieldset>
+            </div>
           </div>
           <div class="m3-dialog__actions">
             <button type="button" class="m3-btn m3-btn-text" id="close-add-model-btn">取消</button>
@@ -777,9 +846,9 @@
       <div class="m3-dialog__body">
         <div class="m3-dialog__head">
           <h2 class="m3-headline-small" id="edit-model-title">编辑模型</h2>
-          <p class="m3-body-medium" id="edit-model-subtitle">修改 Codex 中的显示名称和上下文长度。</p>
+          <p class="m3-body-medium" id="edit-model-subtitle">修改显示名称、上下文长度、模型能力和思考档位。</p>
         </div>
-        <form id="m3-edit-model-form" class="m3-settings-form">
+        <form id="m3-edit-model-form" class="m3-settings-form" data-model-capability-form>
           <input type="hidden" name="logical_model_id" />
           <div class="m3-text-field m3-text-field--outlined">
             <div class="m3-text-field__control">
@@ -799,6 +868,85 @@
             <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
             <span class="m3-checkbox__label">清除自定义上下文长度</span>
           </label>
+          <div class="m3-model-capability-section">
+            <span class="m3-body-small m3-text-variant">模型能力</span>
+            <div class="m3-model-tags">
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_text" data-capability="text" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">文本</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_images" data-capability="images" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">图片</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_files" data-capability="files" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">文件</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_audio" data-capability="audio" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">音频</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_video" data-capability="video" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">视频</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_tools" data-capability="tools" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">工具调用</span>
+              </label>
+              <label class="m3-checkbox">
+                <input type="checkbox" name="cap_streaming" data-capability="streaming" />
+                <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                <span class="m3-checkbox__label">流式输出</span>
+              </label>
+            </div>
+          </div>
+          <div class="m3-model-capability-section">
+            <label class="m3-checkbox">
+              <input type="checkbox" name="cap_reasoning" data-capability="reasoning" />
+              <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+              <span class="m3-checkbox__label">支持思考</span>
+            </label>
+            <fieldset class="m3-model-reasoning-levels" data-reasoning-controls disabled>
+              <legend class="m3-body-small m3-text-variant">可用思考档位</legend>
+              <div class="m3-model-tags">
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="reasoning_level" value="low" data-reasoning-level />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">low</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="reasoning_level" value="medium" data-reasoning-level />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">medium</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="reasoning_level" value="high" data-reasoning-level />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">high</span>
+                </label>
+                <label class="m3-checkbox">
+                  <input type="checkbox" name="reasoning_level" value="xhigh" data-reasoning-level />
+                  <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+                  <span class="m3-checkbox__label">xhigh</span>
+                </label>
+              </div>
+              <div class="m3-text-field m3-text-field--outlined">
+                <div class="m3-text-field__control">
+                  <input class="m3-text-field__input" name="reasoning_levels_custom" placeholder=" " id="edit-model-reasoning-levels-custom" data-reasoning-custom />
+                  <label class="m3-text-field__label" for="edit-model-reasoning-levels-custom">自定义档位</label>
+                </div>
+                <div class="m3-text-field__support"><span>可用逗号分隔，例如 balanced, ultra</span></div>
+              </div>
+            </fieldset>
+          </div>
           <div class="m3-dialog__actions">
             <button type="button" class="m3-btn m3-btn-text" id="close-edit-model-btn">取消</button>
             <button type="submit" class="m3-btn m3-btn-filled" id="edit-model-submit">保存修改</button>

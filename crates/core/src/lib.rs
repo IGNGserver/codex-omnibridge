@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
@@ -13,6 +13,55 @@ use url::Url;
 
 pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_WEB_PORT: u16 = 31828;
+/// Maximum size of a persisted JSON/TOML state document accepted by the core.
+/// These files contain configuration and metadata, not model payloads; a much
+/// larger document is almost certainly corrupt or hostile and must not be read
+/// into memory unboundedly.
+pub const MAX_STATE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum stdout/stderr retained from a metadata command. The reader still
+/// drains the pipe after the cap so a normal child cannot deadlock on a full
+/// pipe, but the captured result never grows without bound.
+pub const MAX_CHILD_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROVIDERS: usize = 1024;
+const MAX_MODELS_PER_PROVIDER: usize = 4096;
+const MAX_OFFICIAL_MODELS: usize = 8192;
+const MAX_MODEL_ID_CHARS: usize = 1024;
+const MAX_DISPLAY_NAME_CHARS: usize = 512;
+const MAX_REASONING_LEVELS: usize = 32;
+const MAX_REASONING_LEVEL_CHARS: usize = 64;
+const MAX_PROVIDER_NAME_CHARS: usize = 512;
+const MAX_BASE_URL_CHARS: usize = 2048;
+const MAX_CREDENTIAL_REFERENCE_CHARS: usize = 512;
+const MAX_STATIC_HEADERS: usize = 64;
+const MAX_HEADER_VALUE_CHARS: usize = 4096;
+
+/// Read a UTF-8 state document with an actual byte cap.
+///
+/// Checking only metadata or Content-Length is insufficient: files can grow
+/// after the check and HTTP peers may omit or lie about their length. Reading
+/// at most `max_bytes + 1` lets callers reject the document before parsing it.
+pub fn read_to_string_limited(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state file exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state file is not valid UTF-8: {error}"),
+        )
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebSecurityConfig {
@@ -54,6 +103,8 @@ pub enum CoreError {
     InvalidBaseUrl(String),
     #[error("invalid provider header: {0}")]
     InvalidHeader(String),
+    #[error("invalid reasoning level: {0}")]
+    InvalidReasoningLevel(String),
     #[error("provider `{0}` already exists")]
     ProviderExists(String),
     #[error("provider `{0}` was not found")]
@@ -86,6 +137,8 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("unsupported registry schema version {0}")]
     UnsupportedSchema(u32),
+    #[error("registry contains too many {0}")]
+    RegistryTooLarge(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -131,6 +184,8 @@ impl AuthStrategy {
 pub struct ModelCapabilities {
     #[serde(default)]
     pub reasoning: bool,
+    #[serde(default = "default_true")]
+    pub text: bool,
     #[serde(default)]
     pub tools: bool,
     #[serde(default)]
@@ -138,6 +193,10 @@ pub struct ModelCapabilities {
     #[serde(default)]
     pub files: bool,
     #[serde(default)]
+    pub audio: bool,
+    #[serde(default)]
+    pub video: bool,
+    #[serde(default = "default_true")]
     pub streaming: bool,
 }
 
@@ -148,10 +207,13 @@ impl Default for ModelCapabilities {
         // calls in the generated catalog) before anything had verified that the
         // provider can honour the full tool lifecycle.
         Self {
-            reasoning: true,
+            reasoning: false,
+            text: true,
             tools: false,
             images: false,
             files: false,
+            audio: false,
+            video: false,
             streaming: true,
         }
     }
@@ -179,6 +241,8 @@ pub struct CustomModel {
 pub struct ModelEdit {
     pub display_name: Option<String>,
     pub context_window: Option<Option<u64>>,
+    pub reasoning_levels: Option<Vec<String>>,
+    pub capabilities: Option<ModelCapabilities>,
 }
 
 impl CustomModel {
@@ -200,8 +264,29 @@ impl CustomModel {
             capabilities: ModelCapabilities::default(),
             enabled: true,
             context_window: None,
-            reasoning_levels: vec!["low".into(), "medium".into(), "high".into()],
+            reasoning_levels: Vec::new(),
         })
+    }
+
+    /// Construct a model with metadata supplied by a provider or by the panel.
+    ///
+    /// `CustomModel::new` intentionally uses conservative capability defaults;
+    /// callers that have real metadata should use this constructor so the
+    /// generated Codex catalog reflects what the upstream actually supports.
+    pub fn with_metadata(
+        provider_id: &str,
+        upstream_model_id: &str,
+        display_name: &str,
+        capabilities: ModelCapabilities,
+        reasoning_levels: Vec<String>,
+    ) -> Result<Self, CoreError> {
+        let mut model = Self::new(provider_id, upstream_model_id, display_name)?;
+        model.capabilities = capabilities;
+        model.reasoning_levels = normalize_reasoning_levels(reasoning_levels)?;
+        if !model.capabilities.reasoning {
+            model.reasoning_levels.clear();
+        }
+        Ok(model)
     }
 }
 
@@ -252,8 +337,20 @@ impl ProviderConfig {
 
     pub fn validate(&self) -> Result<(), CoreError> {
         validate_provider_id(&self.id)?;
-        if self.name.trim().is_empty() {
+        if self.name.trim().is_empty() || self.name.chars().count() > MAX_PROVIDER_NAME_CHARS {
             return Err(CoreError::EmptyProviderName);
+        }
+        if self.base_url.chars().count() > MAX_BASE_URL_CHARS
+            || self.credential_reference.chars().count() > MAX_CREDENTIAL_REFERENCE_CHARS
+        {
+            return Err(CoreError::RegistryTooLarge(
+                "provider metadata strings".to_owned(),
+            ));
+        }
+        if self.static_headers.len() > MAX_STATIC_HEADERS {
+            return Err(CoreError::RegistryTooLarge(
+                "static provider headers".to_owned(),
+            ));
         }
         normalize_base_url(&self.base_url)?;
         validate_static_headers(&self.static_headers)?;
@@ -268,14 +365,30 @@ impl ProviderConfig {
                 return Err(CoreError::InvalidHeader(name.clone()));
             }
         }
+        if self.models.len() > MAX_MODELS_PER_PROVIDER {
+            return Err(CoreError::RegistryTooLarge(
+                "models for one provider".to_owned(),
+            ));
+        }
         let mut model_ids = BTreeSet::new();
         for model in &self.models {
             if model.upstream_model_id.trim().is_empty()
                 || model.upstream_model_id.chars().any(char::is_control)
+                || model.upstream_model_id.chars().count() > MAX_MODEL_ID_CHARS
                 || model.logical_model_id != format!("{}/{}", self.id, model.upstream_model_id)
+                || model.logical_model_id.chars().count() > MAX_MODEL_ID_CHARS
+                || model.display_name.chars().count() > MAX_DISPLAY_NAME_CHARS
             {
                 return Err(CoreError::InvalidModelId(model.logical_model_id.clone()));
             }
+            normalize_reasoning_levels(model.reasoning_levels.clone()).map_err(
+                |error| match error {
+                    CoreError::InvalidReasoningLevel(level) => CoreError::InvalidReasoningLevel(
+                        format!("{} for model `{}`", level, model.logical_model_id),
+                    ),
+                    other => other,
+                },
+            )?;
             if !model_ids.insert(model.logical_model_id.clone()) {
                 return Err(CoreError::ModelExists(model.logical_model_id.clone()));
             }
@@ -316,10 +429,19 @@ impl ProviderRegistryFile {
         if self.schema_version != REGISTRY_SCHEMA_VERSION {
             return Err(CoreError::UnsupportedSchema(self.schema_version));
         }
+        if self.providers.len() > MAX_PROVIDERS {
+            return Err(CoreError::RegistryTooLarge("providers".to_owned()));
+        }
+        if self.official_models.len() > MAX_OFFICIAL_MODELS {
+            return Err(CoreError::RegistryTooLarge("official models".to_owned()));
+        }
         let mut ids = BTreeSet::new();
         let mut official = BTreeSet::new();
         for model in &self.official_models {
-            if model.trim().is_empty() || model.chars().any(char::is_control) {
+            if model.trim().is_empty()
+                || model.chars().any(char::is_control)
+                || model.chars().count() > MAX_MODEL_ID_CHARS
+            {
                 return Err(CoreError::InvalidModelId(model.clone()));
             }
             if !official.insert(model.clone()) {
@@ -373,7 +495,7 @@ impl ProviderRegistry {
         if !path.exists() {
             return Ok(Self::empty(path));
         }
-        let content = fs::read_to_string(&path)?;
+        let content = read_to_string_limited(&path, MAX_STATE_FILE_BYTES)?;
         let mut file: ProviderRegistryFile = serde_json::from_str(&content)?;
         // Version 1 did not carry an explicit official route table. It is safe
         // to load it for migration, but it cannot be served until sync records
@@ -492,6 +614,11 @@ impl ProviderRegistry {
         let provider = self
             .provider_mut(provider_id)
             .ok_or_else(|| CoreError::ProviderNotFound(provider_id.to_owned()))?;
+        let mut model = model;
+        model.reasoning_levels = normalize_reasoning_levels(model.reasoning_levels)?;
+        if !model.capabilities.reasoning {
+            model.reasoning_levels.clear();
+        }
         if provider
             .models
             .iter()
@@ -538,6 +665,15 @@ impl ProviderRegistry {
         }
         if let Some(context_window) = edit.context_window {
             model.context_window = context_window;
+        }
+        if let Some(capabilities) = edit.capabilities {
+            model.capabilities = capabilities;
+        }
+        if let Some(reasoning_levels) = edit.reasoning_levels {
+            model.reasoning_levels = normalize_reasoning_levels(reasoning_levels)?;
+        }
+        if !model.capabilities.reasoning {
+            model.reasoning_levels.clear();
         }
         self.bump_generation();
         Ok(())
@@ -861,7 +997,7 @@ fn lock_is_abandoned(path: &Path) -> bool {
     {
         return true;
     }
-    match fs::read_to_string(path) {
+    match read_to_string_limited(path, 4 * 1024) {
         Ok(contents) => contents
             .trim()
             .parse::<u32>()
@@ -882,9 +1018,9 @@ fn process_is_alive(pid: u32) -> bool {
 fn process_is_alive(pid: u32) -> bool {
     // Fall back to "alive" when the probe cannot run; the age check is the
     // backstop, and erring toward "alive" never corrupts state.
-    std::process::Command::new("tasklist.exe")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
+    let mut command = std::process::Command::new("tasklist.exe");
+    command.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    run_with_timeout(&mut command, std::time::Duration::from_secs(2))
         .map(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
         .unwrap_or(true)
 }
@@ -1056,36 +1192,82 @@ pub fn run_with_timeout(
     // failed with a bogus "did not finish within 30s" against every real Codex.
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let stdout_reader = std::thread::spawn(move || drain(stdout_pipe));
-    let stderr_reader = std::thread::spawn(move || drain(stderr_pipe));
+    let (stdout_sender, stdout_reader) = std::sync::mpsc::sync_channel(1);
+    let (stderr_sender, stderr_reader) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = stdout_sender.send(drain(stdout_pipe));
+    });
+    std::thread::spawn(move || {
+        let _ = stderr_sender.send(drain(stderr_pipe));
+    });
 
     let deadline = std::time::Instant::now() + limit;
+    let mut wait_error = None;
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     kill_process_tree(&mut child);
                     break None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
+            Err(error) => {
+                // `Child::try_wait` can fail after the process has already
+                // become unavailable. Dropping the handle here would leave a
+                // live child and detached drain threads behind, so terminate
+                // the process tree before returning the probe error.
+                wait_error = Some(error);
+                kill_process_tree(&mut child);
+                break None;
+            }
         }
     };
 
-    // The pipes close once the child (and any process holding them) exits, so
-    // these joins are bounded by the child's lifetime; a killed child closes them
-    // too. Joining after `kill` is deliberate: it guarantees the collected output
-    // belongs to this run rather than a partially-read buffer.
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // A descendant can inherit a pipe even after the direct child exits. Never
+    // join the reader threads without a deadline: a broken wrapper must not turn
+    // this bounded command into a permanently blocked caller. The readers keep a
+    // fixed-size buffer and are detached if a hostile descendant retains a pipe.
+    let drain_grace = std::time::Duration::from_secs(2);
+    let stdout = stdout_reader.recv_timeout(drain_grace).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "command stdout pipe did not close within the drain grace period",
+        )
+    });
+    let stderr = stderr_reader.recv_timeout(drain_grace).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "command stderr pipe did not close within the drain grace period",
+        )
+    });
+
+    if let Some(error) = wait_error {
+        // Still consume the reader results when possible so the bounded
+        // command does not leave a pipe-backed thread alive merely because
+        // process status probing failed.
+        let _ = stdout?;
+        let _ = stderr?;
+        return Err(error);
+    }
 
     match status {
-        Some(status) => Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        }),
+        Some(status) => {
+            let (stdout, stdout_truncated) = stdout?;
+            let (stderr, stderr_truncated) = stderr?;
+            if stdout_truncated || stderr_truncated {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("command output exceeds the {MAX_CHILD_OUTPUT_BYTES} byte limit"),
+                ));
+            }
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
         None => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!("command did not finish within {limit:?}"),
@@ -1109,6 +1291,21 @@ fn kill_process_tree(child: &mut std::process::Child) {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
+    #[cfg(windows)]
+    {
+        // `Child::kill` only terminates the direct process on Windows. Ask
+        // taskkill to terminate its descendant tree as well, but keep that
+        // cleanup itself bounded because it runs on the timeout path.
+        let pid = child.id().to_string();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid, "/T", "/F"])
+                .status();
+            let _ = sender.send(result);
+        });
+        let _ = receiver.recv_timeout(std::time::Duration::from_secs(2));
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1117,12 +1314,27 @@ fn kill_process_tree(child: &mut std::process::Child) {
 ///
 /// Generic over both `ChildStdout` and `ChildStderr`, which are distinct types
 /// with the same `Read` implementation.
-fn drain<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
+fn drain<R: std::io::Read>(pipe: Option<R>) -> (Vec<u8>, bool) {
     let mut collected = Vec::new();
+    let mut truncated = false;
     if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut collected);
+        let mut buffer = [0_u8; 16 * 1024];
+        while let Ok(read) = pipe.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            if collected.len() < MAX_CHILD_OUTPUT_BYTES {
+                let keep = (MAX_CHILD_OUTPUT_BYTES - collected.len()).min(read);
+                collected.extend_from_slice(&buffer[..keep]);
+                if keep < read {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+        }
     }
-    collected
+    (collected, truncated)
 }
 
 pub fn atomic_replace(
@@ -1184,7 +1396,10 @@ pub fn atomic_replace(
             }
             std::thread::sleep(std::time::Duration::from_millis(10 * (attempt as u64 + 1)));
         }
-        unreachable!("the atomic replacement retry loop always returns")
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "atomic replacement retry loop exhausted",
+        ))
     }
 }
 
@@ -1396,6 +1611,30 @@ fn default_true() -> bool {
     true
 }
 
+fn normalize_reasoning_levels(levels: Vec<String>) -> Result<Vec<String>, CoreError> {
+    if levels.len() > MAX_REASONING_LEVELS {
+        return Err(CoreError::RegistryTooLarge(
+            "reasoning levels for one model".to_owned(),
+        ));
+    }
+    let mut normalized = Vec::with_capacity(levels.len());
+    let mut seen = BTreeSet::new();
+    for raw in levels {
+        let level = raw.trim();
+        if level.is_empty()
+            || level.chars().any(char::is_control)
+            || level.chars().count() > MAX_REASONING_LEVEL_CHARS
+        {
+            return Err(CoreError::InvalidReasoningLevel(raw));
+        }
+        if !seen.insert(level.to_owned()) {
+            return Err(CoreError::InvalidReasoningLevel(level.to_owned()));
+        }
+        normalized.push(level.to_owned());
+    }
+    Ok(normalized)
+}
+
 fn default_generation() -> u64 {
     1
 }
@@ -1412,7 +1651,7 @@ fn validate_static_headers(headers: &BTreeMap<String, String>) -> Result<(), Cor
         {
             return Err(CoreError::InvalidHeader(name.clone()));
         }
-        if value.chars().any(char::is_control) {
+        if value.chars().any(char::is_control) || value.chars().count() > MAX_HEADER_VALUE_CHARS {
             return Err(CoreError::InvalidHeader(name.clone()));
         }
     }
@@ -2410,6 +2649,7 @@ mod tests {
                 ModelEdit {
                     display_name: Some("  Preferred name  ".into()),
                     context_window: Some(Some(131_072)),
+                    ..ModelEdit::default()
                 },
             )
             .unwrap();

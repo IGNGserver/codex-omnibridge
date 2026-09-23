@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: true,
   localToken: bootstrap.localToken,
   apiBase: bootstrap.apiBase,
+  appVersion: bootstrap.appVersion || "",
   minimizeWindow: () => ipcRenderer.send("window-minimize"),
   maximizeWindow: () => ipcRenderer.send("window-maximize"),
   closeWindow: () => ipcRenderer.send("window-close"),

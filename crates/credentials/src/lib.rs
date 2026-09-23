@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keyring::Entry;
@@ -17,6 +17,11 @@ use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
 const DEFAULT_SERVICE: &str = "dev.codex-multiprovider";
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CREDENTIAL_OPERATIONS: usize = 8;
+const CREDENTIAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+static CREDENTIAL_OPERATION_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// References already reported as served by an environment override.
 ///
@@ -156,15 +161,31 @@ fn set_in_file_at(
 ) -> Result<(), CredentialStoreError> {
     let _guard = codex_mp_core::FileLock::acquire(path)
         .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
-    let mut map: HashMap<String, String> = fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut map = read_file_map(path)?;
     map.insert(reference.to_owned(), value.expose_secret().to_owned());
     let json_str = serde_json::to_string(&map)
         .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
     write_private_json_atomic(path, &json_str)
         .map_err(|error| CredentialStoreError::Backend(error.to_string()))
+}
+
+/// Read the optional file backend without turning corruption, permission
+/// failures, or an oversized document into an empty map. Treating every read
+/// error as "no credentials" can overwrite the only surviving copy of a
+/// user's tokens during the next write.
+fn read_file_map(path: &Path) -> Result<HashMap<String, String>, CredentialStoreError> {
+    let contents = match codex_mp_core::read_to_string_limited(path, MAX_CREDENTIAL_FILE_BYTES) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(CredentialStoreError::Backend(format!(
+                "credential file could not be read: {error}"
+            )));
+        }
+    };
+    serde_json::from_str(&contents).map_err(|error| {
+        CredentialStoreError::Backend(format!("credential file is not valid JSON: {error}"))
+    })
 }
 
 impl NativeCredentialStore {
@@ -220,10 +241,8 @@ impl CredentialStore for NativeCredentialStore {
 
         if self.file_backend_enabled() {
             let fallback_file = file_backend_path();
-            if let Ok(s) = std::fs::read_to_string(&fallback_file)
-                && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
-                && let Some(val) = map.get(reference)
-            {
+            let map = read_file_map(&fallback_file)?;
+            if let Some(val) = map.get(reference) {
                 return Ok(SecretString::from(val.clone()));
             }
         }
@@ -235,10 +254,8 @@ impl CredentialStore for NativeCredentialStore {
                 // If the key was stored in the file store (e.g. automatic fallback for large secrets),
                 // check the file store before giving up.
                 let fallback_file = file_backend_path();
-                if let Ok(s) = std::fs::read_to_string(&fallback_file)
-                    && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&s)
-                    && let Some(val) = map.get(reference)
-                {
+                let map = read_file_map(&fallback_file)?;
+                if let Some(val) = map.get(reference) {
                     return Ok(SecretString::from(val.clone()));
                 }
                 if matches!(error, keyring::Error::NoEntry) {
@@ -298,15 +315,16 @@ impl CredentialStore for NativeCredentialStore {
         // Always clean up any entry in the file store (handles file backend or fallback writes)
         let fallback_file = file_backend_path();
         let mut removed_from_file = false;
-        if fallback_file.exists()
-            && let Ok(_guard) = codex_mp_core::FileLock::acquire(&fallback_file)
-            && let Ok(s) = fs::read_to_string(&fallback_file)
-            && let Ok(mut map) = serde_json::from_str::<HashMap<String, String>>(&s)
-            && map.remove(reference).is_some()
-        {
-            removed_from_file = true;
-            if let Ok(json_str) = serde_json::to_string(&map) {
-                let _ = write_private_json_atomic(&fallback_file, &json_str);
+        if fallback_file.exists() {
+            let _guard = codex_mp_core::FileLock::acquire(&fallback_file)
+                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+            let mut map = read_file_map(&fallback_file)?;
+            if map.remove(reference).is_some() {
+                removed_from_file = true;
+                let json_str = serde_json::to_string(&map)
+                    .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+                write_private_json_atomic(&fallback_file, &json_str)
+                    .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
             }
         }
 
@@ -339,10 +357,31 @@ where
     T: Send + 'static,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle
-            .spawn_blocking(operation)
-            .await
-            .map_err(|error| CredentialStoreError::Backend(error.to_string()))?,
+        Ok(handle) => {
+            let slots = CREDENTIAL_OPERATION_SLOTS
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CREDENTIAL_OPERATIONS)))
+                .clone();
+            let permit = tokio::time::timeout(CREDENTIAL_OPERATION_TIMEOUT, slots.acquire_owned())
+                .await
+                .map_err(|_| {
+                    CredentialStoreError::Backend(
+                        "credential backend is overloaded; try again later".to_owned(),
+                    )
+                })?
+                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?;
+            let task = handle.spawn_blocking(move || {
+                let _permit = permit;
+                operation()
+            });
+            tokio::time::timeout(CREDENTIAL_OPERATION_TIMEOUT, task)
+                .await
+                .map_err(|_| {
+                    CredentialStoreError::Backend(
+                        "credential backend operation timed out".to_owned(),
+                    )
+                })?
+                .map_err(|error| CredentialStoreError::Backend(error.to_string()))?
+        }
         Err(_) => operation(),
     }
 }

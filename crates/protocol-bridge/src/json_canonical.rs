@@ -31,8 +31,11 @@ pub fn canonical_json_string(value: &Value) -> String {
         Value::Null => "null".to_string(),
         Value::Bool(value) => value.to_string(),
         Value::Number(value) => value.to_string(),
-        Value::String(value) => serde_json::to_string(value)
-            .expect("serializing a JSON string for canonical output should not fail"),
+        // `String` is an infallible serde_json writer in practice, but this
+        // helper is used on request data and must not turn a serialization
+        // failure into a process panic. The fallback is valid JSON and keeps
+        // the non-Result API backward compatible.
+        Value::String(value) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned()),
         Value::Array(values) => {
             let parts = values.iter().map(canonical_json_string).collect::<Vec<_>>();
             format!("[{}]", parts.join(","))
@@ -43,9 +46,7 @@ pub fn canonical_json_string(value: &Value) -> String {
             let parts = entries
                 .into_iter()
                 .map(|(key, value)| {
-                    let key = serde_json::to_string(key).expect(
-                        "serializing a JSON object key for canonical output should not fail",
-                    );
+                    let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
                     format!("{key}:{}", canonical_json_string(value))
                 })
                 .collect::<Vec<_>>();

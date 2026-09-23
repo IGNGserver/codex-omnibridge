@@ -5,6 +5,7 @@
 //! or any OAuth material.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +26,9 @@ const MANIFEST_FILE: &str = "integration.json";
 const MANAGED_KEY: &str = "model_catalog_json";
 const MANAGED_PROVIDER_KEY: &str = "model_provider";
 const OMNIBRIDGE_PROVIDER_ID: &str = "omnibridge";
+const MAX_INTEGRATION_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_INTEGRATION_CATALOG_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CAPABILITY_BYTES: u64 = 4096;
 
 #[derive(Debug, Error)]
 pub enum IntegrationError {
@@ -234,7 +238,7 @@ pub fn build_and_install(
             paths.catalog.clone(),
         ));
     }
-    let previous_catalog = match fs::read(&paths.catalog) {
+    let previous_catalog = match read_bytes_limited(&paths.catalog, MAX_INTEGRATION_CATALOG_BYTES) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
@@ -354,8 +358,13 @@ pub fn build_and_install(
     save_manifest(&paths.manifest, &manifest)?;
 
     // Phase 2: mutate, rolling back to the recorded originals on any failure.
+    let mut created_capability: Option<String> = None;
     let applied = (|| -> Result<(), IntegrationError> {
+        let capability_was_present = capability_path.exists();
         let capability = ensure_capability(&capability_path)?;
+        if !capability_was_present {
+            created_capability = Some(capability.clone());
+        }
         write_catalog_atomic(&merged, &paths.catalog)?;
         // Mutate a layout-preserving document so user comments and unrelated
         // tables survive the sync byte-for-byte.
@@ -380,10 +389,15 @@ pub fn build_and_install(
             restore_config_snapshot(&paths.codex_config, &config_content, config_existed);
         let catalog_rollback =
             restore_catalog_snapshot(&paths.catalog, previous_catalog.as_deref());
+        let capability_rollback = if let Some(created) = created_capability.as_deref() {
+            remove_created_capability(&capability_path, created)
+        } else {
+            Ok(())
+        };
         // The intent record must go too, otherwise a failed sync leaves a
         // "pending" manifest behind and blocks the next attempt.
         let manifest_rollback = fs::remove_file(&paths.manifest);
-        if config_rollback.is_err() || catalog_rollback.is_err() {
+        if config_rollback.is_err() || catalog_rollback.is_err() || capability_rollback.is_err() {
             return Err(IntegrationError::InvalidManifest(format!(
                 "sync failed ({error}) and rollback was incomplete"
             )));
@@ -605,7 +619,7 @@ fn provider_table_matches(config: &toml::Value, paths: &IntegrationPaths) -> boo
         return false;
     };
     let expected_base = paths.router_base_url();
-    let capability = fs::read_to_string(paths.capability_path())
+    let capability = read_text_limited(&paths.capability_path(), MAX_CAPABILITY_BYTES)
         .ok()
         .map(|value| value.trim().to_owned());
     let header_matches = provider
@@ -637,7 +651,9 @@ pub fn ensure_capability(path: &Path) -> Result<String, IntegrationError> {
                 path.display()
             )));
         }
-        let value = fs::read_to_string(path)?.trim().to_owned();
+        let value = read_text_limited(path, MAX_CAPABILITY_BYTES)?
+            .trim()
+            .to_owned();
         if value.is_empty() {
             return Err(IntegrationError::Capability(
                 "capability file is empty".into(),
@@ -718,7 +734,7 @@ fn validate_manifest_paths(
 pub fn router_port_for_registry(registry_path: impl AsRef<Path>) -> u16 {
     let paths = IntegrationPaths::for_registry(registry_path);
     let fallback_port = port_from_base_url(&paths.router_base_url()).unwrap_or(8787);
-    let Ok(content) = fs::read_to_string(&paths.codex_config) else {
+    let Ok(content) = read_text_limited(&paths.codex_config, MAX_INTEGRATION_TEXT_BYTES) else {
         return fallback_port;
     };
     let Ok(document) = content.parse::<toml_edit::DocumentMut>() else {
@@ -935,7 +951,7 @@ pub fn restore_if_present(paths: &IntegrationPaths) -> Result<bool, IntegrationE
 
 pub fn load_manifest(path: impl AsRef<Path>) -> Result<IntegrationManifest, IntegrationError> {
     let path = path.as_ref();
-    let content = fs::read_to_string(path)?;
+    let content = read_text_limited(path, MAX_INTEGRATION_TEXT_BYTES)?;
     // Report the file and a remedy rather than a bare parser message. This
     // manifest is our own record; when it is unreadable, `sync`, `repair` and
     // `restore` all stop here, so a message without the path left the user with
@@ -1181,11 +1197,49 @@ fn split_line_ending(segment: &str) -> (&str, &str) {
 }
 
 fn read_config(path: &Path) -> Result<String, IntegrationError> {
-    match fs::read_to_string(path) {
+    match read_text_limited(path, MAX_INTEGRATION_TEXT_BYTES) {
         Ok(content) => Ok(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_bytes_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes} byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_text_limited(path: &Path, max_bytes: u64) -> Result<String, std::io::Error> {
+    let bytes = read_bytes_limited(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file is not valid UTF-8: {error}"),
+        )
+    })
+}
+
+fn remove_created_capability(path: &Path, created: &str) -> Result<(), std::io::Error> {
+    // Only remove the token that this failed transaction created. If another
+    // process replaced the file while rollback was running, preserve that
+    // newer token rather than deleting a live capability.
+    if read_text_limited(path, MAX_CAPABILITY_BYTES)
+        .ok()
+        .is_some_and(|value| value.trim() == created)
+    {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn write_config(path: &Path, content: &str) -> Result<(), IntegrationError> {

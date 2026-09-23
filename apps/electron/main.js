@@ -12,6 +12,16 @@ let rustProcess = null;
 let isQuitting = false;
 let restartAttempts = 0;
 let quitCleanupStarted = false;
+let backendStartTimer = null;
+let backendWatchdogTimer = null;
+let backendWatchdogInFlight = false;
+let backendConsecutiveHealthFailures = 0;
+let backendGeneration = 0;
+let backendReady = false;
+let rendererRecoveryTimer = null;
+let rendererRecoveryAttempts = 0;
+let rendererRecoveryBackoffAttempts = 0;
+let traySyncProcess = null;
 const pendingBackendEvents = [];
 
 // 动态生成本次运行专属的本地特权 Token（免密通道）
@@ -34,6 +44,80 @@ try {
 const PANEL_DIR = path.resolve(__dirname, "../panel");
 const MAX_RESTART_DELAY_MS = 30000;
 const BACKEND_READY_TIMEOUT_MS = 8000;
+const BACKEND_HEALTH_INTERVAL_MS = 5000;
+const BACKEND_HEALTH_FAILURE_LIMIT = 3;
+const MAX_RENDERER_RECOVERY_ATTEMPTS = 3;
+const RENDERER_RECOVERY_BASE_DELAY_MS = 500;
+const MAX_RENDERER_RECOVERY_DELAY_MS = 30000;
+
+function stopBackendWatchdog() {
+  if (backendWatchdogTimer) {
+    clearTimeout(backendWatchdogTimer);
+    backendWatchdogTimer = null;
+  }
+  backendWatchdogInFlight = false;
+  backendConsecutiveHealthFailures = 0;
+}
+
+function scheduleBackendRestart(generation) {
+  if (isQuitting || generation !== backendGeneration || backendStartTimer) return;
+  const delay = Math.min(
+    1000 * 2 ** Math.min(restartAttempts, 5),
+    MAX_RESTART_DELAY_MS,
+  );
+  restartAttempts += 1;
+  console.warn(`[Rust Core] 异常退出，${delay}ms 后重试（第 ${restartAttempts} 次）...`);
+  backendStartTimer = setTimeout(() => {
+    backendStartTimer = null;
+    startRustBackend();
+  }, delay);
+}
+
+function markBackendReady(generation) {
+  if (generation !== backendGeneration || isQuitting) return;
+  backendReady = true;
+  restartAttempts = 0;
+  backendConsecutiveHealthFailures = 0;
+  startBackendWatchdog(generation);
+}
+
+function startBackendWatchdog(generation) {
+  stopBackendWatchdog();
+  const tick = async () => {
+    if (isQuitting || generation !== backendGeneration || !rustProcess) return;
+    if (backendWatchdogInFlight) {
+      backendWatchdogTimer = setTimeout(tick, BACKEND_HEALTH_INTERVAL_MS);
+      return;
+    }
+    backendWatchdogInFlight = true;
+    const response = await requestBackend("/healthz", { timeoutMs: 1200 });
+    backendWatchdogInFlight = false;
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      backendConsecutiveHealthFailures = 0;
+    } else {
+      backendConsecutiveHealthFailures += 1;
+      console.warn(
+        `[Rust Core] 健康检查失败 ${backendConsecutiveHealthFailures}/${BACKEND_HEALTH_FAILURE_LIMIT}`,
+      );
+      if (backendConsecutiveHealthFailures >= BACKEND_HEALTH_FAILURE_LIMIT) {
+        backendConsecutiveHealthFailures = 0;
+        const child = rustProcess;
+        if (child && !child.killed) {
+          console.error("[Rust Core] 后台服务失去响应，正在重启 Rust 进程。");
+          try {
+            child.kill();
+          } catch {
+            // close/error handlers perform the retry if the process is already gone.
+          }
+        }
+      }
+    }
+    if (!isQuitting && generation === backendGeneration) {
+      backendWatchdogTimer = setTimeout(tick, BACKEND_HEALTH_INTERVAL_MS);
+    }
+  };
+  backendWatchdogTimer = setTimeout(tick, BACKEND_HEALTH_INTERVAL_MS);
+}
 
 // 寻找 codex-mp 二进制路径
 function getBinaryPath() {
@@ -88,38 +172,93 @@ function reportToRenderer(kind, payload) {
   }
   // Structured payload instead of string-interpolated script: an error message
   // containing quotes or backticks must not be able to alter the executed code.
-  mainWindow.webContents.send("backend-event", { kind, ...payload });
+  try {
+    mainWindow.webContents.send("backend-event", { kind, ...payload });
+  } catch {
+    if (pendingBackendEvents.length >= 50) pendingBackendEvents.shift();
+    pendingBackendEvents.push({ kind, ...payload });
+  }
 }
 
 function flushPendingBackendEvents() {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isLoading()) return;
   while (pendingBackendEvents.length) {
-    mainWindow.webContents.send("backend-event", pendingBackendEvents.shift());
+    try {
+      mainWindow.webContents.send("backend-event", pendingBackendEvents.shift());
+    } catch {
+      break;
+    }
   }
 }
 
 function requestBackend(pathname, { method = "GET", headers = {}, body = null, timeoutMs = 1000 } = {}) {
   return new Promise((resolve) => {
-    const request = http.request(
-      {
-        hostname: "127.0.0.1",
-        port: defaultPort,
-        path: pathname,
-        method,
-        headers: {
-          ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
-          ...headers,
+    const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.max(1, Math.floor(timeoutMs))
+      : 1000;
+    let request = null;
+    let deadlineTimer = null;
+    let settled = false;
+    let responseStarted = false;
+
+    // Every caller only needs a small status result. Resolve exactly once so
+    // timeout, response errors, and normal completion cannot race each other
+    // or leave the watchdog's in-flight flag stuck forever.
+    const finish = (statusCode) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      resolve({ statusCode });
+    };
+
+    const abort = () => {
+      try {
+        request?.destroy();
+      } catch {
+        // The request may already have been closed.
+      }
+      finish(0);
+    };
+
+    try {
+      request = http.request(
+        {
+          hostname: "127.0.0.1",
+          port: defaultPort,
+          path: pathname,
+          method,
+          headers: {
+            ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
+            ...headers,
+          },
         },
-      },
-      (response) => {
-        response.resume();
-        response.on("end", () => resolve({ statusCode: response.statusCode || 0 }));
-      },
-    );
-    request.setTimeout(timeoutMs, () => request.destroy());
-    request.on("error", () => resolve({ statusCode: 0 }));
-    if (body) request.write(body);
-    request.end();
+        (response) => {
+          responseStarted = true;
+          response.resume();
+          response.on("end", () => finish(response.statusCode || 0));
+          response.on("error", () => finish(0));
+          response.on("aborted", () => finish(0));
+          response.on("close", () => {
+            if (!settled) finish(0);
+          });
+        },
+      );
+      // This protects against a peer that continuously sends a small amount
+      // of data: request.setTimeout() alone is only an idle timeout.
+      request.setTimeout(deadlineMs, abort);
+      request.on("error", () => finish(0));
+      request.on("close", () => {
+        if (!settled && !responseStarted) finish(0);
+      });
+      deadlineTimer = setTimeout(abort, deadlineMs);
+      if (body) request.write(body);
+      request.end();
+    } catch {
+      abort();
+    }
   });
 }
 
@@ -148,6 +287,14 @@ async function requestRouterStop() {
 
 // 启动 Rust 后台 Web & 路由服务
 function startRustBackend() {
+  if (isQuitting || (rustProcess && !rustProcess.killed)) return;
+  if (backendStartTimer) {
+    clearTimeout(backendStartTimer);
+    backendStartTimer = null;
+  }
+  const generation = ++backendGeneration;
+  backendReady = false;
+  stopBackendWatchdog();
   const binPath = getBinaryPath();
   console.log(`[Electron Main] 启动 Rust 后台守护进程: ${binPath}`);
 
@@ -156,7 +303,7 @@ function startRustBackend() {
   const args = ["web", "start", "--headless", `--port=${defaultPort}`];
 
   try {
-    rustProcess = spawn(binPath, args, {
+    const child = spawn(binPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       detached: false,
@@ -170,50 +317,43 @@ function startRustBackend() {
           : {}),
       },
     });
+    rustProcess = child;
+    startBackendWatchdog(generation);
 
-    rustProcess.stdout.on("data", (data) => {
-      const text = data.toString();
+    child.stdout.on("data", (data) => {
+      // Keep logs bounded per event. The backend remains responsible for its
+      // own log rotation; Electron must not retain a giant diagnostic chunk.
+      const text = data.toString().slice(0, 16 * 1024);
       console.log(`[Rust Core stdout] ${text.trim()}`);
-      // The backend prints this banner only after it has bound its port and
-      // started serving. Resetting the counter here makes the 5-attempt limit
-      // mean "5 consecutive failures": previously nothing ever reset it, so five
-      // crashes spread across hours of healthy operation permanently disabled
-      // auto-restart and the panel was unrecoverable without a manual relaunch.
-      if (text.includes("Web 控制面板已启动")) {
-        restartAttempts = 0;
-        console.log("[Rust Core] 后端已就绪，重启计数已重置。");
-      }
     });
 
-    rustProcess.stderr.on("data", (data) => {
-      console.error(`[Rust Core stderr] ${data.toString().trim()}`);
+    child.stderr.on("data", (data) => {
+      console.error(`[Rust Core stderr] ${data.toString().slice(0, 16 * 1024).trim()}`);
     });
 
-    rustProcess.on("error", (err) => {
+    child.on("error", (err) => {
       console.error(`[Rust Core] 启动失败:`, err);
       reportToRenderer("error", { message: `启动后台 Rust 失败: ${err.message}` });
     });
 
-    rustProcess.on("close", (code) => {
+    child.on("close", (code) => {
+      if (generation !== backendGeneration) return;
+      rustProcess = null;
+      backendReady = false;
+      stopBackendWatchdog();
       console.log(`[Rust Core] 进程已退出，退出码: ${code}`);
       if (isQuitting) {
         return;
       }
-      // 指数退避并设置上限，避免后端持续崩溃时无限重启刷屏。
-      if (restartAttempts >= 5) {
-        console.error("[Rust Core] 已连续重启 5 次仍失败，停止自动重启。");
-        reportToRenderer("error", {
-          message: "后台服务连续启动失败，已停止自动重启。请检查端口占用或日志。",
-        });
-        return;
-      }
-      const delay = Math.min(1000 * 2 ** restartAttempts, MAX_RESTART_DELAY_MS);
-      restartAttempts += 1;
-      console.warn(`[Rust Core] 异常退出，${delay}ms 后重试（第 ${restartAttempts} 次）...`);
-      setTimeout(startRustBackend, delay);
+      reportToRenderer("error", {
+        message: "后台服务已退出，正在自动尝试恢复。",
+      });
+      scheduleBackendRestart(generation);
     });
   } catch (err) {
     console.error(`[Rust Core] 创建子进程异常:`, err);
+    reportToRenderer("error", { message: `创建后台 Rust 进程失败: ${err.message}` });
+    scheduleBackendRestart(generation);
   }
 }
 
@@ -263,6 +403,38 @@ function guardNavigation(event, targetUrl) {
   openExternalSafely(targetUrl);
 }
 
+function recoverRenderer(reason) {
+  if (isQuitting || rendererRecoveryTimer) return;
+  const delay = Math.min(
+    RENDERER_RECOVERY_BASE_DELAY_MS * 2 ** Math.min(rendererRecoveryBackoffAttempts, 6),
+    MAX_RENDERER_RECOVERY_DELAY_MS,
+  );
+  rendererRecoveryBackoffAttempts += 1;
+  console.error(`[Electron] 渲染器异常（${reason}），${delay}ms 后准备恢复页面。`);
+  reportToRenderer("error", { message: "控制中心页面异常，正在自动恢复。" });
+  rendererRecoveryTimer = setTimeout(() => {
+    rendererRecoveryTimer = null;
+    if (!mainWindow || mainWindow.isDestroyed() || isQuitting) return;
+    rendererRecoveryAttempts += 1;
+    try {
+      if (rendererRecoveryAttempts <= MAX_RENDERER_RECOVERY_ATTEMPTS) {
+        mainWindow.webContents.reloadIgnoringCache();
+        return;
+      }
+      // A repeatedly broken renderer may be tied to a corrupted WebContents;
+      // replace the window so BrowserWindow can recreate its renderer process.
+      rendererRecoveryAttempts = 0;
+      const oldWindow = mainWindow;
+      mainWindow = null;
+      oldWindow.destroy();
+      createWindow();
+    } catch (error) {
+      console.error("[Electron] 渲染器恢复失败:", error);
+      recoverRenderer("recovery failed");
+    }
+  }, delay);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1220,
@@ -302,7 +474,30 @@ function createWindow() {
   });
 
   const localFile = path.resolve(PANEL_DIR, "index.html");
-  mainWindow.webContents.on("did-finish-load", flushPendingBackendEvents);
+  mainWindow.webContents.on("did-finish-load", () => {
+    rendererRecoveryAttempts = 0;
+    rendererRecoveryBackoffAttempts = 0;
+    flushPendingBackendEvents();
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    recoverRenderer(`render-process-gone:${details?.reason || "unknown"}`);
+  });
+  mainWindow.webContents.on("child-process-gone", (_event, details) => {
+    const type = details?.type || "child";
+    recoverRenderer(`child-process-gone:${type}:${details?.reason || "unknown"}`);
+  });
+  mainWindow.webContents.on("crashed", () => recoverRenderer("crashed"));
+  mainWindow.webContents.on("unresponsive", () => {
+    reportToRenderer("error", { message: "控制中心页面暂时无响应，正在等待恢复。" });
+  });
+  mainWindow.webContents.on("responsive", () => {
+    console.log("[Electron] 控制中心页面已恢复响应。");
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
+    if (isMainFrame && errorCode !== -3) {
+      recoverRenderer(`did-fail-load:${errorCode}:${errorDescription}`);
+    }
+  });
 
   // 优先直接加载本地打包的控制中心页面（永不黑屏，即开即显）。
   // localToken 通过 preload 的同步 IPC 注入，不再出现在 URL 里。
@@ -378,17 +573,52 @@ function createTray() {
     {
       label: "将模型同步到 Codex",
       click: () => {
+        if (traySyncProcess) {
+          reportToRenderer("error", { message: "模型同步已经在进行中，请稍候。" });
+          return;
+        }
         const binPath = getBinaryPath();
-        const p = spawn(binPath, ["sync"], { windowsHide: true });
+        const p = spawn(binPath, ["sync"], {
+          windowsHide: true,
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        traySyncProcess = p;
+        let stderr = "";
+        let finished = false;
+        const syncTimeout = setTimeout(() => {
+          if (finished) return;
+          finished = true;
+          try {
+            p.kill();
+          } catch {
+            // The close event still reports the failure if the process already exited.
+          }
+          traySyncProcess = null;
+          reportToRenderer("error", { message: "同步超时，已终止卡住的同步进程。" });
+        }, 120000);
+        p.stderr.on("data", (data) => {
+          if (stderr.length < 8192) stderr += data.toString().slice(0, 8192 - stderr.length);
+        });
         p.on("error", (err) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(syncTimeout);
+          traySyncProcess = null;
           console.error("Tray sync failed to spawn:", err);
           reportToRenderer("error", { message: `同步失败: ${err.message}` });
         });
         p.on("close", (code) => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(syncTimeout);
+          traySyncProcess = null;
           if (code === 0) {
             reportToRenderer("sync-finished", { success: true });
           } else {
-            reportToRenderer("error", { message: `同步失败，退出码 ${code}` });
+            const detail = stderr.trim().slice(0, 512);
+            reportToRenderer("error", {
+              message: `同步失败，退出码 ${code}${detail ? `：${detail}` : ""}`,
+            });
           }
         });
       },
@@ -433,10 +663,10 @@ function isTrustedSender(event) {
 ipcMain.on("get-bootstrap", (event) => {
   if (!isTrustedSender(event)) {
     console.warn("[Electron Main] 拒绝来自不受信任来源的 bootstrap 请求");
-    event.returnValue = { localToken: "", apiBase };
+    event.returnValue = { localToken: "", apiBase, appVersion: "" };
     return;
   }
-  event.returnValue = { localToken, apiBase };
+  event.returnValue = { localToken, apiBase, appVersion: app.getVersion() };
 });
 
 ipcMain.on("window-minimize", (event) => {
@@ -457,6 +687,24 @@ ipcMain.on("window-close", (event) => {
   if (isTrustedSender(event) && mainWindow) mainWindow.hide();
 });
 
+// Chromium can lose its GPU process or report system memory pressure without
+// taking the Electron main process down. Treat those signals as recoverable and
+// ask the renderer to recreate itself; never let a stale WebContents leave the
+// desktop app showing a permanent blank window.
+app.on("child-process-gone", (_event, details) => {
+  if (details?.type === "GPU" || details?.type === "Renderer") {
+    recoverRenderer(`app-child-process-gone:${details.type}:${details.reason || "unknown"}`);
+  }
+});
+app.on("gpu-process-crashed", () => recoverRenderer("gpu-process-crashed"));
+app.on("memory-pressure", (_event, level) => {
+  console.warn(`[Electron] 系统内存压力: ${level}`);
+  reportToRenderer("error", { message: "系统内存紧张，控制中心正在释放页面资源。" });
+  if (level === "critical" && mainWindow && !mainWindow.isDestroyed()) {
+    void mainWindow.webContents.session.clearCache().catch(() => {});
+  }
+});
+
 // 单实例锁：防止多开冲突
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
@@ -474,6 +722,7 @@ if (!gotTheLock) {
   app.whenReady().then(async () => {
     startRustBackend();
     const backendReady = await waitForBackendReady();
+    if (backendReady) markBackendReady(backendGeneration);
     createWindow();
     createTray();
     if (!backendReady) {
@@ -510,15 +759,40 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   quitCleanupStarted = true;
   isQuitting = true;
+  if (backendStartTimer) {
+    clearTimeout(backendStartTimer);
+    backendStartTimer = null;
+  }
+  stopBackendWatchdog();
   void (async () => {
     console.log("[Electron Main] 正在停止 Router 与 Rust 后台守护进程...");
     await requestRouterStop();
-    if (rustProcess) {
+    const child = rustProcess;
+    if (child) {
       try {
-        rustProcess.kill("SIGTERM");
+        child.kill("SIGTERM");
       } catch {
         // 忽略：进程可能已经退出。
       }
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        child.once("close", finish);
+        setTimeout(() => {
+          if (!settled) {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // The process may have exited between the timeout and the kill.
+            }
+            finish();
+          }
+        }, 3000);
+      });
     }
     app.quit();
   })();

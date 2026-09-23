@@ -5,13 +5,21 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use codex_mp_core::FileLock;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use codex_mp_core::run_with_timeout;
+use codex_mp_core::{
+    FileLock, command_for_executable, read_to_string_limited, write_private_atomic,
+};
 use codex_mp_credentials::{CredentialStore, CredentialStoreError, NativeCredentialStore};
+use codex_mp_desktop::load_manifest;
+use codex_mp_desktop::{DESKTOP_LAUNCHER_CONFIG_FILE, DesktopLauncherConfig, DesktopPaths};
+use codex_mp_router::load_router_endpoint;
 use directories::{BaseDirs, ProjectDirs};
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
@@ -24,6 +32,10 @@ const ACCOUNT_CREDENTIAL_SERVICE: &str = "dev.codex-multiprovider.accounts";
 /// Only this many `auth.bak-switch-*` copies are kept. Each one contains live
 /// OAuth tokens, so an unbounded pile of them is a credential-leak hazard.
 const MAX_AUTH_BACKUPS: usize = 3;
+const MAX_ACCOUNT_STORE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Credential reference for a managed account's token set.
 fn account_credential_reference(id: &str) -> String {
@@ -55,21 +67,44 @@ const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// return something enormous, and the same bound is already applied to provider
 /// discovery.
 const MAX_ACCOUNT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DESKTOP_LAUNCHER_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const RESTART_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const RESTART_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Read an error body for a diagnostic message, truncated to a readable size.
 ///
 /// `text()` buffers the whole body; an error path only ever shows a short
 /// snippet, so an oversized or hostile response should not be absorbed whole.
-async fn read_bounded_error_text(response: reqwest::Response) -> String {
+async fn read_bounded_error_text(mut response: reqwest::Response) -> String {
     /// Enough for a readable diagnostic, far below any response worth buffering.
     const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
-    let text = response.text().await.unwrap_or_default();
-    if text.len() <= MAX_ERROR_BODY_BYTES {
-        return text;
+    let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
+                let keep = remaining.min(chunk.len());
+                bytes.extend_from_slice(&chunk[..keep]);
+                if keep < chunk.len() {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                if bytes.is_empty() {
+                    return format!("response body could not be read: {error}");
+                }
+                break;
+            }
+        }
     }
-    let mut truncated: String = text.chars().take(MAX_ERROR_BODY_BYTES).collect();
-    truncated.push_str("… (truncated)");
-    truncated
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str("… (truncated)");
+    }
+    text
 }
 
 /// Read a bounded JSON body, rejecting anything larger than the cap.
@@ -84,14 +119,22 @@ async fn read_bounded_account_json(
             "{what} returned {length} bytes, exceeding the {MAX_ACCOUNT_RESPONSE_BYTES} byte limit"
         )));
     }
-    let text = response.text().await?;
-    if text.len() > MAX_ACCOUNT_RESPONSE_BYTES {
-        return Err(AccountError::RefreshFailed(format!(
-            "{what} returned {} bytes, exceeding the {MAX_ACCOUNT_RESPONSE_BYTES} byte limit",
-            text.len()
-        )));
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_ACCOUNT_RESPONSE_BYTES as u64) as usize,
+    );
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_ACCOUNT_RESPONSE_BYTES {
+            return Err(AccountError::RefreshFailed(format!(
+                "{what} returned more than {MAX_ACCOUNT_RESPONSE_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
     }
-    serde_json::from_str(&text).map_err(AccountError::from)
+    serde_json::from_slice(&body).map_err(AccountError::from)
 }
 
 /// Extract only the non-secret OAuth error fields. The complete response is
@@ -178,6 +221,8 @@ pub enum AccountError {
     AuthJsonInvalid(String),
     #[error("Credential store error: {0}")]
     Credential(#[from] CredentialStoreError),
+    #[error("Codex restart failed: {0}")]
+    RestartFailed(String),
 }
 
 impl AccountError {
@@ -192,6 +237,7 @@ impl AccountError {
             Self::UsageCheckFailed { status: 401, .. } => "usage_unauthorized",
             Self::UsageCheckFailed { status: 429, .. } => "usage_rate_limited",
             Self::UsageCheckFailed { .. } => "usage_check_failed",
+            Self::RestartFailed(_) => "restart_failed",
             Self::Network(_) => "network_error",
             Self::RefreshFailed(_) => "refresh_failed",
             _ => "account_operation_failed",
@@ -437,7 +483,8 @@ pub struct AccountManager {
     // `Arc` so the whole manager can be moved into `spawn_blocking`: every one of
     // its synchronous methods may touch the OS keyring, which must never run on
     // an async worker thread (see `codex_mp_credentials::run_blocking`).
-    http_client: Arc<Client>,
+    http_client: Option<Arc<Client>>,
+    http_client_error: Option<Arc<str>>,
     credentials: Arc<dyn CredentialStore>,
     refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
@@ -464,31 +511,28 @@ impl AccountManager {
         codex_home: impl Into<PathBuf>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        let (http_client, http_client_error) = match Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
+            Ok(client) => (Some(Arc::new(client)), None),
+            Err(error) => {
+                let message = format!("could not build the hardened account client: {error}");
+                eprintln!("codex-mp: {message}; account network operations are unavailable");
+                (
+                    None,
+                    Some(Arc::<str>::from(format!(
+                        "account network client unavailable: {message}"
+                    ))),
+                )
+            }
+        };
         Self {
             store_path: store_path.into(),
             codex_home: codex_home.into(),
-            http_client: Arc::new(
-                Client::builder()
-                    // This client POSTs a **live OAuth refresh token** to the
-                    // token endpoint. Without an explicit policy reqwest uses
-                    // `Policy::limited(10)`, and a 307/308 redirect makes it
-                    // resend the request body — the refresh token — to whatever
-                    // host the redirect names. Verified with a local redirector:
-                    // the target received `refresh_token=SECRET-RT`.
-                    //
-                    // Every other client in this project already sets this; this
-                    // was the one that carries the most sensitive payload.
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(Duration::from_secs(15))
-                    .build()
-                    .unwrap_or_else(|_| {
-                        eprintln!(
-                            "codex-mp: FATAL: no hardened account client available; \
-                             OAuth redirects will be followed"
-                        );
-                        Client::new()
-                    }),
-            ),
+            http_client,
+            http_client_error,
             credentials,
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -541,7 +585,7 @@ impl AccountManager {
                 accounts: Vec::new(),
             });
         }
-        let content = fs::read_to_string(&self.store_path)?;
+        let content = read_to_string_limited(&self.store_path, MAX_ACCOUNT_STORE_BYTES)?;
         // Name the file and the remedy. A bare `expected value at line 1 column 15`
         // gave the user no way to know *which* file was broken, and the panel
         // surfaced it verbatim — leaving account import and listing both failing
@@ -613,7 +657,7 @@ impl AccountManager {
                 accounts: Vec::new(),
             });
         }
-        let content = fs::read_to_string(&self.store_path)?;
+        let content = read_to_string_limited(&self.store_path, MAX_ACCOUNT_STORE_BYTES)?;
         serde_json::from_str(&content).map_err(|error| AccountError::StoreUnreadable {
             path: self.store_path.display().to_string(),
             detail: error.to_string(),
@@ -664,7 +708,7 @@ impl AccountManager {
         if !path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(&path)?;
+        let content = read_to_string_limited(&path, MAX_AUTH_FILE_BYTES)?;
         let val: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| AccountError::AuthJsonInvalid(e.to_string()))?;
         Ok(Some(val))
@@ -1052,7 +1096,7 @@ impl AccountManager {
     /// privately, and named uniquely enough that two switches in the same second
     /// cannot overwrite each other's evidence.
     fn write_auth_backup(&self, auth_path: &Path) -> Result<(), AccountError> {
-        let bytes = fs::read(auth_path)?;
+        let bytes = read_to_string_limited(auth_path, MAX_AUTH_FILE_BYTES)?.into_bytes();
 
         let backup_path = auth_path.with_extension(format!(
             "bak-switch-{}-{}",
@@ -1193,8 +1237,15 @@ impl AccountManager {
             .append_pair("refresh_token", &refresh_token)
             .finish();
 
-        let resp = self
-            .http_client
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            AccountError::RefreshFailed(
+                self.http_client_error
+                    .as_deref()
+                    .unwrap_or("account network client unavailable")
+                    .to_owned(),
+            )
+        })?;
+        let resp = http_client
             .post(OPENAI_OAUTH_TOKEN_URL)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("User-Agent", DEFAULT_USER_AGENT)
@@ -1525,8 +1576,18 @@ impl AccountManager {
             }
         })?;
 
-        let mut req = self
-            .http_client
+        let http_client =
+            self.http_client
+                .as_ref()
+                .ok_or_else(|| AccountError::UsageCheckFailed {
+                    status: 503,
+                    message: self
+                        .http_client_error
+                        .as_deref()
+                        .unwrap_or("account network client unavailable")
+                        .to_owned(),
+                })?;
+        let mut req = http_client
             .get(OPENAI_WHAM_USAGE_URL)
             .header("Authorization", format!("Bearer {access_token}"))
             .header("User-Agent", "Mozilla/5.0");
@@ -1567,44 +1628,425 @@ impl AccountManager {
 
     // ---------------- Restarting Codex ---------------- //
 
-    /// Restart Codex processes (Desktop app-server and CLI background processes)
+    /// Restart Codex processes (Desktop app-server and CLI background processes).
+    ///
+    /// The Desktop launcher is deliberately resolved from its signed-in user's
+    /// runtime rather than guessed from the current executable. This matters
+    /// for the panel, which is often hosted by a different `codex-mp` process
+    /// than the launcher used by ChatGPT Desktop.
     pub fn restart_codex_processes(&self) -> Result<RestartCodexReport, AccountError> {
-        let mut killed_pids = Vec::new();
+        let config = resolve_desktop_launcher_config(&self.codex_home)?;
+        self.restart_codex_processes_with_loaded_config(config)
+    }
 
-        // 1. Terminate running codex app-server processes. Only report PIDs
-        //    that are actually gone, so the UI cannot claim a clean restart
-        //    while a process is still holding the old credentials.
-        let running_pids = find_codex_running_pids();
-        for pid in &running_pids {
+    /// Internal seam for lifecycle tests. Keeping config resolution separate
+    /// means tests never need to mutate the process-wide Desktop environment.
+    #[cfg(test)]
+    fn restart_codex_processes_with_config(
+        &self,
+        config_path: &Path,
+    ) -> Result<RestartCodexReport, AccountError> {
+        let config = load_desktop_launcher_config(config_path)?;
+        self.restart_codex_processes_with_loaded_config(config)
+    }
+
+    fn restart_codex_processes_with_loaded_config(
+        &self,
+        config: DesktopLauncherConfig,
+    ) -> Result<RestartCodexReport, AccountError> {
+        let previous_endpoint = read_endpoint_snapshot(&config.endpoint_file)?;
+
+        // Keep a startup snapshot so a failed launch can only clean up a
+        // process that appeared as part of this restart. The generic matcher
+        // covers stock Codex, while the exact matcher covers the patched
+        // `codex-mp-app-server-bin` whose name is intentionally excluded from
+        // the generic matcher to protect this application.
+        let mut old_pids = find_codex_running_pids();
+        old_pids.extend(find_configured_app_server_pids(&config.app_server_binary));
+        old_pids.sort_unstable();
+        old_pids.dedup();
+
+        let mut terminated_pids = Vec::new();
+        for pid in &old_pids {
             if terminate_pid(*pid) {
-                killed_pids.push(*pid);
+                terminated_pids.push(*pid);
             } else {
-                eprintln!("codex-mp: could not terminate Codex app-server pid {pid}");
+                return Err(AccountError::RestartFailed(format!(
+                    "旧 Codex app-server 进程 {pid} 仍在运行，已中止启动新进程"
+                )));
             }
         }
 
-        // 2. Remove stale app-server socket if present
-        let sock_path = self
-            .codex_home
-            .join("app-server-control/app-server-control.sock");
-        if sock_path.exists() {
-            let _ = fs::remove_file(&sock_path);
+        // The manager owns the Router lifecycle and then keeps the actual
+        // app-server as its child. Do not invoke the Desktop launcher itself:
+        // that would recurse through the launcher config and would not give us
+        // a handle to clean up if startup fails.
+        let mut command = command_for_executable(&config.manager_binary);
+        command
+            .arg("launch")
+            .arg("--app-server-binary")
+            .arg(&config.app_server_binary)
+            .arg("--endpoint-file")
+            .arg(&config.endpoint_file)
+            .arg("--")
+            .arg("app-server")
+            .env("CODEX_HOME", &self.codex_home)
+            .env("CODEX_MP_ROUTER_ENDPOINT_FILE", &config.endpoint_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut manager_child = command.spawn().map_err(|error| {
+            AccountError::RestartFailed(format!(
+                "无法启动 Codex manager `{}`: {error}",
+                config.manager_binary.display()
+            ))
+        })?;
+
+        let deadline = Instant::now() + RESTART_STARTUP_TIMEOUT;
+        let mut observed_endpoint = None;
+        let started_pid = loop {
+            // `load_router_endpoint` performs the security checks (including
+            // symlink rejection and loopback validation) before we report the
+            // endpoint as usable. A stale endpoint is not enough: a successful
+            // restart must publish a different endpoint from the old runtime.
+            let endpoint_bytes = fs::read(&config.endpoint_file).ok();
+            let endpoint_changed = match (&previous_endpoint, endpoint_bytes.as_deref()) {
+                (Some(previous), Some(current)) => previous != current,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if endpoint_changed && load_router_endpoint(&config.endpoint_file).is_ok() {
+                observed_endpoint = endpoint_bytes;
+            }
+
+            // The manager PID is not the app-server PID. Return the latter so
+            // the panel and callers can verify the process that was replaced.
+            if let Some(pid) = find_configured_app_server_pids(&config.app_server_binary)
+                .into_iter()
+                .find(|pid| !old_pids.contains(pid))
+                && observed_endpoint.is_some()
+            {
+                break pid;
+            }
+
+            if let Some(status) = manager_child.try_wait()? {
+                let detail = if status.success() {
+                    "manager 在 app-server 出现前退出"
+                } else {
+                    "manager 启动失败"
+                };
+                return Err(self.finish_failed_restart(
+                    &mut manager_child,
+                    &config,
+                    &previous_endpoint,
+                    &old_pids,
+                    observed_endpoint.as_deref(),
+                    detail.to_owned(),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(self.finish_failed_restart(
+                    &mut manager_child,
+                    &config,
+                    &previous_endpoint,
+                    &old_pids,
+                    observed_endpoint.as_deref(),
+                    format!(
+                        "等待新的 app-server 超时（{} 秒）",
+                        RESTART_STARTUP_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(RESTART_POLL_INTERVAL);
+        };
+
+        // The manager intentionally remains alive to supervise the child. Its
+        // Child handle may be dropped safely; the manager is detached by the
+        // OS and owns its own Router/app-server cleanup path.
+        drop(manager_child);
+        Ok(RestartCodexReport {
+            terminated_pids,
+            started_pid: Some(started_pid),
+            endpoint_file: Some(config.endpoint_file),
+            message: "Codex app-server 已终止并启动新的 manager/app-server。".into(),
+        })
+    }
+
+    fn finish_failed_restart(
+        &self,
+        manager_child: &mut Child,
+        config: &DesktopLauncherConfig,
+        previous_endpoint: &Option<Vec<u8>>,
+        old_pids: &[u32],
+        observed_endpoint: Option<&[u8]>,
+        reason: String,
+    ) -> AccountError {
+        terminate_child(manager_child);
+
+        // Only processes absent from the pre-restart snapshot belong to this
+        // attempt. This avoids killing an unrelated app-server that started
+        // concurrently while we were waiting.
+        for pid in find_configured_app_server_pids(&config.app_server_binary) {
+            if !old_pids.contains(&pid) {
+                let _ = terminate_pid(pid);
+            }
         }
 
-        Ok(RestartCodexReport {
-            terminated_pids: killed_pids,
-            message: "Codex background app-server terminated. Desktop/CLI will reload credentials on next invocation or window focus.".into(),
-        })
+        // Roll back only an endpoint that we observed and validated during
+        // this attempt. If another process published a different endpoint in
+        // the meantime, leave it untouched.
+        if let Some(observed) = observed_endpoint
+            && fs::read(&config.endpoint_file).ok().as_deref() == Some(observed)
+        {
+            match previous_endpoint {
+                Some(previous) => {
+                    let _ = write_private_atomic(&config.endpoint_file, previous);
+                }
+                None => {
+                    let _ = fs::remove_file(&config.endpoint_file);
+                }
+            }
+        }
+
+        AccountError::RestartFailed(reason)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartCodexReport {
     pub terminated_pids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_file: Option<PathBuf>,
     pub message: String,
 }
 
 // ---------------- Helpers ---------------- //
+
+fn resolve_desktop_launcher_config(
+    codex_home: &Path,
+) -> Result<DesktopLauncherConfig, AccountError> {
+    if let Some(path) = std::env::var_os("CODEX_MP_DESKTOP_LAUNCHER_CONFIG") {
+        return load_desktop_launcher_config(&PathBuf::from(path));
+    }
+
+    let manifest_path = DesktopPaths::default_manifest_path();
+    if manifest_path.exists() {
+        let manifest = load_manifest(&manifest_path).map_err(|error| {
+            AccountError::RestartFailed(format!(
+                "无法读取 Desktop integration manifest `{}`: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        if let Some(path) = manifest.launcher_config {
+            return load_desktop_launcher_config(&path);
+        }
+
+        // Linux replaces the official `codex` entrypoint with a POSIX
+        // launcher, so older installs intentionally have no companion JSON
+        // file. The manifest already contains the exact, validated runtime
+        // paths needed to construct the same configuration in memory.
+        return validate_desktop_launcher_config(DesktopLauncherConfig {
+            schema_version: 1,
+            manager_binary: manifest.codex_mp_binary,
+            app_server_binary: manifest.patched_app_server,
+            endpoint_file: manifest.endpoint_file,
+        });
+    }
+
+    let current_release_config = codex_home
+        .join("packages")
+        .join("standalone")
+        .join("current")
+        .join("bin")
+        .join(DESKTOP_LAUNCHER_CONFIG_FILE);
+    if current_release_config.exists() {
+        return load_desktop_launcher_config(&current_release_config);
+    }
+
+    // Windows/macOS use the managed native launcher under the integration
+    // registry rather than replacing the official Desktop entrypoint. Its
+    // config therefore lives beside `manifest.launcher_path`, not under
+    // `$CODEX_HOME/packages/standalone/current/bin`.
+    let discovered_config = DesktopPaths::discover()
+        .map(|paths| paths.launcher_config_path())
+        .map_err(|error| {
+            AccountError::RestartFailed(format!(
+                "找不到 Codex Desktop launcher 配置（{}）: {error}",
+                current_release_config.display()
+            ))
+        })?;
+    load_desktop_launcher_config(&discovered_config).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "找不到 Codex Desktop launcher 配置（{}）: {error}",
+            discovered_config.display()
+        ))
+    })
+}
+
+fn load_desktop_launcher_config(path: &Path) -> Result<DesktopLauncherConfig, AccountError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "无法读取 Desktop launcher 配置 `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AccountError::RestartFailed(format!(
+            "Desktop launcher 配置 `{}` 不能是符号链接",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(AccountError::RestartFailed(format!(
+            "Desktop launcher 配置 `{}` 不是普通文件",
+            path.display()
+        )));
+    }
+    let contents =
+        read_to_string_limited(path, MAX_DESKTOP_LAUNCHER_CONFIG_BYTES).map_err(|error| {
+            AccountError::RestartFailed(format!(
+                "无法读取 Desktop launcher 配置 `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    let config: DesktopLauncherConfig = serde_json::from_str(&contents).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "Desktop launcher 配置 `{}` 无效: {error}",
+            path.display()
+        ))
+    })?;
+    validate_desktop_launcher_config(config)
+}
+
+fn validate_desktop_launcher_config(
+    config: DesktopLauncherConfig,
+) -> Result<DesktopLauncherConfig, AccountError> {
+    if config.schema_version != 1 {
+        return Err(AccountError::RestartFailed(format!(
+            "不支持的 Desktop launcher 配置版本: {}",
+            config.schema_version
+        )));
+    }
+
+    let manager_binary = validate_launcher_binary(&config.manager_binary, "manager")?;
+    let app_server_binary = validate_launcher_binary(&config.app_server_binary, "app-server")?;
+    let manager_canonical = fs::canonicalize(&manager_binary).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "无法解析 manager binary `{}`: {error}",
+            manager_binary.display()
+        ))
+    })?;
+    let app_server_canonical = fs::canonicalize(&app_server_binary).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "无法解析 app-server binary `{}`: {error}",
+            app_server_binary.display()
+        ))
+    })?;
+    if manager_canonical == app_server_canonical {
+        return Err(AccountError::RestartFailed(
+            "Desktop launcher 的 manager binary 与 app-server binary 不能是同一个文件".into(),
+        ));
+    }
+
+    if !config.endpoint_file.is_absolute() {
+        return Err(AccountError::RestartFailed(format!(
+            "Router endpoint 路径必须是绝对路径: `{}`",
+            config.endpoint_file.display()
+        )));
+    }
+    if config.endpoint_file.file_name().is_none() {
+        return Err(AccountError::RestartFailed(format!(
+            "Router endpoint 路径不是有效文件路径: `{}`",
+            config.endpoint_file.display()
+        )));
+    }
+    validate_endpoint_target(&config.endpoint_file)?;
+
+    Ok(DesktopLauncherConfig {
+        manager_binary,
+        app_server_binary,
+        ..config
+    })
+}
+
+fn validate_launcher_binary(path: &Path, role: &str) -> Result<PathBuf, AccountError> {
+    if !path.is_absolute() {
+        return Err(AccountError::RestartFailed(format!(
+            "Desktop {role} binary 路径必须是绝对路径: `{}`",
+            path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AccountError::RestartFailed(format!(
+            "Desktop {role} binary `{}` 不存在: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(AccountError::RestartFailed(format!(
+            "Desktop {role} binary `{}` 不能是符号链接",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(AccountError::RestartFailed(format!(
+            "Desktop {role} binary `{}` 不是普通文件",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(AccountError::RestartFailed(format!(
+                "Desktop {role} binary `{}` 不可执行",
+                path.display()
+            )));
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_endpoint_target(path: &Path) -> Result<(), AccountError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AccountError::RestartFailed(
+            format!("Router endpoint `{}` 不能是符号链接", path.display()),
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(AccountError::RestartFailed(format!(
+            "Router endpoint `{}` 不是普通文件",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AccountError::RestartFailed(format!(
+            "无法检查 Router endpoint `{}`: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_endpoint_snapshot(path: &Path) -> Result<Option<Vec<u8>>, AccountError> {
+    validate_endpoint_target(path)?;
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AccountError::RestartFailed(format!(
+            "无法读取旧 Router endpoint `{}`: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    let pid = child.id();
+    let running = child.try_wait().ok().flatten().is_none();
+    if running {
+        let _ = terminate_pid(pid);
+    }
+    let _ = child.wait();
+}
 
 pub fn default_accounts_path() -> PathBuf {
     ProjectDirs::from("dev", "codex-multiprovider", "Codex MultiProvider")
@@ -1895,9 +2337,10 @@ pub fn find_codex_running_pids() -> Vec<u32> {
     {
         let mut pids = Vec::new();
         let own_pid = std::process::id();
-        let output = std::process::Command::new("tasklist.exe")
-            .args(["/FO", "CSV", "/NH"])
-            .output();
+        let output = run_with_timeout(
+            std::process::Command::new("tasklist.exe").args(["/FO", "CSV", "/NH"]),
+            PROCESS_PROBE_TIMEOUT,
+        );
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
@@ -1944,9 +2387,10 @@ pub fn find_codex_running_pids() -> Vec<u32> {
         let mut pids = Vec::new();
         // `-ww` disables truncation; `-o pid=,command=` prints one line per
         // process with no header.
-        let output = std::process::Command::new("ps")
-            .args(["-ww", "-A", "-o", "pid=,command="])
-            .output();
+        let output = run_with_timeout(
+            std::process::Command::new("ps").args(["-ww", "-A", "-o", "pid=,command="]),
+            PROCESS_PROBE_TIMEOUT,
+        );
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
@@ -1975,6 +2419,116 @@ pub fn find_codex_running_pids() -> Vec<u32> {
     {
         Vec::new()
     }
+}
+
+/// Find app-server processes whose executable is the exact patched binary from
+/// the Desktop launcher config. The normal Codex matcher deliberately excludes
+/// `codex-mp*`, so relying on it alone misses the common
+/// `codex-mp-app-server-bin` artifact.
+#[cfg(target_os = "linux")]
+fn find_configured_app_server_pids(binary: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry
+            .file_name()
+            .to_str()
+            .unwrap_or_default()
+            .parse::<u32>()
+        else {
+            continue;
+        };
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(cmdline) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        if is_configured_app_server_process(&args, pid, binary) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(target_os = "macos")]
+fn find_configured_app_server_pids(binary: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let output = run_with_timeout(
+        std::process::Command::new("ps").args(["-ww", "-A", "-o", "pid=,command="]),
+        PROCESS_PROBE_TIMEOUT,
+    );
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let line = line.trim_start();
+            let Some((pid_text, command)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid_text.parse::<u32>() else {
+                continue;
+            };
+            let args: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+            if is_configured_app_server_process(&args, pid, binary) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(target_os = "windows")]
+fn find_configured_app_server_pids(binary: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let expected_name = binary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let output = run_with_timeout(
+        std::process::Command::new("tasklist.exe").args(["/FO", "CSV", "/NH"]),
+        PROCESS_PROBE_TIMEOUT,
+    );
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let fields: Vec<&str> = line
+                .split(',')
+                .map(|field| field.trim().trim_matches('"'))
+                .collect();
+            if fields.len() < 2 || fields[0].to_ascii_lowercase() != expected_name {
+                continue;
+            }
+            let Ok(pid) = fields[1].parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() || Some(pid) == parent_process_id() {
+                continue;
+            }
+            if process_executable_path_matches(pid, binary)
+                && process_command_line_has_app_server(pid)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn find_configured_app_server_pids(_binary: &Path) -> Vec<u32> {
+    Vec::new()
 }
 
 /// Whether `/proc/<pid>/cmdline` arguments describe a real Codex app-server.
@@ -2020,6 +2574,34 @@ fn is_codex_app_server_process(args: &[String], pid: u32) -> bool {
         .any(|arg| arg == "app-server" || arg.ends_with("/app-server"))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_configured_app_server_process(args: &[String], pid: u32, binary: &Path) -> bool {
+    if pid == std::process::id() || Some(pid) == parent_process_id() {
+        return false;
+    }
+    if !args.iter().skip(1).any(|arg| arg == "app-server") {
+        return false;
+    }
+    let Some(program) = args.first() else {
+        return false;
+    };
+    executable_argument_matches(program, binary)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn executable_argument_matches(program: &str, expected: &Path) -> bool {
+    if program == expected.to_string_lossy() {
+        return true;
+    }
+    let Some(actual) = fs::canonicalize(program).ok() else {
+        return false;
+    };
+    let Some(expected) = fs::canonicalize(expected).ok() else {
+        return false;
+    };
+    actual == expected
+}
+
 /// This process's parent PID, when it can be determined.
 ///
 /// Killing the parent would take down the caller that asked for the restart (the
@@ -2040,9 +2622,15 @@ fn parent_process_id() -> Option<u32> {
 #[cfg(target_os = "windows")]
 fn process_command_line_contains(pid: u32, needle: &str) -> bool {
     let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output();
+    let output = run_with_timeout(
+        std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]),
+        PROCESS_PROBE_TIMEOUT,
+    );
     match output {
         Ok(out) if out.status.success() => {
             let line = String::from_utf8_lossy(&out.stdout);
@@ -2050,6 +2638,74 @@ fn process_command_line_contains(pid: u32, needle: &str) -> bool {
         }
         _ => true,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn process_executable_path_matches(pid: u32, expected: &Path) -> bool {
+    let script =
+        format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").ExecutablePath");
+    let output = run_with_timeout(
+        std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]),
+        PROCESS_PROBE_TIMEOUT,
+    );
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    actual == expected.to_string_lossy().to_ascii_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+fn process_command_line_has_app_server(pid: u32) -> bool {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
+    let output = run_with_timeout(
+        std::process::Command::new("powershell.exe").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]),
+        PROCESS_PROBE_TIMEOUT,
+    );
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .any(|argument| argument.trim_matches('"') == "app-server")
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    let stat_path = format!("/proc/{pid}/stat");
+    match fs::read_to_string(stat_path) {
+        Ok(stat) => {
+            // `/proc/<pid>/stat` is `pid (comm) state ...`; `comm` may itself
+            // contain spaces or parentheses, so split at its final `)`.
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| state != 'Z')
+        }
+        Err(_) => unsafe { libc::kill(pid as i32, 0) == 0 },
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 /// Terminate a process, returning whether it is believed to be gone.
@@ -2068,8 +2724,7 @@ pub fn terminate_pid(pid: u32) -> bool {
         }
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(50));
-            let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-            if !alive {
+            if !process_is_alive(pid) {
                 return true;
             }
         }
@@ -2077,13 +2732,14 @@ pub fn terminate_pid(pid: u32) -> bool {
             libc::kill(pid as i32, libc::SIGKILL);
         }
         std::thread::sleep(Duration::from_millis(50));
-        unsafe { libc::kill(pid as i32, 0) != 0 }
+        !process_is_alive(pid)
     }
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
+        let output = run_with_timeout(
+            std::process::Command::new("taskkill.exe").args(["/PID", &pid.to_string(), "/T", "/F"]),
+            PROCESS_PROBE_TIMEOUT,
+        );
         match output {
             // 128 = "process not found", which means the goal is already met.
             Ok(out) => out.status.success() || out.status.code() == Some(128),
@@ -2544,6 +3200,125 @@ mod tests {
             &args(&["/usr/bin/codex", "exec"]),
             4247
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_replaces_configured_app_server_and_rolls_back_endpoint_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let directory = tempdir().unwrap();
+        let manager_binary = directory.path().join("codex-mp-test-manager");
+        let app_server_binary = directory.path().join("codex-mp-app-server-bin");
+        let failing_manager_binary = directory.path().join("codex-mp-failing-manager");
+        let endpoint_file = directory.path().join("router-endpoint.json");
+        let config_path = directory.path().join(DESKTOP_LAUNCHER_CONFIG_FILE);
+
+        let app_server_script = r##"#!/bin/bash
+set -eu
+if [[ "${CODEX_FIXTURE_APP_SERVER_REEXEC:-}" != "1" ]]; then
+  export CODEX_FIXTURE_APP_SERVER_REEXEC=1
+  exec -a "$0" /bin/bash "$0" "$@"
+fi
+endpoint=""
+while (($# > 0)); do
+  case "$1" in
+    --endpoint-file) endpoint="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+umask 077
+printf '{"schema_version":1,"base_url":"http://127.0.0.1:9","capability_token":"fixture-%s"}\n' "$$" > "$endpoint"
+trap 'exit 0' TERM INT
+while true; do sleep 1; done
+"##;
+        let manager_script = r##"#!/bin/bash
+set -eu
+app=""
+endpoint=""
+while (($# > 0)); do
+  case "$1" in
+    --app-server-binary) app="$2"; shift 2 ;;
+    --endpoint-file) endpoint="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+exec "$app" app-server --endpoint-file "$endpoint"
+"##;
+        let failing_manager_script = "#!/bin/sh\nexit 23\n";
+
+        for (path, contents) in [
+            (&app_server_binary, app_server_script),
+            (&manager_binary, manager_script),
+            (&failing_manager_binary, failing_manager_script),
+        ] {
+            fs::write(path, contents).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = DesktopLauncherConfig {
+            schema_version: 1,
+            manager_binary: manager_binary.clone(),
+            app_server_binary: app_server_binary.clone(),
+            endpoint_file: endpoint_file.clone(),
+        };
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+        let manager = AccountManager::with_paths(
+            directory.path().join("accounts.json"),
+            directory.path().join("codex-home"),
+        );
+        let mut old_process = Command::new(&app_server_binary)
+            .args(["app-server", "--endpoint-file"])
+            .arg(&endpoint_file)
+            .spawn()
+            .unwrap();
+        let old_pid = old_process.id();
+        let old_deadline = Instant::now() + Duration::from_secs(5);
+        while !find_configured_app_server_pids(&app_server_binary).contains(&old_pid)
+            || load_router_endpoint(&endpoint_file).is_err()
+        {
+            assert!(
+                Instant::now() < old_deadline,
+                "fixture app-server did not publish its endpoint"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let old_endpoint = fs::read(&endpoint_file).unwrap();
+
+        let report = manager
+            .restart_codex_processes_with_config(&config_path)
+            .unwrap();
+        let new_pid = report
+            .started_pid
+            .expect("restart must report app-server PID");
+        assert_ne!(new_pid, old_pid);
+        assert!(!find_configured_app_server_pids(&app_server_binary).contains(&old_pid));
+        assert!(find_configured_app_server_pids(&app_server_binary).contains(&new_pid));
+        assert_eq!(
+            report.endpoint_file.as_deref(),
+            Some(endpoint_file.as_path())
+        );
+        assert!(load_router_endpoint(&endpoint_file).is_ok());
+        assert_ne!(fs::read(&endpoint_file).unwrap(), old_endpoint);
+
+        assert!(terminate_pid(new_pid));
+        let _ = old_process.wait();
+
+        // A manager that exits before publishing a new app-server must not
+        // delete or replace the endpoint owned by the previous runtime.
+        let failing_config = DesktopLauncherConfig {
+            manager_binary: failing_manager_binary,
+            ..config
+        };
+        fs::write(&config_path, serde_json::to_vec(&failing_config).unwrap()).unwrap();
+        let preserved_endpoint = fs::read(&endpoint_file).unwrap();
+        let error = manager
+            .restart_codex_processes_with_config(&config_path)
+            .expect_err("a manager that exits early must fail restart");
+        assert!(error.to_string().contains("manager 启动失败"));
+        assert_eq!(fs::read(&endpoint_file).unwrap(), preserved_endpoint);
     }
 
     #[test]

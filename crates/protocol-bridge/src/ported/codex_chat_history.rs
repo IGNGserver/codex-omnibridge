@@ -5,7 +5,7 @@
 // `clippy::all`, which would silently disable them again.
 
 use super::codex_chat_common::{is_absent_value, response_item_call_id};
-use crate::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::sse::{MAX_SSE_BLOCK_BYTES, append_utf8_safe_bounded, strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -17,11 +17,15 @@ use tokio::sync::RwLock;
 pub(crate) type ResponseIdCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 const MAX_CACHED_RESPONSES: usize = 512;
+const MAX_CACHED_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_CALL_BYTES: usize = 256 * 1024;
+const MAX_CALLS_PER_RESPONSE: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 struct CachedResponse {
     calls_by_id: HashMap<String, Value>,
     call_order: Vec<String>,
+    bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -29,6 +33,7 @@ struct CodexChatHistoryInner {
     responses: HashMap<String, CachedResponse>,
     response_order: VecDeque<String>,
     call_index: HashMap<String, VecDeque<String>>,
+    cached_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +75,7 @@ impl CodexChatHistoryStore {
                 items
                     .iter()
                     .filter_map(cached_call_item)
+                    .take(MAX_CALLS_PER_RESPONSE)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -225,13 +231,33 @@ impl CodexChatHistoryInner {
         let cached_response = self.responses.entry(response_id.to_string()).or_default();
         let mut inserted_or_updated = 0usize;
         let mut indexed_call_ids = Vec::new();
+        let mut byte_delta = 0_isize;
         for (call_id, item) in calls {
+            let item_bytes = serde_json::to_vec(&item)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX);
+            if item_bytes > MAX_CACHED_CALL_BYTES {
+                continue;
+            }
             if !cached_response.calls_by_id.contains_key(&call_id) {
                 cached_response.call_order.push(call_id.clone());
             }
-            cached_response.calls_by_id.insert(call_id.clone(), item);
+            if let Some(previous) = cached_response.calls_by_id.insert(call_id.clone(), item) {
+                let previous_bytes = serde_json::to_vec(&previous)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                cached_response.bytes = cached_response.bytes.saturating_sub(previous_bytes);
+                byte_delta -= previous_bytes as isize;
+            }
+            cached_response.bytes = cached_response.bytes.saturating_add(item_bytes);
+            byte_delta += item_bytes as isize;
             indexed_call_ids.push(call_id);
             inserted_or_updated += 1;
+        }
+        if byte_delta >= 0 {
+            self.cached_bytes = self.cached_bytes.saturating_add(byte_delta as usize);
+        } else {
+            self.cached_bytes = self.cached_bytes.saturating_sub(byte_delta.unsigned_abs());
         }
         for call_id in indexed_call_ids {
             self.index_call(&call_id, response_id);
@@ -242,11 +268,15 @@ impl CodexChatHistoryInner {
     }
 
     fn prune(&mut self) {
-        while self.response_order.len() > MAX_CACHED_RESPONSES {
+        while self.response_order.len() > MAX_CACHED_RESPONSES
+            || self.cached_bytes > MAX_CACHED_HISTORY_BYTES
+        {
             let Some(response_id) = self.response_order.pop_front() else {
                 break;
             };
-            self.responses.remove(&response_id);
+            if let Some(response) = self.responses.remove(&response_id) {
+                self.cached_bytes = self.cached_bytes.saturating_sub(response.bytes);
+            }
             self.remove_response_from_call_index(&response_id);
         }
     }
@@ -397,7 +427,13 @@ pub fn record_responses_sse_stream_with_callback(
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    if !append_utf8_safe_bounded(&mut buffer, &mut utf8_remainder, &bytes) {
+                        yield Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("SSE event exceeds the {MAX_SSE_BLOCK_BYTES} byte limit"),
+                        ));
+                        break;
+                    }
                     while let Some(block) = take_sse_block(&mut buffer) {
                         inspect_sse_block(
                             &block,

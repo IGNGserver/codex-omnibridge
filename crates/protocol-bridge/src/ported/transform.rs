@@ -24,7 +24,13 @@ pub fn inject_openai_stream_include_usage(value: &mut Value) {
     if value.get("stream").and_then(Value::as_bool) != Some(true) {
         return;
     }
-    let object = value.as_object_mut().expect("request is an object");
+    let Some(object) = value.as_object_mut() else {
+        // `Value::get` currently makes the branch above imply an object, but
+        // keep this boundary defensive: protocol conversion must reject or
+        // ignore malformed JSON rather than panic the request worker if that
+        // assumption changes in a future serde_json version/refactor.
+        return;
+    };
     let options = object
         .entry("stream_options")
         .or_insert_with(|| serde_json::json!({}));

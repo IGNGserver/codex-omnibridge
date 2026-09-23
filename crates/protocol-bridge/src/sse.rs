@@ -4,6 +4,10 @@
 // are the ones that catch real protocol bugs. Do not widen this to
 // `clippy::all`, which would silently disable them again.
 
+/// Maximum bytes retained while waiting for an SSE event delimiter. A peer that
+/// never sends `\n\n` must not grow a bridge task's buffer forever.
+pub(crate) const MAX_SSE_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+
 #[inline]
 pub fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     line.strip_prefix(&format!("{field}: "))
@@ -89,6 +93,20 @@ pub fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, new_bytes:
             }
         }
     }
+}
+
+/// Bounded variant used by live protocol streams. The caller can turn `false`
+/// into a stream error before the un-delimited event is appended.
+pub(crate) fn append_utf8_safe_bounded(
+    buffer: &mut String,
+    remainder: &mut Vec<u8>,
+    new_bytes: &[u8],
+) -> bool {
+    if buffer.len().saturating_add(new_bytes.len()) > MAX_SSE_BLOCK_BYTES {
+        return false;
+    }
+    append_utf8_safe(buffer, remainder, new_bytes);
+    buffer.len() <= MAX_SSE_BLOCK_BYTES
 }
 
 #[cfg(test)]

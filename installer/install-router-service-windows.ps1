@@ -44,15 +44,19 @@ if ($existingTask) {
 
 $action = New-ScheduledTaskAction `
     -Execute $CliDestination `
-    -Argument "--registry `"$RegistryPath`" router --port 8787 --endpoint-file `"$EndpointFile`""
+    -Argument "--registry `"$RegistryPath`" manager --endpoint-file `"$EndpointFile`""
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 
+# The manager owns the Router child and keeps recovering it after a local
+# crash. If the manager itself is killed by OOM or an update, use the largest
+# Task Scheduler retry count instead of a small finite budget that can leave
+# the service permanently stopped.
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -RestartCount 3 `
+    -RestartCount ([uint32]::MaxValue) `
     -RestartInterval (New-TimeSpan -Seconds 2) `
     -MultipleInstances IgnoreNew
 
@@ -69,4 +73,4 @@ if ($EnableService.IsPresent -or $env:CODEX_MP_ENABLE_SERVICE -eq "1") {
 }
 
 Write-Host "registered scheduled task $TaskName"
-Write-Host "router task configured to start at logon; endpoint file at $EndpointFile"
+Write-Host "router manager task configured to start at logon; endpoint file at $EndpointFile"
