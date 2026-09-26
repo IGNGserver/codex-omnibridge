@@ -1,9 +1,10 @@
 pub mod account;
 
 pub use account::{
-    AccountError, AccountManager, AccountSummary, AccountTokens, AccountUsageSnapshot,
-    ActiveAccountStatus, ManagedAccount, RateLimitSummary, ReserveLimitSummary, RestartCodexReport,
-    UsageWindow, default_accounts_path, default_codex_home,
+    AccountError, AccountManager, AccountPurgeReport, AccountSummary, AccountTokens,
+    AccountUsageSnapshot, ActiveAccountStatus, AuthBackupInfo, ManagedAccount, RateLimitSummary,
+    ReserveLimitSummary, RestartCodexReport, UsageWindow, default_accounts_path,
+    default_codex_home, format_epoch_secs,
 };
 
 use std::collections::BTreeSet;
@@ -93,6 +94,13 @@ pub struct ModelSummary {
     pub enabled: bool,
     pub context_window: Option<u64>,
     pub reasoning_levels: Vec<String>,
+    /// Whether the registry replaces Codex's own system prompt for this model.
+    ///
+    /// A flag rather than the text: an override can be 256 KiB, and summaries are
+    /// returned in bulk for every model of every provider. The text itself comes
+    /// from [`ProviderManager::show_model`], which the panel's detail view calls
+    /// when it opens one model.
+    pub has_system_prompt_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -493,19 +501,26 @@ impl ProviderManager {
         let (mut registry, _registry_lock) = self.load_registry_locked()?;
         registry.edit_model(logical_model_id, edit)?;
         registry.save()?;
-        let (provider_id, _) = logical_model_id
-            .split_once('/')
-            .ok_or_else(|| CoreError::InvalidModelId(logical_model_id.to_owned()))?;
-        let model = registry
-            .provider(provider_id)
-            .and_then(|provider| {
-                provider
-                    .models
-                    .iter()
-                    .find(|model| model.logical_model_id == logical_model_id)
-            })
-            .ok_or_else(|| CoreError::ModelNotFound(logical_model_id.to_owned()))?;
-        Ok(model_summary(model))
+        Ok(model_summary(find_model(&registry, logical_model_id)?))
+    }
+
+    /// Read one model back in full, including its system-prompt override.
+    ///
+    /// `ModelSummary` deliberately carries only a `has_system_prompt_override`
+    /// flag, because a list of summaries is served for every model of every
+    /// provider and an override can be 256 KiB. That leaves the text with no read
+    /// path at all: the panel could set an override and clear it, but could never
+    /// show the user what is currently in force, so editing it meant guessing at
+    /// what was already there. This is the single-model read that gap needs, and
+    /// the reason it stays off the list endpoints is the reason it returns
+    /// [`ModelDetail`] rather than a summary.
+    pub fn show_model(&self, logical_model_id: &str) -> Result<ModelDetail, ProviderManagerError> {
+        let registry = self.load_registry()?;
+        let model = find_model(&registry, logical_model_id)?;
+        Ok(ModelDetail {
+            summary: model_summary(model),
+            system_prompt_override: model.system_prompt_override.clone(),
+        })
     }
 
     pub fn set_model_enabled(
@@ -680,7 +695,45 @@ fn model_summary(model: &CustomModel) -> ModelSummary {
         enabled: model.enabled,
         context_window: model.context_window,
         reasoning_levels: model.reasoning_levels.clone(),
+        has_system_prompt_override: model.system_prompt_override.is_some(),
     }
+}
+
+/// Locate one model by its `provider/id` logical key in an already-loaded
+/// registry.
+///
+/// Shared by the read and write paths that used to repeat this lookup verbatim.
+/// The `split_once('/')` is load-bearing: without it a malformed id would be
+/// reported as "model not found" and the user would keep looking at a model list
+/// that plainly does not contain the string they typed.
+fn find_model<'a>(
+    registry: &'a ProviderRegistry,
+    logical_model_id: &str,
+) -> Result<&'a CustomModel, CoreError> {
+    let (provider_id, _) = logical_model_id
+        .split_once('/')
+        .ok_or_else(|| CoreError::InvalidModelId(logical_model_id.to_owned()))?;
+    registry
+        .provider(provider_id)
+        .and_then(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.logical_model_id == logical_model_id)
+        })
+        .ok_or_else(|| CoreError::ModelNotFound(logical_model_id.to_owned()))
+}
+
+/// One model, in full.
+///
+/// Separates the bulk list projection ([`ModelSummary`]) from the single-model
+/// read that has to carry the potentially 256 KiB system-prompt override.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDetail {
+    #[serde(flatten)]
+    pub summary: ModelSummary,
+    /// The text replacing Codex's own system prompt for this model, when set.
+    pub system_prompt_override: Option<String>,
 }
 
 fn parse_discovered_models(
@@ -2399,6 +2452,101 @@ mod tests {
             models, 8,
             "a model was lost to a concurrent read-modify-write"
         );
+    }
+
+    /// `show_model` is the only read path for a system-prompt override: the bulk
+    /// summaries carry a flag alone, because an override can be 256 KiB and every
+    /// model of every provider is listed at once. Without it the panel could set
+    /// and clear an override but never show what was in force.
+    #[test]
+    fn show_model_returns_the_override_that_summaries_only_flag() {
+        let directory = tempdir().unwrap();
+        let registry_path = directory.path().join("providers.json");
+        let manager = ProviderManager::with_credentials(
+            &registry_path,
+            Arc::new(MemoryCredentialStore::default()),
+        );
+        manager
+            .add_provider(
+                "Show",
+                "https://example.test/v1",
+                ProviderProtocol::Responses,
+                None,
+            )
+            .unwrap();
+        let model = manager
+            .add_model("show", "gpt-x", "GPT X", None, ModelCapabilities::default())
+            .unwrap();
+        assert_eq!(model.logical_model_id, "show/gpt-x");
+
+        // No override yet: the flag and the text agree on "absent".
+        let detail = manager.show_model("show/gpt-x").unwrap();
+        assert_eq!(detail.summary.logical_model_id, "show/gpt-x");
+        assert!(!detail.summary.has_system_prompt_override);
+        assert_eq!(detail.system_prompt_override, None);
+
+        let prompt = "You answer in one short sentence.".to_owned();
+        manager
+            .edit_model(
+                "show/gpt-x",
+                ModelEdit {
+                    system_prompt_override: Some(Some(prompt.clone())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let detail = manager.show_model("show/gpt-x").unwrap();
+        assert!(
+            detail.summary.has_system_prompt_override,
+            "the summary flag must follow the stored text"
+        );
+        assert_eq!(
+            detail.system_prompt_override.as_deref(),
+            Some(prompt.as_str())
+        );
+        // The list projection still must not carry the text.
+        let listed = serde_json::to_string(&detail.summary).unwrap();
+        assert!(
+            !listed.contains("one short sentence"),
+            "a summary must never ship the override body: {listed}"
+        );
+
+        // Clearing brings both back to absent.
+        manager
+            .edit_model(
+                "show/gpt-x",
+                ModelEdit {
+                    system_prompt_override: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let detail = manager.show_model("show/gpt-x").unwrap();
+        assert!(detail.system_prompt_override.is_none());
+        assert!(!detail.summary.has_system_prompt_override);
+    }
+
+    /// A bad id has to be distinguishable from a missing model, because the panel
+    /// maps the former to a 400 and the latter to a 404 and says "this model is
+    /// gone" — for a typo that would be a lie.
+    #[test]
+    fn show_model_distinguishes_a_malformed_id_from_an_unknown_model() {
+        let directory = tempdir().unwrap();
+        let registry_path = directory.path().join("providers.json");
+        let manager = ProviderManager::with_credentials(
+            &registry_path,
+            Arc::new(MemoryCredentialStore::default()),
+        );
+
+        assert!(matches!(
+            manager.show_model("no-slash"),
+            Err(ProviderManagerError::Core(CoreError::InvalidModelId(_)))
+        ));
+        assert!(matches!(
+            manager.show_model("provider/missing"),
+            Err(ProviderManagerError::Core(CoreError::ModelNotFound(_)))
+        ));
     }
 
     /// Regression: `add_provider` and `remove_provider` were the two mutators

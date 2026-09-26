@@ -18,6 +18,27 @@
 //! vary per converter (including function, namespace, custom, and tool-search calls)
 //! are supplied by the caller via the generic
 //! `output_item_added` / `output_item_done` helpers.
+//!
+//! # Fields this envelope deliberately does not emit
+//!
+//! Verified against the stock Codex 0.156.0 binary (`/home/<user>/.local/bin/codex`)
+//! by byte-level search of its string table, so the absence below is evidence
+//! rather than an oversight:
+//!
+//! * `sequence_number` — **not read by Codex.** The only two occurrences of that
+//!   literal in the binary come from `quinn-proto` (the QUIC
+//!   `new_connection_id` frame field), not from `codex-api/src/sse/responses.rs`.
+//!   `output_index` does not occur in the binary *at all*, which means Codex
+//!   correlates stream events by `item_id` alone. Both fields are still emitted
+//!   here because the real OpenAI backend sends them and a third-party client
+//!   may rely on them; adding `sequence_number` would be inventing state the
+//!   converter has no use for.
+//! * `response.incomplete` — **not an event name Codex knows.** That literal has
+//!   zero occurrences in the binary. Truncation and policy stops are therefore
+//!   reported on `response.completed` via `status: "incomplete"` plus
+//!   `incomplete_details.reason`, which *are* present in the binary (Codex reads
+//!   `incomplete_details`/`reason` in `codex-api/src/sse/responses.rs`). See
+//!   `response_status_from_finish_reason` / `incomplete_reason_from_finish_reason`.
 
 use bytes::Bytes;
 use serde_json::{Value, json};

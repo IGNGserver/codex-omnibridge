@@ -93,6 +93,55 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+
+/// Codex's default tool namespace.
+///
+/// Codex 0.156.0 does not put its tools in the request's top-level `tools` array.
+/// It sends an `input[0]` item of `type: "additional_tools"` whose `tools` are
+/// `namespace` groups, and the group holding the agent's own tools is named
+/// `functions`. Its system prompt then refers to those tools by **bare name** —
+/// "Exercise caution when escaping text for exec_command calls", "use the
+/// `apply_patch` tool" — and qualifies only the exceptions ("call
+/// `functions.new_context`").
+///
+/// So flattening that namespace would advertise `functions__exec_command` to a
+/// model that has just read 23k characters calling it `exec_command`, and models
+/// do follow the prompt they were given; the resulting call name would then miss
+/// the spec lookup and be forwarded to Codex unnamespaced. Children of the
+/// default namespace keep their bare Chat name. Every other namespace (`web`,
+/// `collaboration`, `mcp__…`) is still flattened, so names stay unambiguous.
+///
+/// The spec keeps the real namespace either way, which is what lets the reverse
+/// mapping put `namespace` back on the Responses item.
+const DEFAULT_TOOL_NAMESPACE: &str = "functions";
+
+/// Recursion cap for nested `namespace` tool groups.
+///
+/// Codex only ever sends one level today. The bound exists because the request
+/// body arrives over a socket: without it, a deeply nested document would drive
+/// unbounded recursion on the Router's stack.
+const MAX_TOOL_NAMESPACE_DEPTH: usize = 8;
+
+/// The Chat Completions name to advertise for a tool that arrived inside a
+/// Responses namespace. See [`DEFAULT_TOOL_NAMESPACE`] for why the default
+/// namespace is not flattened.
+fn namespaced_chat_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace.filter(|value| !value.is_empty() && *value != DEFAULT_TOOL_NAMESPACE) {
+        Some(namespace) => flatten_namespace_tool_name(namespace, name),
+        None => name.to_owned(),
+    }
+}
+
+/// A namespace worth recording on the way back to Codex.
+///
+/// An empty string is Codex's own "no namespace" spelling and must not be echoed
+/// back as one.
+fn spec_namespace(namespace: Option<&str>) -> Option<String> {
+    namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
     Function,
@@ -142,7 +191,11 @@ impl CodexToolContext {
             {
                 return chat_name.clone();
             }
-            return flatten_namespace_tool_name(namespace, name);
+            // Not a tool we advertised — the model invented or renamed one. Fall
+            // back to the same rule used on the way out, so a default-namespace
+            // name stays bare instead of becoming a `functions__…` name that is
+            // not in `tools` either.
+            return namespaced_chat_name(Some(namespace), name);
         }
 
         name.to_string()
@@ -163,15 +216,16 @@ impl CodexToolContext {
 
     fn add_function_tool(&mut self, tool: &Value, namespace: Option<&str>) {
         let Some(original_name) = responses_tool_name(tool) else {
+            log::warn!("[Codex] dropped a `function` tool with no usable name");
             return;
         };
-        let chat_name = namespace
-            .map(|namespace| flatten_namespace_tool_name(namespace, &original_name))
-            .unwrap_or_else(|| original_name.clone());
+        let chat_name = namespaced_chat_name(namespace, &original_name);
 
         let Some(chat_tool) = responses_function_tool_to_chat_tool(tool, &chat_name) else {
+            log::warn!("[Codex] dropped function tool `{original_name}`: not convertible");
             return;
         };
+        let namespace = spec_namespace(namespace);
         let spec = CodexToolSpec {
             kind: if namespace.is_some() {
                 CodexToolKind::Namespace
@@ -179,20 +233,30 @@ impl CodexToolContext {
                 CodexToolKind::Function
             },
             name: original_name,
-            namespace: namespace.map(ToString::to_string),
+            namespace,
         };
         self.add_chat_tool(chat_name, spec, chat_tool);
     }
 
-    fn add_custom_tool(&mut self, tool: &Value) {
+    /// Advertise a Responses `custom` tool (freeform/grammar input) as a Chat
+    /// function whose single `input` string carries the raw text.
+    ///
+    /// `namespace` is not optional decoration: Codex 0.156.0 declares
+    /// `apply_patch` — and, in code mode, `exec` — as `custom` **children of the
+    /// `functions` namespace**. An earlier revision only accepted a `custom` tool
+    /// at the top level, so both were dropped and the model was offered no way to
+    /// edit a file.
+    fn add_custom_tool(&mut self, tool: &Value, namespace: Option<&str>) {
         let Some(name) = responses_tool_name(tool) else {
+            log::warn!("[Codex] dropped a `custom` tool with no usable name");
             return;
         };
+        let chat_name = namespaced_chat_name(namespace, &name);
         let description = json!(responses_custom_tool_description(tool));
         let chat_tool = json!({
             "type": "function",
             "function": {
-                "name": name,
+                "name": chat_name,
                 "description": description,
                 "parameters": {
                     "type": "object",
@@ -209,9 +273,9 @@ impl CodexToolContext {
         let spec = CodexToolSpec {
             kind: CodexToolKind::Custom,
             name: name.clone(),
-            namespace: None,
+            namespace: spec_namespace(namespace),
         };
-        self.add_chat_tool(name, spec, chat_tool);
+        self.add_chat_tool(chat_name, spec, chat_tool);
     }
 
     fn add_tool_search_tool(&mut self) {
@@ -244,8 +308,22 @@ impl CodexToolContext {
         self.add_chat_tool(TOOL_SEARCH_PROXY_NAME.to_string(), spec, chat_tool);
     }
 
-    fn add_namespace_tool(&mut self, namespace_tool: &Value) {
+    /// Walk a `namespace` tool group and advertise each of its children.
+    ///
+    /// Every child type Codex can put in a group is handled, not just `function`:
+    /// `apply_patch` and code-mode `exec` arrive as `custom` children, and a group
+    /// may itself nest. A child of an unrecognised type is logged rather than
+    /// dropped in silence — a silent drop is how a model ends up with no way to
+    /// edit a file and nobody knows why.
+    fn add_namespace_tool(&mut self, namespace_tool: &Value, depth: usize) {
+        if depth >= MAX_TOOL_NAMESPACE_DEPTH {
+            log::warn!(
+                "[Codex] stopped descending nested tool namespaces at depth {MAX_TOOL_NAMESPACE_DEPTH}"
+            );
+            return;
+        }
         let Some(namespace) = namespace_tool.get("name").and_then(|v| v.as_str()) else {
+            log::warn!("[Codex] dropped a `namespace` tool group with no name");
             return;
         };
         let Some(children) = namespace_tool
@@ -253,12 +331,21 @@ impl CodexToolContext {
             .or_else(|| namespace_tool.get("children"))
             .and_then(|v| v.as_array())
         else {
+            log::warn!("[Codex] namespace `{namespace}` declares no tool list");
             return;
         };
 
         for child in children {
-            if child.get("type").and_then(|v| v.as_str()) == Some("function") {
-                self.add_function_tool(child, Some(namespace));
+            match child.get("type").and_then(|v| v.as_str()) {
+                Some("function") => self.add_function_tool(child, Some(namespace)),
+                Some("custom") => self.add_custom_tool(child, Some(namespace)),
+                Some("tool_search") => self.add_tool_search_tool(),
+                Some("namespace") => self.add_namespace_tool(child, depth + 1),
+                other => log::warn!(
+                    "[Codex] dropped tool `{}` of unsupported type `{}` inside namespace `{namespace}`",
+                    child.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    other.unwrap_or("<missing>")
+                ),
             }
         }
     }
@@ -266,17 +353,29 @@ impl CodexToolContext {
     fn add_response_tool(&mut self, tool: &Value) {
         match tool {
             Value::String(name) => {
-                self.add_custom_tool(&json!({
-                    "type": "custom",
-                    "name": name
-                }));
+                self.add_custom_tool(
+                    &json!({
+                        "type": "custom",
+                        "name": name
+                    }),
+                    None,
+                );
             }
             Value::Object(_) => match tool.get("type").and_then(|v| v.as_str()) {
                 Some("function") => self.add_function_tool(tool, None),
-                Some("custom") => self.add_custom_tool(tool),
+                Some("custom") => self.add_custom_tool(tool, None),
                 Some("tool_search") => self.add_tool_search_tool(),
-                Some("namespace") => self.add_namespace_tool(tool),
-                _ => {}
+                Some("namespace") => self.add_namespace_tool(tool, 0),
+                // Hosted tool types the OpenAI backend executes itself
+                // (`web_search`, `image_generation`, `file_search`, `mcp`,
+                // `local_shell`, `code_interpreter`, …). The generated catalog
+                // disables them for custom models, so seeing one here means a
+                // Codex build or a config this bridge has not been checked
+                // against; say so instead of quietly offering nothing.
+                other => log::warn!(
+                    "[Codex] dropped top-level tool of unsupported type `{}`",
+                    other.unwrap_or("<missing>")
+                ),
             },
             _ => {}
         }
@@ -293,13 +392,12 @@ pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolCo
     }
 
     if let Some(input) = body.get("input") {
-        collect_tool_search_output_tools(input, &mut context);
+        collect_input_declared_tools(input, &mut context);
     }
 
     context
 }
 
-/// Convert an OpenAI Responses request into an OpenAI Chat Completions request.
 /// Convert an OpenAI Responses request into an OpenAI Chat Completions request,
 /// using provider-declared Codex Chat reasoning capabilities when available.
 pub fn responses_to_chat_completions_with_reasoning(
@@ -800,7 +898,10 @@ fn append_responses_item_as_chat_message(
         }
         Some("custom_tool_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
-            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(item));
+            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(
+                item,
+                tool_context,
+            ));
         }
         Some("tool_search_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
@@ -895,6 +996,23 @@ fn append_responses_item_as_chat_message(
             // 到达时回溯附挂，见 attach_pending_reasoning_to_previous_assistant。
             append_pending_reasoning(pending_reasoning, responses_reasoning_item_text(item));
         }
+        // `additional_tools` is how Codex 0.156.0 declares the turn's tool set;
+        // `build_codex_tool_context_from_request` consumes it. It is not
+        // conversation content, but it does carry `role: "developer"`, so without
+        // this arm the generic fallback below would emit it as an empty chat
+        // message. Ordering is preserved exactly as the fallback's inert-item
+        // branch did: close a pending tool-call batch unless media is waiting.
+        Some("additional_tools") => {
+            if pending_media.is_empty() {
+                flush_pending_tool_calls(
+                    messages,
+                    pending_tool_calls,
+                    pending_media,
+                    pending_reasoning,
+                    last_assistant_index,
+                );
+            }
+        }
         Some("input_text" | "input_image" | "input_file" | "input_audio") => {
             flush_pending_tool_calls(
                 messages,
@@ -967,6 +1085,23 @@ fn append_responses_item_as_chat_message(
             }
         }
         _ => {
+            // An unknown Responses item type is not conversation content by
+            // definition — this bridge has no way to reconstruct it. Falling
+            // through silently turned every future Codex item type into an
+            // invisible gap in the forwarded history, which is exactly the
+            // failure mode that hid the `additional_tools` tool outage. Log the
+            // type once per item so a Codex upgrade shows up in the router log
+            // instead of only in degraded model behaviour.
+            match item_type {
+                Some(unknown) => log::warn!(
+                    "[Codex] dropping unrecognized input item of type `{unknown}`; \
+                     forwarding it to the model is not supported by this bridge"
+                ),
+                None => log::warn!(
+                    "[Codex] dropping an input item with no `type` field; \
+                     forwarding it to the model is not supported by this bridge"
+                ),
+            }
             if item.get("role").is_some() || item.get("content").is_some() {
                 flush_pending_tool_calls(
                     messages,
@@ -1412,23 +1547,42 @@ fn responses_input_file_to_chat_file(part: &Value) -> Option<Value> {
     chat_file_from_input_file(part)
 }
 
-fn collect_tool_search_output_tools(value: &Value, context: &mut CodexToolContext) {
+/// Collect every tool the request declares, wherever Codex put it.
+///
+/// Two carriers exist and a request may use either, both, or neither:
+///
+/// * `type: "additional_tools"` — how Codex 0.156.0 declares the agent's own tool
+///   set. There is **no top-level `tools` key at all** in that build; the group
+///   arrives as `input[0]` with `role: "developer"`. Reading only `body["tools"]`
+///   therefore forwarded zero tools for every custom model, which is a total tool
+///   outage rather than a degradation.
+/// * `type: "tool_search_output"` — tools a `tool_search` call loaded mid-turn, so
+///   a call issued in an earlier turn stays callable in a later one.
+///
+/// The walk is recursive and type-driven rather than positional: `input[0]` is
+/// where the item happens to be today, and an index-based read would break the
+/// first time Codex reorders it or a resumed conversation puts history first.
+fn collect_input_declared_tools(value: &Value, context: &mut CodexToolContext) {
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_tool_search_output_tools(item, context);
+                collect_input_declared_tools(item, context);
             }
         }
         Value::Object(obj) => {
-            if obj.get("type").and_then(|v| v.as_str()) == Some("tool_search_output")
-                && let Some(tools) = obj.get("tools").and_then(|v| v.as_array())
-            {
+            let declared = match obj.get("type").and_then(|v| v.as_str()) {
+                Some("additional_tools") | Some("tool_search_output") => {
+                    obj.get("tools").and_then(|v| v.as_array())
+                }
+                _ => None,
+            };
+            if let Some(tools) = declared {
                 for tool in tools {
                     context.add_response_tool(tool);
                 }
             }
             for value in obj.values() {
-                collect_tool_search_output_tools(value, context);
+                collect_input_declared_tools(value, context);
             }
         }
         _ => {}
@@ -1577,15 +1731,27 @@ fn responses_function_call_to_chat_tool_call(
     )
 }
 
-fn responses_custom_tool_call_to_chat_tool_call(item: &Value) -> Value {
+/// Map a replayed `custom_tool_call` history item onto the Chat name we advertised.
+///
+/// Takes the tool context for the same reason the `function_call` mapper does: the
+/// name Codex replays is the *unflattened* one plus a separate `namespace` field,
+/// while the Chat request advertised a single name. Using the raw `name` here
+/// paired the assistant call with a name that is not in `tools`, which strict
+/// gateways reject outright.
+fn responses_custom_tool_call_to_chat_tool_call(
+    item: &Value,
+    tool_context: &CodexToolContext,
+) -> Value {
     let call_id = response_item_call_id(item);
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let namespace = item.get("namespace").and_then(|v| v.as_str());
+    let chat_name = tool_context.chat_name_for_response_function(name, namespace);
     let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
 
     chat_tool_call(
         call_id.as_deref(),
         json!({
-            "name": name,
+            "name": chat_name,
             "arguments": canonical_json_string(&json!({ CUSTOM_TOOL_INPUT_FIELD: input }))
         }),
     )
@@ -1971,7 +2137,13 @@ pub(crate) fn response_tool_call_item_from_chat_name(
             response_tool_search_call_item(call_id, status, arguments, reasoning)
         }
         Some(spec) if spec.kind == CodexToolKind::Custom => response_custom_tool_call_item(
-            item_id, status, call_id, &spec.name, arguments, reasoning,
+            item_id,
+            status,
+            call_id,
+            &spec.name,
+            spec.namespace.as_deref(),
+            arguments,
+            reasoning,
         ),
         Some(spec) => response_function_call_item_with_namespace(
             item_id,
@@ -2006,11 +2178,17 @@ fn response_tool_search_call_item(
     item
 }
 
+/// Build a Responses `custom_tool_call` item, restoring the namespace it came from.
+///
+/// The namespace is echoed for the same reason `function_call` echoes it: Codex
+/// declares `apply_patch` inside the `functions` group, and an item naming only
+/// `apply_patch` leaves Codex to guess which group the call belongs to.
 fn response_custom_tool_call_item(
     item_id: &str,
     status: &str,
     call_id: &str,
     name: &str,
+    namespace: Option<&str>,
     arguments: &str,
     reasoning: Option<&str>,
 ) -> Value {
@@ -2023,6 +2201,11 @@ fn response_custom_tool_call_item(
         "name": name,
         "input": input
     });
+    if let Some(namespace) = namespace.filter(|value| !value.is_empty())
+        && let Some(obj) = item.as_object_mut()
+    {
+        obj.insert("namespace".to_string(), json!(namespace));
+    }
     super::codex_chat_common::attach_optional_reasoning_content_field(&mut item, reasoning);
     item
 }
@@ -2768,6 +2951,343 @@ mod tests {
                 .unwrap()
                 .contains("mcp__codex_apps__gmail")
         );
+    }
+
+    /// The tool declaration Codex 0.156.0 actually sends, captured from a real
+    /// `codex exec` turn: **no top-level `tools` key**, and the whole tool set
+    /// inside an `input[0]` item of `type: "additional_tools"`.
+    ///
+    /// This is the flat layout the generated catalog produces once `tool_mode` is
+    /// left off (see `CODE_MODE_TOOL_FIELDS` in codex-mp-catalog). Note that
+    /// `apply_patch` is a `custom` child of the `functions` namespace, not a
+    /// top-level tool — the shape an earlier revision dropped entirely.
+    fn real_additional_tools_flat_layout() -> Value {
+        json!({
+            "type": "additional_tools",
+            "id": "at_3b49fcae-9e5b-5644-b59b-bc6cdd8417fc",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "exec_command",
+                            "description": "Runs a shell command.",
+                            "strict": false,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"cmd": {"type": "string"}},
+                                "required": ["cmd"]
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "view_image",
+                            "description": "View an image.",
+                            "strict": false,
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "description": "*** Begin Patch …",
+                            "format": "grammar"
+                        }
+                    ]
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "description": "Tools for spawning and managing sub-agents.",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn a sub-agent.",
+                        "strict": false,
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                },
+                {
+                    "type": "namespace",
+                    "name": "web",
+                    "description": "Web search.",
+                    "tools": [{
+                        "type": "function",
+                        "name": "run",
+                        "description": "Run a web search.",
+                        "strict": false,
+                        "parameters": {"type": "object", "properties": {}}
+                    }]
+                }
+            ]
+        })
+    }
+
+    fn advertised_tool_names(result: &Value) -> Vec<String> {
+        result["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// P0 regression: reading only `body["tools"]` forwarded **zero** tools for
+    /// every custom model on Codex 0.156.0, because that build declares its tools
+    /// in `input` instead. A model with no tools cannot run a command or edit a
+    /// file, so this was a total outage rather than a degradation.
+    #[test]
+    fn additional_tools_declares_the_flat_tool_set_codex_0_156_sends() {
+        let result = convert_test_input(vec![
+            real_additional_tools_flat_layout(),
+            json!({"type": "message", "role": "user", "content": "hi"}),
+        ]);
+
+        let names = advertised_tool_names(&result);
+        // The default namespace keeps bare names: the 23k-character system prompt
+        // that arrives in the same request calls them `exec_command` and
+        // `apply_patch`, and a model follows the prompt it was given.
+        assert!(names.contains(&"exec_command".to_owned()), "{names:?}");
+        assert!(names.contains(&"view_image".to_owned()), "{names:?}");
+        assert!(names.contains(&"apply_patch".to_owned()), "{names:?}");
+        // Every other namespace is flattened so the names stay unambiguous.
+        assert!(
+            names.contains(&"collaboration__spawn_agent".to_owned()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"web__run".to_owned()), "{names:?}");
+        // A `custom` tool is advertised as a one-string function, which is how a
+        // grammar-formatted freeform tool survives the trip to Chat Completions.
+        let apply_patch = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("apply_patch")
+            })
+            .expect("apply_patch must be advertised");
+        assert_eq!(
+            apply_patch.pointer("/function/parameters/required"),
+            Some(&json!([CUSTOM_TOOL_INPUT_FIELD]))
+        );
+        assert!(
+            apply_patch
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("Begin Patch")),
+            "the original grammar/tool definition must survive in the description"
+        );
+    }
+
+    /// The declaration item carries `role: "developer"`, so the generic fallback
+    /// in `append_responses_item_as_chat_message` would otherwise turn it into an
+    /// empty chat message and the model would see a blank developer turn.
+    #[test]
+    fn additional_tools_is_consumed_not_forwarded_as_a_message() {
+        let result = convert_test_input(vec![
+            real_additional_tools_flat_layout(),
+            json!({"type": "message", "role": "user", "content": "Say hello."}),
+        ]);
+
+        let messages = result_messages(&result);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            !messages[0]["content"].to_string().contains("exec_command"),
+            "tool declarations must not leak into message content"
+        );
+    }
+
+    /// The other half of the round trip: when the model picks `apply_patch`, Codex
+    /// must get back a `custom_tool_call` carrying the raw patch text as `input`
+    /// and the namespace the tool was declared in.
+    #[test]
+    fn a_namespaced_custom_tool_call_round_trips_with_its_namespace() {
+        let request = json!({
+            "model": "mock/qwen3-max",
+            "input": [real_additional_tools_flat_layout()]
+        });
+        let context = build_codex_tool_context_from_request(&request);
+        let chat = json!({
+            "id": "chatcmpl_patch",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "mock/qwen3-max",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_patch",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result = chat_completion_to_response_with_context(chat, &context).unwrap();
+        let call = &result["output"][0];
+
+        assert_eq!(call["type"], "custom_tool_call");
+        assert_eq!(call["name"], "apply_patch");
+        assert_eq!(call["namespace"], "functions");
+        assert_eq!(call["call_id"], "call_patch");
+        // Raw text, not a JSON-wrapped string: `apply_patch` is a grammar tool.
+        assert_eq!(call["input"], "*** Begin Patch\n*** End Patch");
+        assert!(call["id"].as_str().unwrap().starts_with("ctc_"));
+    }
+
+    /// A namespaced `function` call still round trips the way it always did; this
+    /// pins the fact that adding namespace support to custom tools did not change
+    /// the default namespace's bare naming for functions either.
+    #[test]
+    fn a_default_namespace_function_call_round_trips_with_its_namespace() {
+        let request = json!({
+            "model": "mock/qwen3-max",
+            "input": [real_additional_tools_flat_layout()]
+        });
+        let context = build_codex_tool_context_from_request(&request);
+        let chat = json!({
+            "id": "chatcmpl_exec",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "mock/qwen3-max",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_exec",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"ls\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result = chat_completion_to_response_with_context(chat, &context).unwrap();
+        let call = &result["output"][0];
+
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "exec_command");
+        assert_eq!(call["namespace"], "functions");
+        assert_eq!(call["arguments"], r#"{"cmd":"ls"}"#);
+    }
+
+    /// Code mode (`tool_mode: "code_mode_only"`) advertises one `custom` tool
+    /// named `exec`. The generated catalog turns code mode off for custom models,
+    /// but an official-model passthrough or a hand-edited catalog can still produce
+    /// it, and dropping it would leave the model with nothing to call.
+    #[test]
+    fn code_mode_exec_is_forwarded_as_a_custom_tool() {
+        let result = convert_test_input(vec![json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [{
+                    "type": "custom",
+                    "name": "exec",
+                    "description": "Runs raw JavaScript in a fresh V8 isolate.",
+                    "format": "grammar"
+                }]
+            }]
+        })]);
+
+        assert_eq!(advertised_tool_names(&result), vec!["exec".to_owned()]);
+    }
+
+    /// A namespace group may nest, and the request arrives over a socket — the walk
+    /// is bounded so a pathological document cannot exhaust the Router's stack.
+    #[test]
+    fn nested_namespaces_are_walked_and_bounded() {
+        let mut deepest = json!({
+            "type": "function",
+            "name": "leaf",
+            "description": "A leaf tool.",
+            "parameters": {"type": "object", "properties": {}}
+        });
+        for depth in 0..(MAX_TOOL_NAMESPACE_DEPTH + 4) {
+            deepest = json!({
+                "type": "namespace",
+                "name": format!("n{depth}"),
+                "description": "",
+                "tools": [deepest]
+            });
+        }
+        let result = convert_test_input(vec![json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [deepest]
+        })]);
+
+        // Bounded, and it terminated rather than overflowing.
+        assert!(
+            advertised_tool_names(&result).len() <= 1,
+            "the walk must stop at the depth cap"
+        );
+    }
+
+    /// Resuming a conversation replays earlier `custom_tool_call` items. The name
+    /// Codex replays is unflattened and carries a separate `namespace`, so mapping
+    /// it needs the tool context — otherwise the assistant turn names a tool that
+    /// is not in `tools` and a strict gateway rejects the whole request.
+    #[test]
+    fn a_replayed_namespaced_custom_tool_call_maps_to_the_advertised_name() {
+        let result = convert_test_input(vec![
+            real_additional_tools_flat_layout(),
+            json!({
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "namespace": "functions",
+                "input": "*** Begin Patch\n*** End Patch"
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "Success."
+            }),
+        ]);
+
+        let messages = result_messages(&result);
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("the replayed call must become an assistant turn");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"], "apply_patch",
+            "{messages:?}"
+        );
+        assert_eq!(
+            assistant["tool_calls"][0]["id"], "call_patch",
+            "the call must keep the id its output is paired with"
+        );
+        let tool_message = messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("the replayed output must become a tool message");
+        assert_eq!(tool_message["tool_call_id"], "call_patch");
     }
 
     #[test]

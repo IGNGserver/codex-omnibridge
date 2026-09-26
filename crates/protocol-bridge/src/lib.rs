@@ -297,40 +297,69 @@ pub fn portable_request(request: &Value) -> Result<Value, BridgeError> {
     Ok(request)
 }
 
+/// Strip every route-private field from `input` in place.
+///
+/// Codex runs the Responses API statelessly (`store: false`,
+/// `include: ["reasoning.encrypted_content"]`), so it resends the *entire*
+/// thread history on every turn. That history can contain items produced by a
+/// different security domain — an official ChatGPT turn before the user
+/// switched to a custom model, or the reverse. Two kinds of item are affected:
+///
+/// * `reasoning` — the payload is `encrypted_content`, which is opaque
+///   per-account material. It is always removed. When nothing portable is left
+///   (an empty `summary` is the common case for models that do not emit
+///   summaries) the whole item is dropped.
+/// * `web_search_call` / `computer_call` / `file_search_call` — hosted tool
+///   results have no Chat representation at all, so they are dropped too.
+///
+/// Both cases used to abort the request with [`BridgeError::ContextBoundary`].
+/// Because Codex owns the history, that made the *whole thread* unusable: the
+/// offending item is resent on every subsequent turn, so the user got the same
+/// error forever and the only recovery was abandoning the conversation.
+/// Dropping the item costs the model some context and nothing else —
+/// `append_responses_item_as_chat_message` cannot forward either shape to a
+/// Chat model anyway, and [`record_portable_response`] already applies the same
+/// rule when writing to the history ledger. Every drop is logged so the loss is
+/// visible in the router log rather than silent.
 fn portable_items(value: &mut Value) -> Result<(), BridgeError> {
     let Some(items) = value.as_array_mut() else {
         return Ok(());
     };
-    for item in items.iter_mut() {
+    items.retain_mut(|item| {
         let Some(object) = item.as_object_mut() else {
-            continue;
+            return true;
         };
         match object.get("type").and_then(Value::as_str) {
             Some("reasoning") => {
                 object.remove("id");
                 object.remove("encrypted_content");
-                if object
+                let portable = object
                     .get("summary")
                     .and_then(Value::as_array)
-                    .is_none_or(|summary| summary.is_empty())
-                {
-                    return Err(BridgeError::ContextBoundary(
-                        "opaque reasoning has no portable summary".into(),
-                    ));
+                    .is_some_and(|summary| !summary.is_empty());
+                if !portable {
+                    log::warn!(
+                        "[bridge] dropped an opaque `reasoning` item crossing route domains: \
+                         it carried `encrypted_content` and no portable summary"
+                    );
                 }
+                portable
             }
             Some("function_call") | Some("custom_tool_call") => {
                 object.remove("id");
                 object.remove("status");
+                true
             }
-            Some("web_search_call") | Some("computer_call") | Some("file_search_call") => {
-                return Err(BridgeError::ContextBoundary(
-                    "hosted tool result cannot cross route domains".into(),
-                ));
+            Some(hosted @ ("web_search_call" | "computer_call" | "file_search_call")) => {
+                log::warn!(
+                    "[bridge] dropped a `{hosted}` item crossing route domains: \
+                     a hosted tool result has no Chat Completions representation"
+                );
+                false
             }
-            _ => {}
+            _ => true,
         }
-    }
+    });
     Ok(())
 }
 
@@ -417,13 +446,94 @@ mod tests {
     }
 
     #[test]
-    fn portable_request_rejects_hosted_tool_and_removes_private_id() {
+    fn portable_request_drops_hosted_tool_and_removes_private_id() {
         let request = json!({
             "previous_response_id": "resp_private",
-            "input": [{"type":"web_search_call","id":"call_private"}]
+            "input": [
+                {"type":"web_search_call","id":"call_private","status":"completed"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
         });
-        let error = portable_request(&request).unwrap_err();
-        assert!(error.to_string().contains("hosted tool"));
-        assert!(!error.to_string().contains("resp_private"));
+        let portable = portable_request(&request).unwrap();
+        assert!(
+            portable.get("previous_response_id").is_none(),
+            "a route-private response id must never cross a security domain"
+        );
+        let input = portable["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1, "the hosted tool item must be dropped");
+        assert_eq!(input[0]["type"], "message");
+    }
+
+    /// Codex resends the whole thread on every turn (`store: false`), so an
+    /// opaque reasoning item from an earlier official turn is present on *every*
+    /// later request. Erroring on it made the thread permanently unusable.
+    #[test]
+    fn portable_request_drops_opaque_reasoning_instead_of_failing_the_thread() {
+        let request = json!({
+            "input": [
+                {"type":"reasoning","id":"rs_private","summary":[],"encrypted_content":"gAAAAOpaque"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        });
+        let portable = portable_request(&request).unwrap();
+        let input = portable["input"].as_array().unwrap();
+        assert_eq!(
+            input.len(),
+            1,
+            "a reasoning item with no summary is not portable"
+        );
+        assert_eq!(input[0]["type"], "message");
+        assert!(
+            !portable.to_string().contains("gAAAAOpaque"),
+            "encrypted reasoning content must never cross a security domain"
+        );
+    }
+
+    #[test]
+    fn portable_request_keeps_a_reasoning_summary_and_scrubs_its_private_fields() {
+        let request = json!({
+            "input": [{
+                "type":"reasoning",
+                "id":"rs_private",
+                "encrypted_content":"gAAAAOpaque",
+                "summary":[{"type":"summary_text","text":"decided to list the directory"}]
+            }]
+        });
+        let portable = portable_request(&request).unwrap();
+        let item = &portable["input"][0];
+        assert_eq!(item["type"], "reasoning");
+        assert_eq!(item["summary"][0]["text"], "decided to list the directory");
+        assert!(
+            item.get("id").is_none(),
+            "the reasoning item id is route-private"
+        );
+        assert!(
+            item.get("encrypted_content").is_none(),
+            "encrypted reasoning content must never cross a security domain"
+        );
+    }
+
+    #[test]
+    fn portable_request_scrubs_tool_call_ids_but_keeps_the_call() {
+        let request = json!({
+            "prompt_cache_key": "cache_private",
+            "input": [{
+                "type":"function_call",
+                "id":"fc_private",
+                "status":"completed",
+                "call_id":"call_1",
+                "name":"exec_command",
+                "arguments":"{\"cmd\":\"ls\"}"
+            }]
+        });
+        let portable = portable_request(&request).unwrap();
+        assert!(portable.get("prompt_cache_key").is_none());
+        let item = &portable["input"][0];
+        assert!(item.get("id").is_none());
+        assert!(item.get("status").is_none());
+        // `call_id` is the pairing key for the tool output that follows; losing
+        // it would make the forwarded Chat history invalid.
+        assert_eq!(item["call_id"], "call_1");
+        assert_eq!(item["name"], "exec_command");
     }
 }

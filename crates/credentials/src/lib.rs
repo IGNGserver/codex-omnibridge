@@ -21,6 +21,17 @@ const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CREDENTIAL_OPERATIONS: usize = 8;
 const CREDENTIAL_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Windows Credential Manager's ceiling on a credential blob, in UTF-16 units.
+///
+/// This is a property of `CredWriteW`, not of the `keyring` crate: the blob is
+/// capped at 5 × 512 bytes and the crate reports the overflow as
+/// [`keyring::Error::TooLong`] rather than truncating. A ChatGPT OAuth token
+/// bundle routinely exceeds it, which is why Windows needs the 0600 file store as
+/// a fallback at all. Secret Service and the macOS Keychain have no comparable
+/// limit, so the constant is only consulted on Windows.
+#[cfg(windows)]
+const WINDOWS_CREDENTIAL_BLOB_LIMIT: usize = 2560;
+
 static CREDENTIAL_OPERATION_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// References already reported as served by an environment override.
@@ -38,6 +49,25 @@ fn file_backend_path() -> PathBuf {
     codex_mp_core::app_config_dir()
         .map(|dir| dir.join(".credentials"))
         .unwrap_or_else(|| PathBuf::from(".credentials"))
+}
+
+/// Whether a secret is too big for this platform's keyring on size grounds alone.
+///
+/// Split out of [`CredentialStore::set`] so the platform policy is testable
+/// without an OS keyring. The answer is "only on Windows": Secret Service and the
+/// macOS Keychain have no comparable ceiling, so elsewhere the keyring is always
+/// attempted first and the file fallback is driven by the platform's own
+/// [`keyring::Error::TooLong`].
+fn secret_exceeds_keyring_size_limit(secret: &str) -> bool {
+    #[cfg(windows)]
+    {
+        secret.encode_utf16().count() >= WINDOWS_CREDENTIAL_BLOB_LIMIT
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = secret;
+        false
+    }
 }
 
 fn write_private_json_atomic(path: &Path, contents: &str) -> Result<(), std::io::Error> {
@@ -132,8 +162,11 @@ impl NativeCredentialStore {
 
     /// Whether the opt-in 0600 file backend is selected.
     ///
-    /// Enabled only by `--secret-backend file`, which sets this variable. The
-    /// default store never falls back to a plaintext credential file.
+    /// Enabled only by `--secret-backend file`, which sets this variable. Without
+    /// it the keyring is authoritative; the one exception is a secret too large
+    /// for the platform's keyring, which falls back to the file store in
+    /// [`CredentialStore::set`] — on Windows that is a real and common case, see
+    /// `WINDOWS_CREDENTIAL_BLOB_LIMIT`.
     fn file_backend_enabled(&self) -> bool {
         std::env::var("CODEX_MP_SECRET_BACKEND").as_deref() == Ok("file")
     }
@@ -274,28 +307,37 @@ impl CredentialStore for NativeCredentialStore {
             return self.set_in_file(reference, value);
         }
 
-        // On Windows (or when a secret exceeds Windows Credential Manager's limit),
-        // large secret material (e.g. OAuth token bundles > 2560 UTF-16 chars)
-        // cannot be stored in the native keyring. Automatically fall back to the 0600 file store.
+        // Windows Credential Manager cannot hold a large secret (an OAuth token
+        // bundle is routinely over the blob limit), so there the 0600 file store
+        // is the only place it can live and the size check has to come first.
+        //
+        // This used to run on *every* platform. Secret Service and the macOS
+        // Keychain have no comparable ceiling, so on Linux and macOS a long
+        // provider API key was silently demoted from the encrypted login keyring
+        // to a plaintext-on-disk file — a real security downgrade for a secret
+        // that would have stored fine, and one the user was never told about
+        // (the doc comment on `file_backend_enabled` still claimed the default
+        // store never falls back). Everywhere else the keyring is tried first and
+        // the fallback below is reached only on the platform's own "too long"
+        // error, which keeps this correct if another backend grows a limit.
         let secret_str = value.expose_secret();
-        if secret_str.encode_utf16().count() >= 2560 {
+        if secret_exceeds_keyring_size_limit(secret_str) {
             return self.set_in_file(reference, value);
         }
 
         let entry = self.entry(reference)?;
         match entry.set_password(secret_str) {
             Ok(()) => Ok(()),
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("2560 chars")
-                    || err_msg.contains("longer than the platform limit")
-                {
-                    return self.set_in_file(reference, value);
-                }
-                Err(CredentialStoreError::Backend(format!(
-                    "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
-                )))
-            }
+            // The platform said the secret does not fit. Matching the error
+            // *variant* rather than substrings of its message: the wording differs
+            // between keyring versions ("Attribute 'x' is longer than platform
+            // limit of 2560 chars" vs "Value of 'x' is longer than the platform
+            // limit of 2560 chars"), and a reword upstream would have silently
+            // turned a working fallback into a hard failure.
+            Err(keyring::Error::TooLong(_, _)) => self.set_in_file(reference, value),
+            Err(e) => Err(CredentialStoreError::Backend(format!(
+                "keyring write failed; choose --secret-backend file explicitly to enable the 0600 file backend: {e}"
+            ))),
         }
     }
 
@@ -583,6 +625,39 @@ mod tests {
             resolved.is_err(),
             "a whitespace-only override must not be treated as a credential"
         );
+    }
+
+    /// Regression: the size-based demotion to the plaintext file store ran on
+    /// every platform, so a long provider API key on Linux or macOS was moved out
+    /// of the encrypted login keyring and into a file on disk for no reason —
+    /// the 2560-unit ceiling is a Windows Credential Manager property, not a
+    /// general one. Pinning the policy here keeps a future "let's just fall back
+    /// early" edit from silently reintroducing the downgrade.
+    #[test]
+    fn only_windows_demotes_a_large_secret_to_the_file_store() {
+        // Far past Windows' blob limit and still unremarkable for Secret Service
+        // or the macOS Keychain: a base64 provider key or a bundled OAuth token.
+        let large = "k".repeat(64 * 1024);
+        #[cfg(windows)]
+        {
+            assert!(
+                secret_exceeds_keyring_size_limit(&large),
+                "Windows cannot store this in Credential Manager, so the file \
+                 store is the only option"
+            );
+            assert!(
+                !secret_exceeds_keyring_size_limit("sk-short"),
+                "an ordinary key must still use the keyring on Windows"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !secret_exceeds_keyring_size_limit(&large),
+                "this platform's keyring has no such limit; a large secret must \
+                 not be demoted to plaintext on size alone"
+            );
+        }
     }
 
     #[test]

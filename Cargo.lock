@@ -627,6 +627,7 @@ dependencies = [
  "reqwest",
  "secrecy",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing-subscriber",

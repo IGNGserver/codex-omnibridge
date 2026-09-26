@@ -331,6 +331,37 @@
                   </div>
                 </div>
               </div>
+
+              <!-- 切换账号前 auth.json 的可恢复副本。每次切换都会自动留一份，
+                   此前只能靠手写 auth.json 才能撤销一次误切换。 -->
+              <div class="m3-card m3-card-outlined" id="auth-backups-card">
+                <div class="m3-section-header">
+                  <div class="m3-section-title-group">
+                    <h3 class="m3-title-medium">登录态备份</h3>
+                    <p class="m3-body-small m3-text-secondary">
+                      每次切换官方账号前，Codex 的 auth.json 都会被复制一份。误切换、或切到已被
+                      Codex 轮换过的凭证时，可以在这里退回。备份内含完整登录令牌，恢复完成后请及时清空。
+                    </p>
+                  </div>
+                  <div class="m3-section-actions">
+                    <button class="m3-btn m3-btn-text m3-btn-xs" id="refresh-auth-backups-btn" type="button">
+                      <span class="material-symbols-outlined m3-i-autorenew" aria-hidden="true"></span>
+                      <span>刷新</span>
+                    </button>
+                    <button class="m3-btn m3-btn-outlined m3-btn-xs" id="clean-auth-backups-btn" type="button">
+                      <span class="material-symbols-outlined m3-i-delete" aria-hidden="true"></span>
+                      <span>清空备份</span>
+                    </button>
+                  </div>
+                </div>
+                <ul class="m3-list" id="auth-backups-list" aria-live="polite">
+                  <li class="m3-list-item">
+                    <div class="m3-list-item__content">
+                      <div class="m3-list-item__headline m3-body-small m3-text-secondary">加载中…</div>
+                    </div>
+                  </li>
+                </ul>
+              </div>
             </div>
           </section>
 
@@ -665,11 +696,12 @@
           <div class="m3-text-field m3-text-field--outlined m3-text-field--select">
             <div class="m3-text-field__control">
               <select class="m3-select" name="protocol" id="tf-3">
-                <option value="responses">Responses（OpenAI Responses / Codex 增强协议）</option>
-                <option value="chat_completions">Chat Completions（标准 /v1/chat/completions）</option>
+                <option value="chat_completions">Chat Completions（标准 /v1/chat/completions，绝大多数中转站）</option>
+                <option value="responses">Responses（上游原生支持 /v1/responses 时才选）</option>
               </select>
               <label class="m3-text-field__label" id="tf-3-label" for="tf-3">协议</label>
             </div>
+            <div class="m3-text-field__support"><span>NewAPI、OneAPI、OpenRouter、本地模型等请保持默认；选错会导致上游返回 404</span></div>
           </div>
           <details class="m3-form-advanced" id="provider-advanced-details">
             <summary>高级连接选项 <span class="m3-body-small m3-text-variant">协议和认证方式通常无需修改</span></summary>
@@ -946,6 +978,23 @@
                 <div class="m3-text-field__support"><span>可用逗号分隔，例如 balanced, ultra</span></div>
               </div>
             </fieldset>
+          </div>
+          <div class="m3-model-capability-section" id="edit-model-system-prompt-section">
+            <label class="m3-checkbox">
+              <input type="checkbox" name="clear_system_prompt" id="edit-model-clear-system-prompt" />
+              <span class="m3-checkbox__box" aria-hidden="true"><span class="material-symbols-outlined m3-i-check"></span></span>
+              <span class="m3-checkbox__label">清除系统提示词覆盖，交还给 Codex 自己生成</span>
+            </label>
+            <div class="m3-text-field m3-text-field--outlined">
+              <div class="m3-text-field__control">
+                <textarea class="m3-text-field__input" name="system_prompt_override" id="edit-model-system-prompt"
+                  rows="6" placeholder=" " autocomplete="off" spellcheck="false"></textarea>
+                <label class="m3-text-field__label" for="edit-model-system-prompt">系统提示词覆盖（可选）</label>
+              </div>
+              <div class="m3-text-field__support">
+                <span id="edit-model-system-prompt-hint">当前状态读取中…</span>
+              </div>
+            </div>
           </div>
           <div class="m3-dialog__actions">
             <button type="button" class="m3-btn m3-btn-text" id="close-edit-model-btn">取消</button>

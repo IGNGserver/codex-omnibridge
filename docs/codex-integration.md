@@ -196,7 +196,15 @@ Router 默认只绑定 `127.0.0.1`，端口可以为 `0`。启动后写入 JSON 
 程序在首次使用某个覆盖时会打印一行说明；但如果你发现"改了 Key 却不生效"，
 请先检查环境中是否存在对应的 `CODEX_MP_KEY_*` 变量。
 
-Unix endpoint file 强制 0600；Windows 写入时移除继承 ACL 并只授予当前 Windows principal；token 不打印到 stdout。`/v1/models`、`/v1/responses` 和 `/v1/chat/completions` 都要求 `x-codex-omnibridge-token: <raw token>`；官方 route 另外要求有效的 `Authorization: Bearer ...`，该 header 只允许转发到官方 upstream，Custom route 不携带它。POST body 必须是 `application/json`。官方 model ID 被 Router 明确拒绝为 `501 Not Implemented`，避免把官方请求误发给第三方适配层。
+Unix endpoint file 强制 0600；Windows 写入时移除继承 ACL 并只授予当前 Windows principal；token 不打印到 stdout。`/v1/models`、`/v1/responses` 和 `/v1/chat/completions` 都要求 `x-codex-omnibridge-token: <raw token>`；官方 route 另外要求有效的 `Authorization: Bearer ...`，该 header 只允许转发到官方 upstream，Custom route 不携带它。POST body 必须是 `application/json`。
+
+官方 model ID **不再**被拒绝。早前版本对 `logical_model_id` 不含 `/` 的请求返回
+`501 Not Implemented`，目的是避免把官方请求误发给第三方适配层；现在官方 route 是显式的
+`RouteClass::Official`：校验调用方自带的 `Authorization: Bearer` 后原样透传到官方
+base URL，因此同一个 Codex 会话里官方模型和自定义模型可以并存，切换模型不会打断之前的对话。
+`501` 现在只出现在一个确实无法胜任的组合上：Chat Completions 客户端接入一个只讲
+Responses 协议的 provider——桥接层只朝 Responses 方向转换，没有反向的响应转换器，
+返回 200 会让客户端拿到一个无法解析的 body，因此显式拒绝并指引改用 `/v1/responses`。
 
 当前仍是 loopback TCP，不是 Unix socket / Windows named pipe。Router 已对 Host 和
 Origin 做 loopback 校验，并保留 capability token、JSON body 上限和 endpoint 文件权限
@@ -206,9 +214,9 @@ token 不能替代这些边界。
 ## 协议与 Context Boundary
 
 当前实现以 Codex Responses 请求为主路径：Responses provider 的请求和 SSE 响应可直接
-转发；Chat Completions provider 的非流式请求会做显式的消息转换。跨协议流式转换会
-返回 `400`，因为无法在没有完整事件语义映射的情况下保证 tool、reasoning、cancel 和
-错误事件的含义。
+转发；Chat Completions provider 无论流式与否都会做显式转换——非流式走
+`chat_to_responses_with_request`，流式走 `chat_sse_to_responses_stream`，把上游的
+`chat.completion.chunk` 事件重新发成 Responses 事件。跨协议转换已经不再是 `400`。
 
 输入中的图片、文件、hosted tool、函数调用历史和缺失 reasoning summary 会依据目标
 provider 能力进行校验；不支持的内容返回带有 `context boundary` 的错误，不会静默删

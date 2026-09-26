@@ -300,3 +300,38 @@ jobs:
             }
           }
           if ($failed) { exit 1 }
+
+  # The committed catalog fixture makes the real-Codex schema assertions run on every
+  # push (they are `include_str!`-embedded, so deleting the fixture breaks the
+  # compile). What it cannot do is notice that a *new* Codex release changed the
+  # schema. This job re-runs the same two tests against a live binary instead of the
+  # fixture, by way of `CODEX_MP_TEST_CODEX_BIN`.
+  #
+  # Non-blocking on purpose: `@openai/codex@latest` is third-party and can move or
+  # go unreachable independently of this repository, and a red X for that would just
+  # train everyone to ignore the job. When it fails it means the fixture has drifted
+  # and the generated catalog needs re-checking against the new release.
+  codex-fixture-drift:
+    name: Real Codex catalog drift
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Install stock Codex
+        run: npm install --global @openai/codex@latest
+
+      - name: Record the Codex version under test
+        run: |
+          codex --version
+          echo "The committed fixture is from codex-cli 0.156.0."
+          echo "If the two tests below fail, Codex changed its bundled catalog schema."
+
+      - name: Re-run the real-catalog tests against the live binary
+        run: cargo test --locked -p codex-mp-catalog --lib -- --nocapture
+        env:
+          CODEX_MP_TEST_CODEX_BIN: codex

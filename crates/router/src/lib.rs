@@ -45,6 +45,45 @@ pub const DEFAULT_BIND_IP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const CAPABILITY_HEADER: &str = "x-codex-omnibridge-token";
 pub const ROUTER_BUILD_PROFILE: &str = "stock-omnibridge-v1";
 const DEFAULT_OFFICIAL_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Client headers that may cross into the official ChatGPT backend.
+///
+/// Measured, not guessed: this is the exact header set a real `codex exec`
+/// 0.156.0 turn put on the wire, minus the ones that must *not* be forwarded
+/// (`host`, `content-length`, `content-encoding` — the body arrives
+/// zstd-compressed and is re-serialized uncompressed — and `CAPABILITY_HEADER`,
+/// which is this router's own loopback secret). Any `x-codex-*` header is
+/// additionally passed through by prefix, so a future Codex that adds one keeps
+/// working without a router release.
+///
+/// The ones that were previously dropped and matter:
+/// * `user-agent` — Codex identifies itself as `codex_exec/0.156.0 (…)`. This
+///   router's client is built without `.user_agent(..)`, and reqwest 0.13 only
+///   sends a `User-Agent` when one is configured (verified in
+///   `reqwest-0.13.4/src/connect.rs`: the sole insertion site is the
+///   HTTPS-over-proxy `CONNECT` tunnel, guarded by `if let Some(ua)`). So
+///   dropping the header meant the official backend saw a request with *no*
+///   `User-Agent` at all — the single easiest way for a proxy or a WAF to tell a
+///   real Codex apart from an arbitrary HTTP client.
+/// * `originator` — `codex_exec` vs `codex_tui` vs the desktop app; the backend
+///   gates surface-specific behaviour on it.
+/// * `x-openai-internal-codex-responses-lite` — the flag that pairs with the
+///   catalog's `use_responses_lite`; the official backend uses it to select the
+///   lite Responses path.
+/// * `session-id` / `thread-id` / `x-client-request-id` — correlation ids the
+///   backend echoes into its own logs; dropping them makes an upstream-side
+///   support request about the user's session unanswerable.
+const OFFICIAL_PASSTHROUGH_HEADERS: &[&str] = &[
+    "authorization",
+    "chatgpt-account-id",
+    "originator",
+    "session-id",
+    "thread-id",
+    "user-agent",
+    "x-client-request-id",
+    "x-openai-internal-codex-responses-lite",
+];
+
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Cap on a buffered (non-streaming) upstream response.
 ///
@@ -102,10 +141,16 @@ const MAX_TRACKED_RESPONSE_ROUTES: usize = 4096;
 
 /// Upstream connect deadline.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upstream deadline covering the whole request *including* body streaming.
+/// Longest a upstream may stay *silent* before the router gives up on it.
 ///
-/// Applied per-request rather than on the client, because a client-wide timeout
-/// would abort long-lived streaming responses mid-turn.
+/// This is a `reqwest` **read** timeout, not a total deadline: it is re-armed
+/// after every successful read of the response body. A reasoning model that
+/// thinks for nine minutes and then streams for twenty is fine; a socket that
+/// stops producing bytes is not. The previous code applied this same duration
+/// with `RequestBuilder::timeout`, which reqwest documents as "applied from when
+/// the request starts connecting until the response body has finished" — a hard
+/// 600 s cap that aborted long streaming turns mid-response, the exact failure
+/// the comment next to it claimed to avoid.
 const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Build the client used for every upstream call.
@@ -123,12 +168,14 @@ fn build_upstream_client() -> Result<Client, String> {
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
-    // Deliberately no client-wide `.timeout(..)`: it would abort long-lived
-    // streaming turns mid-response. The deadline is applied per request with
-    // `UPSTREAM_READ_TIMEOUT` instead.
+    // Deliberately no `.timeout(..)` anywhere: reqwest's total-request timeout
+    // covers the response *body*, so it would cut off a long streaming turn no
+    // matter whether it was set here or per request. Stall detection belongs on
+    // `read_timeout`, which resets on each successful read.
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
 }
 
 /// A `previous_response_id` -> route map with a hard size bound and FIFO
@@ -1148,10 +1195,6 @@ async fn forward_request_v2(
     };
     let mut builder = http_client
         .post(upstream_url)
-        // Per-request deadline rather than a client-wide one: a client timeout
-        // would cut off long streaming turns. This at least bounds how long a
-        // hung upstream can pin a request task.
-        .timeout(UPSTREAM_READ_TIMEOUT)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(accept) = headers.get(header::ACCEPT) {
         builder = builder.header(header::ACCEPT, accept.clone());
@@ -1218,6 +1261,19 @@ async fn forward_request_v2(
     };
 
     if !status.is_success() {
+        // A 404/405/501 from a custom provider almost always means the protocol
+        // field is wrong rather than that the model is broken. Say so, and keep
+        // the provider's own message as evidence instead of replacing it.
+        if let Some(hint) = protocol_mismatch_hint(status, endpoint, provider.as_ref()) {
+            let snippet = upstream_error_snippet(upstream).await;
+            let message = if snippet.is_empty() {
+                hint
+            } else {
+                format!("{hint}\nUpstream said: {snippet}")
+            };
+            drop(active_stream_permit.take());
+            return error_response(status, message);
+        }
         let Some(permit) = active_stream_permit.take() else {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1541,6 +1597,21 @@ async fn hydrate_history_boundary(
                     .into(),
             ));
         }
+    }
+    // Scrubbing is keyed on the *destination*, not on the wire protocol.
+    //
+    // It used to share the `is_chat || cross_route` condition above, which left a
+    // hole: Codex runs the Responses API statelessly (`store: false`, and the
+    // captured request body has no `previous_response_id` key at all), so
+    // `cross_route` is false in practice and a custom provider configured with
+    // `protocol = "responses"` is not `is_chat` either. A thread that started on
+    // the official backend therefore handed the third party OpenAI-issued
+    // `encrypted_content` reasoning and `prompt_cache_key` verbatim — precisely
+    // the material `portable_request` exists to stop.
+    //
+    // The official route is still exempt: that backend issued those ids and
+    // needs them back for prompt caching and stateless reasoning replay.
+    if !is_official || cross_route {
         *request = portable_request(request)?;
     }
     Ok(())
@@ -1592,9 +1663,9 @@ fn apply_official_headers(
 ) -> reqwest::RequestBuilder {
     // Explicit official allowlist.  The independent capability header,
     // provider keys and arbitrary browser headers never cross this boundary.
-    for name in ["authorization", "chatgpt-account-id"] {
-        if let Some(value) = headers.get(name) {
-            builder = builder.header(name, value.clone());
+    for name in OFFICIAL_PASSTHROUGH_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            builder = builder.header(*name, value.clone());
         }
     }
     for (name, value) in headers {
@@ -1763,9 +1834,15 @@ async fn forward_multipart_request(
                 .map(|(_, value)| value.into_owned())
         })
         .filter(|value| !value.trim().is_empty());
-    let (upstream_base, route) = match requested_model.as_deref() {
+    // The provider config is kept (not just its `base_url`) because a custom
+    // route needs the credential and static headers attached below. This handler
+    // used to drop the provider as soon as it had the URL, so an image edit
+    // routed to a third party was sent with *no* authorization header at all and
+    // came back 401 — while the same provider worked fine for chat traffic.
+    let (upstream_base, route, custom_provider) = match requested_model.as_deref() {
         Some(logical_model_id) => {
             let registry = state.registry.read().await;
+            let generation = registry.generation();
             match registry.resolve_logical_model_route(logical_model_id) {
                 Ok(LogicalModelRoute::Custom { provider_id, .. }) => {
                     let Some(provider) = registry
@@ -1777,17 +1854,21 @@ async fn forward_multipart_request(
                             RouterError::UnknownProvider(provider_id).to_string(),
                         );
                     };
-                    (provider.base_url.clone(), RouteClass::Custom)
+                    (
+                        provider.base_url.clone(),
+                        RouteClass::Custom,
+                        Some((provider.clone(), generation)),
+                    )
                 }
                 Ok(LogicalModelRoute::Official { .. }) => {
-                    (state.official_base_url.clone(), RouteClass::Official)
+                    (state.official_base_url.clone(), RouteClass::Official, None)
                 }
                 Err(error) => {
                     return error_response(StatusCode::NOT_FOUND, error.to_string());
                 }
             }
         }
-        None => (state.official_base_url.clone(), RouteClass::Official),
+        None => (state.official_base_url.clone(), RouteClass::Official, None),
     };
 
     if route == RouteClass::Official
@@ -1807,7 +1888,6 @@ async fn forward_multipart_request(
     };
     let mut builder = http_client
         .post(upstream_url)
-        .timeout(UPSTREAM_READ_TIMEOUT)
         .header(header::CONTENT_TYPE, content_type)
         .body(bytes);
     if let Some(accept) = headers.get(header::ACCEPT) {
@@ -1815,6 +1895,14 @@ async fn forward_multipart_request(
     }
     if route == RouteClass::Official {
         builder = apply_official_headers(builder, &headers);
+    } else if let Some((provider, generation)) = custom_provider.as_ref() {
+        // Same credential path as chat traffic: the provider's own API key, in
+        // the header shape its `auth_strategy` declares. The ChatGPT bearer that
+        // Codex sent us is never forwarded to a third party.
+        builder = match apply_custom_headers(builder, provider, &state, *generation).await {
+            Ok(builder) => builder,
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        };
     }
 
     match builder.send().await {
@@ -1866,6 +1954,117 @@ async fn read_bounded_json(upstream: reqwest::Response) -> Result<Value, RouterE
         collected.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&collected).map_err(RouterError::InvalidJson)
+}
+
+/// Cap on how much of an upstream *error* body is quoted back to the user.
+/// Error bodies are short; anything beyond this is a page of HTML nobody reads.
+const MAX_UPSTREAM_ERROR_SNIPPET_BYTES: usize = 4 * 1024;
+/// Cap on the quoted fragment itself, after the provider's message is extracted.
+const MAX_UPSTREAM_ERROR_SNIPPET_CHARS: usize = 300;
+
+/// Extract the provider's own explanation from an error body.
+///
+/// Prefers the conventional `error.message` / `message` / `detail` fields so a
+/// JSON API's wording survives; otherwise falls back to a truncated,
+/// control-character-free slice of the raw text. Never returns a string long
+/// enough to smuggle a whole HTML page into the router's JSON error.
+async fn upstream_error_snippet(upstream: reqwest::Response) -> String {
+    let mut collected: Vec<u8> = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while collected.len() < MAX_UPSTREAM_ERROR_SNIPPET_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let room = MAX_UPSTREAM_ERROR_SNIPPET_BYTES - collected.len();
+                collected.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            _ => break,
+        }
+    }
+
+    let text = String::from_utf8_lossy(&collected);
+    let from_json = serde_json::from_str::<Value>(text.trim())
+        .ok()
+        .and_then(|body| {
+            ["error"]
+                .iter()
+                .filter_map(|key| body.get(key))
+                .chain(std::iter::once(&body))
+                .flat_map(|node| {
+                    [
+                        node.get("message").and_then(Value::as_str),
+                        node.get("detail").and_then(Value::as_str),
+                        node.as_str(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+                .map(str::trim)
+                .find(|message| !message.is_empty())
+                .map(ToOwned::to_owned)
+        });
+
+    let snippet = from_json.unwrap_or_else(|| text.trim().to_owned());
+    let flattened: String = snippet
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect();
+    let flattened = flattened.split('\n').collect::<Vec<_>>().join(" ");
+    let trimmed = flattened.trim();
+    if trimmed.chars().count() > MAX_UPSTREAM_ERROR_SNIPPET_CHARS {
+        let cut: String = trimmed
+            .chars()
+            .take(MAX_UPSTREAM_ERROR_SNIPPET_CHARS)
+            .collect();
+        format!("{cut}…")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Explain "the upstream does not have this endpoint" in terms of the one
+/// registry field the user can actually change.
+///
+/// A provider registered with `protocol = "responses"` is called at
+/// `/v1/responses`. Essentially no third-party gateway implements that path, so
+/// the upstream answers 404/405/501 with an HTML page or a bare
+/// `{"detail":"Not Found"}`. Passed through verbatim, Codex shows the user an
+/// opaque failure and the user concludes the *model* is broken; the actual cause
+/// is one wrong dropdown. The mirror case (a `chat_completions` provider whose
+/// base URL only serves `/v1/responses`) gets its own wording.
+fn protocol_mismatch_hint(
+    status: StatusCode,
+    endpoint: OmniEndpoint,
+    provider: Option<&ProviderConfig>,
+) -> Option<String> {
+    let provider = provider?;
+    if !matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+    ) {
+        return None;
+    }
+    let command = format!("codex-mp provider edit {} --protocol", provider.id);
+    match (endpoint, provider.protocol) {
+        (OmniEndpoint::Responses, ProviderProtocol::Responses) => Some(format!(
+            "provider `{}` is registered as speaking the Responses API, but it \
+             answered {status} for `{}`. Most OpenAI-compatible gateways \
+             (NewAPI, OneAPI, OpenRouter, vLLM, Ollama, LM Studio) only implement \
+             Chat Completions; if this is one of them, run `{command} \
+             chat_completions` so OmniBridge translates the request instead of \
+             forwarding it.",
+            provider.name,
+            OmniEndpoint::Responses.path()
+        )),
+        (OmniEndpoint::ChatCompletions, ProviderProtocol::ChatCompletions) => Some(format!(
+            "provider `{}` answered {status} for `{}`. Check that its API base \
+             URL is the root the gateway documents (many expect `…/v1`, some \
+             expect no `/v1`), or run `{command} responses` if this upstream only \
+             serves the Responses API.",
+            provider.name,
+            OmniEndpoint::ChatCompletions.path()
+        )),
+        _ => None,
+    }
 }
 
 fn bridge_error_response(error: BridgeError) -> Response {
@@ -2056,7 +2255,7 @@ fn validate_request_origin(headers: &HeaderMap) -> Option<Response> {
             ));
         };
         let allowed_scheme = matches!(parsed.scheme(), "http" | "https" | "tauri");
-        let allowed_host = parsed.host_str().is_some_and(is_loopback_host);
+        let allowed_host = url_host_is_loopback(&parsed);
         if !allowed_scheme || !allowed_host {
             return Some(error_response(
                 StatusCode::FORBIDDEN,
@@ -2077,15 +2276,25 @@ fn is_loopback_authority(value: &str) -> bool {
         && parsed.query().is_none()
         && parsed.fragment().is_none()
         && valid_path
-        && parsed.host_str().is_some_and(is_loopback_host)
+        && url_host_is_loopback(&parsed)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false)
+/// Whether a parsed URL's host names the loopback interface.
+///
+/// Matched on the typed [`url::Host`] rather than on `host_str()`, because
+/// `host_str()` returns an IPv6 literal **with its brackets** (`"[::1]"`), which
+/// `str::parse::<IpAddr>()` rejects. A Host of `[::1]:8787` therefore used to be
+/// classified as foreign: a Codex configured with
+/// `base_url = "http://localhost:8787/v1"` on a machine whose resolver prefers
+/// IPv6 was answered `InvalidRequestOrigin` instead of being served, and an
+/// `Origin: http://[::1]:…` from the desktop shell was refused the same way.
+fn url_host_is_loopback(parsed: &Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn join_url(base: &str, path: &str) -> Result<Url, RouterError> {
@@ -2528,6 +2737,9 @@ mod tests {
         let mut registry = ProviderRegistry::empty("/tmp/router-test.json");
         let mut provider =
             ProviderConfig::new("NewAPI", &format!("http://{}/v1", upstream_addr)).unwrap();
+        // This test is about the Responses *passthrough* path, so it must opt in
+        // explicitly: `ProviderConfig::new` now defaults to `chat_completions`.
+        provider.protocol = ProviderProtocol::Responses;
         provider.credential_reference = "provider:newapi-test".into();
         registry.add_provider(provider).unwrap();
         registry
@@ -3316,5 +3528,545 @@ mod tests {
             .unwrap();
         let response = tower::ServiceExt::oneshot(app, authorized).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Regression: a provider registered with `protocol = "responses"` is called
+    /// at `/v1/responses`, a path essentially no third-party gateway implements.
+    /// The router used to forward the upstream's bare 404 body, so Codex showed
+    /// an opaque failure and the user concluded the *model* was broken. The field
+    /// that is actually wrong is the protocol dropdown, so the error has to name
+    /// it, give the exact command that fixes it, and keep the provider's own
+    /// message as evidence.
+    #[tokio::test]
+    async fn a_responses_provider_that_404s_names_the_protocol_field_and_the_fix() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Exactly what an Express-based gateway (NewAPI, OneAPI) answers for
+            // a path it does not route.
+            let app = Router::new().fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {"message": "Invalid URL (POST /v1/responses)"}
+                    })),
+                )
+            });
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut registry = ProviderRegistry::empty("/tmp/router-protocol-hint-test.json");
+        let mut provider = ProviderConfig::new("NewAPI", &format!("http://{address}/v1")).unwrap();
+        provider.protocol = ProviderProtocol::Responses;
+        provider.auth_strategy = AuthStrategy::None;
+        registry.add_provider(provider).unwrap();
+        registry
+            .add_model(CustomModel::new("newapi", "qwen3.8", "NewAPI / Qwen3.8").unwrap())
+            .unwrap();
+        let state = RouterState::with_capability_token(
+            registry,
+            Arc::new(MemoryCredentialStore::default()),
+            SecretString::from("capability-secret"),
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("host", "127.0.0.1")
+            .header(CAPABILITY_HEADER, "capability-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "newapi/qwen3.8",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app(state), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let message = error_message(response).await;
+        assert!(
+            message.contains("codex-mp provider edit newapi --protocol chat_completions"),
+            "the error must give the exact command that fixes it, got: {message}"
+        );
+        assert!(
+            message.contains("NewAPI"),
+            "the error must name the provider the user configured, got: {message}"
+        );
+        assert!(
+            message.contains("Invalid URL (POST /v1/responses)"),
+            "the provider's own message must survive as evidence, got: {message}"
+        );
+    }
+
+    /// The hint must fire only when the endpoint and the declared protocol
+    /// actually disagree. A 404 from a correctly configured provider is a real
+    /// upstream problem (a retired model, a wrong base URL), and papering over it
+    /// with "change your protocol" would send the user down the wrong path.
+    #[test]
+    fn protocol_mismatch_hint_only_fires_when_endpoint_and_protocol_disagree() {
+        let provider = |protocol: ProviderProtocol| {
+            let mut provider = ProviderConfig::new("Up", "https://example.test/v1").unwrap();
+            provider.protocol = protocol;
+            provider
+        };
+        let responses = provider(ProviderProtocol::Responses);
+        let chat = provider(ProviderProtocol::ChatCompletions);
+
+        // The mismatch the hint exists for.
+        assert!(
+            protocol_mismatch_hint(
+                StatusCode::NOT_FOUND,
+                OmniEndpoint::Responses,
+                Some(&responses)
+            )
+            .is_some()
+        );
+        // The mirror case: a `chat_completions` provider whose base URL only
+        // serves the Responses API.
+        let mirror = protocol_mismatch_hint(
+            StatusCode::NOT_FOUND,
+            OmniEndpoint::ChatCompletions,
+            Some(&chat),
+        )
+        .expect("the mirror mismatch needs its own wording");
+        assert!(
+            mirror.contains("API base URL"),
+            "the mirror case must point at the base URL, got: {mirror}"
+        );
+
+        // Everything below must stay silent.
+        for (status, endpoint, provider) in [
+            // A 404 that already agrees with the declared protocol is not a
+            // protocol problem.
+            (StatusCode::NOT_FOUND, OmniEndpoint::Responses, Some(&chat)),
+            (
+                StatusCode::NOT_FOUND,
+                OmniEndpoint::ChatCompletions,
+                Some(&responses),
+            ),
+            // An auth or quota failure is never a protocol failure.
+            (
+                StatusCode::UNAUTHORIZED,
+                OmniEndpoint::Responses,
+                Some(&responses),
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                OmniEndpoint::Responses,
+                Some(&responses),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                OmniEndpoint::Responses,
+                Some(&responses),
+            ),
+        ] {
+            assert!(
+                protocol_mismatch_hint(status, endpoint, provider).is_none(),
+                "{status} on {endpoint:?} must not be blamed on the protocol field"
+            );
+        }
+
+        // The official route has no provider config to point at.
+        assert!(
+            protocol_mismatch_hint(StatusCode::NOT_FOUND, OmniEndpoint::Responses, None).is_none()
+        );
+
+        // 405 and 501 mean the same thing as 404 here: the path is not served.
+        for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::NOT_IMPLEMENTED] {
+            assert!(
+                protocol_mismatch_hint(status, OmniEndpoint::Responses, Some(&responses)).is_some(),
+                "{status} is also 'this endpoint does not exist'"
+            );
+        }
+    }
+
+    /// The snippet is what the user actually reads, so it has to survive contact
+    /// with a hostile or merely sloppy upstream: an HTML error page, a body
+    /// bigger than the buffer, control characters, and a message longer than the
+    /// chat surface can show.
+    #[tokio::test]
+    async fn upstream_error_snippet_extracts_the_message_and_is_bounded() {
+        /// Serve one canned body, then hand a real `reqwest::Response` for it to
+        /// the function under test. `upstream_error_snippet` consumes a response
+        /// stream, so it can only be exercised over a real connection.
+        async fn snippet_for(status: StatusCode, body: String) -> String {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let app = Router::new().fallback(move || {
+                    let body = body.clone();
+                    async move { (status, body) }
+                });
+                let _ = axum::serve(listener, app).await;
+            });
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            upstream_error_snippet(response).await
+        }
+
+        // `error.message` is the OpenAI shape and wins over a sibling top-level
+        // `message`, which some gateways also emit with different text.
+        assert_eq!(
+            snippet_for(
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": {"message": "  model `x` is offline  "},
+                    "message": "less specific"
+                })
+                .to_string()
+            )
+            .await,
+            "model `x` is offline",
+            "the provider's own message must be extracted and trimmed"
+        );
+
+        // `detail` is FastAPI's shape and is the only text many gateways give.
+        assert_eq!(
+            snippet_for(
+                StatusCode::NOT_FOUND,
+                json!({"detail": "Not Found"}).to_string()
+            )
+            .await,
+            "Not Found"
+        );
+
+        // A bare JSON string body is still a message.
+        assert_eq!(
+            snippet_for(
+                StatusCode::BAD_GATEWAY,
+                json!("upstream exploded").to_string()
+            )
+            .await,
+            "upstream exploded"
+        );
+
+        // Control characters must not reach a log line or an HTTP body raw: a
+        // carriage return or an escape can forge log entries and break the
+        // panel's rendering. Built through `json!` so the wire form is properly
+        // escaped and the flattening — not the parser — is what is under test.
+        assert_eq!(
+            snippet_for(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {"message": "bad\u{7}key\nsecond line"}}).to_string()
+            )
+            .await,
+            "bad key second line"
+        );
+
+        // Neither valid JSON nor short: an HTML error page. It must be clipped to
+        // the byte bound and then to the character bound, and end with an
+        // ellipsis so the user can tell it was cut.
+        let page = format!("<html><body>{}</body></html>", "A".repeat(64 * 1024));
+        let clipped = snippet_for(StatusCode::NOT_FOUND, page).await;
+        assert!(
+            clipped.chars().count() <= MAX_UPSTREAM_ERROR_SNIPPET_CHARS + 1,
+            "the snippet must be bounded, got {} chars",
+            clipped.chars().count()
+        );
+        assert!(clipped.ends_with('…'), "a cut snippet must say so");
+
+        // A long but legitimate message keeps its first characters rather than
+        // being dropped whole.
+        let long = json!({"error": {"message": "m".repeat(1000)}}).to_string();
+        let clipped = snippet_for(StatusCode::BAD_REQUEST, long).await;
+        assert_eq!(
+            clipped.chars().count(),
+            MAX_UPSTREAM_ERROR_SNIPPET_CHARS + 1,
+            "exactly the cap plus the ellipsis"
+        );
+
+        // An empty body must not produce a dangling "Upstream said: ".
+        assert_eq!(snippet_for(StatusCode::NOT_FOUND, String::new()).await, "");
+    }
+
+    /// Regression: `/v1/images/edits` on a custom route was sent with **no**
+    /// authorization header at all, because the handler dropped the provider
+    /// config as soon as it had extracted `base_url`. Every third-party image
+    /// edit therefore failed 401 while chat traffic to the same provider worked.
+    /// The ChatGPT bearer Codex sent must never be the thing forwarded either.
+    #[tokio::test]
+    async fn image_edits_on_a_custom_route_sends_the_provider_credential() {
+        let capture = Arc::new(StdMutex::new(UpstreamCapture::default()));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = capture.clone();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/images/edits",
+                post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        let mut capture = seen.lock().unwrap();
+                        capture.path = Some("/v1/images/edits".to_owned());
+                        capture.authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        capture.capability = headers
+                            .get(CAPABILITY_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        capture.account = headers
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        // Multipart, not JSON: `UpstreamCapture::body` cannot hold
+                        // it, so only the framing is asserted here.
+                        let _ = body;
+                        Json(json!({"created": 1, "data": []}))
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut registry = ProviderRegistry::empty("/tmp/router-image-credential-test.json");
+        let mut provider = ProviderConfig::new("Img", &format!("http://{address}/v1")).unwrap();
+        provider.credential_reference = "provider:img-test".into();
+        registry.add_provider(provider).unwrap();
+        registry
+            .add_model(CustomModel::new("img", "gpt-image-1", "Img / gpt-image-1").unwrap())
+            .unwrap();
+        let credentials = MemoryCredentialStore::default();
+        credentials
+            .set("provider:img-test", &SecretString::from("provider-secret"))
+            .unwrap();
+        let state = RouterState::with_capability_token(
+            registry,
+            Arc::new(credentials),
+            SecretString::from("capability-secret"),
+        );
+
+        let boundary = "----omnibridge-credential-test";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit this\r\n--{boundary}--\r\n"
+        );
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits?model=img/gpt-image-1")
+            .header("host", "127.0.0.1")
+            .header(CAPABILITY_HEADER, "capability-secret")
+            // A ChatGPT bearer and account id Codex would normally send. Neither
+            // may reach a third party.
+            .header(header::AUTHORIZATION, "Bearer official-oauth")
+            .header("chatgpt-account-id", "acct-canary")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(app(state), request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let capture = capture.lock().unwrap();
+        assert_eq!(
+            capture.authorization.as_deref(),
+            Some("Bearer provider-secret"),
+            "the provider's own key must be attached, not Codex's ChatGPT bearer"
+        );
+        assert_eq!(
+            capture.capability, None,
+            "the loopback capability token must never leave the router"
+        );
+        assert_eq!(
+            capture.account, None,
+            "the ChatGPT account id must never reach a third party"
+        );
+    }
+
+    /// The official route's header set is a security boundary in both directions:
+    /// Codex's own correlation and identity headers must arrive (or the backend
+    /// sees an anonymous client), while this router's loopback capability token
+    /// and arbitrary browser headers must not.
+    #[test]
+    fn official_header_passthrough_follows_the_measured_codex_allowlist() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer official-oauth".parse().unwrap(),
+        );
+        headers.insert("chatgpt-account-id", "acct-1".parse().unwrap());
+        headers.insert("originator", "codex_exec".parse().unwrap());
+        headers.insert("session-id", "sess-1".parse().unwrap());
+        headers.insert("thread-id", "thread-1".parse().unwrap());
+        headers.insert(
+            "user-agent",
+            "codex_exec/0.156.0 (Linux 6.x; x86_64)".parse().unwrap(),
+        );
+        headers.insert("x-client-request-id", "req-1".parse().unwrap());
+        headers.insert(
+            "x-openai-internal-codex-responses-lite",
+            "true".parse().unwrap(),
+        );
+        // Forwarded by the `x-codex-*` prefix rule.
+        headers.insert("x-codex-future-header", "keep".parse().unwrap());
+        // Must never cross.
+        headers.insert(CAPABILITY_HEADER, "loopback-secret".parse().unwrap());
+        headers.insert("x-local-token", "panel-secret".parse().unwrap());
+        headers.insert("cookie", "session=stolen".parse().unwrap());
+        headers.insert("origin", "http://127.0.0.1:1".parse().unwrap());
+
+        let request = apply_official_headers(
+            Client::new().post("https://chatgpt.com/backend-api/codex/responses"),
+            &headers,
+        )
+        .build()
+        .expect("a header value that cannot be built is a bug in this test");
+        let sent = request.headers();
+
+        for (name, expected) in [
+            ("authorization", "Bearer official-oauth"),
+            ("chatgpt-account-id", "acct-1"),
+            ("originator", "codex_exec"),
+            ("session-id", "sess-1"),
+            ("thread-id", "thread-1"),
+            ("user-agent", "codex_exec/0.156.0 (Linux 6.x; x86_64)"),
+            ("x-client-request-id", "req-1"),
+            ("x-openai-internal-codex-responses-lite", "true"),
+            ("x-codex-future-header", "keep"),
+        ] {
+            assert_eq!(
+                sent.get(name).and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "`{name}` is part of the measured Codex header set and must be forwarded"
+            );
+        }
+
+        for name in [CAPABILITY_HEADER, "x-local-token", "cookie", "origin"] {
+            assert!(
+                sent.get(name).is_none(),
+                "`{name}` must never cross into the official backend, got {:?}",
+                sent.get(name)
+            );
+        }
+    }
+
+    /// Regression: scrubbing shared the `is_chat || cross_route` condition with
+    /// history enrichment. Codex runs the Responses API statelessly, so
+    /// `cross_route` is false in practice, and a custom provider configured with
+    /// `protocol = "responses"` is not `is_chat` either — a thread that started
+    /// on the official backend handed the third party OpenAI-issued
+    /// `encrypted_content` and `prompt_cache_key` verbatim.
+    #[tokio::test]
+    async fn a_custom_responses_provider_never_receives_official_reasoning_material() {
+        let mut registry = ProviderRegistry::empty("/tmp/router-scrub-test.json");
+        let mut provider = ProviderConfig::new("Native", "https://example.test/v1").unwrap();
+        provider.protocol = ProviderProtocol::Responses;
+        registry.add_provider(provider).unwrap();
+        registry.set_official_model_ids(["gpt-5.6-sol"]);
+        let state = RouterState::new(registry, Arc::new(MemoryCredentialStore::default()));
+        let provider = state
+            .registry
+            .read()
+            .await
+            .provider("native")
+            .cloned()
+            .expect("provider present");
+
+        let mut request = json!({
+            "model": "native/m1",
+            "prompt_cache_key": "codex-cache-key",
+            "safety_identifier": "user-hash",
+            "input": [
+                {"type": "reasoning", "id": "rs_official",
+                 "encrypted_content": "opaque-openai-material", "summary": []},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hello"}]}
+            ]
+        });
+
+        // No `previous_response_id`, so `cross_route` is false and `is_chat` is
+        // false: the exact shape that used to skip the scrub entirely.
+        hydrate_history_boundary(&state, &mut request, "native:m1", Some(&provider))
+            .await
+            .expect("a native Responses provider is a supported destination");
+
+        assert!(
+            request.get("prompt_cache_key").is_none(),
+            "an official cache key must not be handed to a third party"
+        );
+        assert!(request.get("safety_identifier").is_none());
+        let items = request["input"].as_array().expect("input stays an array");
+        assert!(
+            items
+                .iter()
+                .all(|item| item.get("encrypted_content").is_none()),
+            "opaque per-account reasoning material must never leave the official domain"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning")),
+            "a reasoning item with no portable summary is dropped, not forwarded empty"
+        );
+        assert_eq!(
+            items.len(),
+            1,
+            "the user's own message must survive the scrub"
+        );
+    }
+
+    /// The mirror of the test above: the official backend issued those ids and
+    /// needs them back for prompt caching and stateless reasoning replay, so
+    /// scrubbing there would silently degrade every official turn.
+    #[tokio::test]
+    async fn the_official_route_keeps_its_own_reasoning_material() {
+        let mut registry = ProviderRegistry::empty("/tmp/router-scrub-test.json");
+        registry.set_official_model_ids(["gpt-5.6-sol"]);
+        let state = RouterState::new(registry, Arc::new(MemoryCredentialStore::default()));
+        let mut request = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "codex-cache-key",
+            "input": [
+                {"type": "reasoning", "id": "rs_official",
+                 "encrypted_content": "opaque-openai-material", "summary": []},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hello"}]}
+            ]
+        });
+
+        hydrate_history_boundary(&state, &mut request, "official:acct", None)
+            .await
+            .expect("the official route owns its own ids");
+
+        assert_eq!(request["prompt_cache_key"], "codex-cache-key");
+        assert_eq!(
+            request["input"][0]["encrypted_content"], "opaque-openai-material",
+            "stateless reasoning replay depends on this round-tripping"
+        );
+    }
+
+    /// Pull `error.message` out of a router error response so assertions read as
+    /// sentences rather than JSON spelunking.
+    async fn error_message(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("the error body is small");
+        let body: Value = serde_json::from_slice(&bytes).expect("router errors are JSON");
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 }

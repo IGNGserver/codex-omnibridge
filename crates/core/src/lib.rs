@@ -34,6 +34,13 @@ const MAX_BASE_URL_CHARS: usize = 2048;
 const MAX_CREDENTIAL_REFERENCE_CHARS: usize = 512;
 const MAX_STATIC_HEADERS: usize = 64;
 const MAX_HEADER_VALUE_CHARS: usize = 4096;
+/// Upper bound for a registry-supplied system prompt override.
+///
+/// The stock Codex 0.156.0 `instructions_template` is ~23k characters, so this
+/// is an order of magnitude of headroom for a heavily customised prompt. It
+/// exists to keep one typo from producing a `models.json` that Codex refuses to
+/// load, not to police prompt length.
+const MAX_SYSTEM_PROMPT_CHARS: usize = 256 * 1024;
 
 /// Read a UTF-8 state document with an actual byte cap.
 ///
@@ -105,6 +112,8 @@ pub enum CoreError {
     InvalidHeader(String),
     #[error("invalid reasoning level: {0}")]
     InvalidReasoningLevel(String),
+    #[error("invalid system prompt override: {0}")]
+    InvalidSystemPrompt(String),
     #[error("provider `{0}` already exists")]
     ProviderExists(String),
     #[error("provider `{0}` was not found")]
@@ -144,9 +153,22 @@ pub enum CoreError {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
+    /// The provider only speaks `/v1/chat/completions`, so OmniBridge translates
+    /// Codex's Responses requests into Chat Completions and back.
+    ///
+    /// This is the default because it is what essentially every third-party
+    /// gateway a user will point this app at (NewAPI, OneAPI, OpenRouter, vLLM,
+    /// Ollama, LM Studio, llama.cpp server) actually implements. The Responses
+    /// API is an OpenAI-server-side format; a provider that advertises
+    /// "OpenAI compatible" almost never means it. Defaulting to `responses`
+    /// instead sent `/v1/responses` upstream and surfaced the provider's bare 404
+    /// to Codex, which reads as "this model is broken" rather than "one config
+    /// field is wrong".
     #[default]
-    Responses,
     ChatCompletions,
+    /// The provider natively implements the OpenAI Responses API, so requests are
+    /// forwarded without translation.
+    Responses,
 }
 
 /// How a custom upstream receives the credential held by the selected
@@ -235,6 +257,18 @@ pub struct CustomModel {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub reasoning_levels: Vec<String>,
+    /// Replaces the system prompt Codex sends for this model.
+    ///
+    /// `None` (the default) means the generated catalog entry carries Codex's own
+    /// `instructions_template`, with only its model-identity sentence rewritten.
+    /// Some third-party models behave badly under that prompt — it documents the
+    /// `apply_patch` freeform format, the approval policy and the tool names of a
+    /// specific Codex build — so the registry may substitute its own text.
+    ///
+    /// An empty or whitespace-only string is normalised to `None`, which is how a
+    /// caller clears an override that was already written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -243,6 +277,9 @@ pub struct ModelEdit {
     pub context_window: Option<Option<u64>>,
     pub reasoning_levels: Option<Vec<String>>,
     pub capabilities: Option<ModelCapabilities>,
+    /// Outer `None` = leave the override alone; `Some(None)` = clear it.
+    #[serde(default)]
+    pub system_prompt_override: Option<Option<String>>,
 }
 
 impl CustomModel {
@@ -265,6 +302,7 @@ impl CustomModel {
             enabled: true,
             context_window: None,
             reasoning_levels: Vec::new(),
+            system_prompt_override: None,
         })
     }
 
@@ -325,7 +363,9 @@ impl ProviderConfig {
             id: id.clone(),
             name: name.to_owned(),
             base_url,
-            protocol: ProviderProtocol::Responses,
+            // Follow the enum default so the wire behaviour of a freshly added
+            // provider and the documented default cannot drift apart.
+            protocol: ProviderProtocol::default(),
             auth_strategy: AuthStrategy::Bearer,
             static_headers: BTreeMap::new(),
             credential_reference: format!("provider:{id}"),
@@ -389,6 +429,17 @@ impl ProviderConfig {
                     other => other,
                 },
             )?;
+            normalize_system_prompt(model.system_prompt_override.clone()).map_err(|error| {
+                match error {
+                    CoreError::InvalidSystemPrompt(reason) => {
+                        CoreError::InvalidSystemPrompt(format!(
+                            "system prompt override for model `{}` {reason}",
+                            model.logical_model_id
+                        ))
+                    }
+                    other => other,
+                }
+            })?;
             if !model_ids.insert(model.logical_model_id.clone()) {
                 return Err(CoreError::ModelExists(model.logical_model_id.clone()));
             }
@@ -619,6 +670,7 @@ impl ProviderRegistry {
         if !model.capabilities.reasoning {
             model.reasoning_levels.clear();
         }
+        model.system_prompt_override = normalize_system_prompt(model.system_prompt_override)?;
         if provider
             .models
             .iter()
@@ -671,6 +723,10 @@ impl ProviderRegistry {
         }
         if let Some(reasoning_levels) = edit.reasoning_levels {
             model.reasoning_levels = normalize_reasoning_levels(reasoning_levels)?;
+        }
+        if let Some(system_prompt_override) = edit.system_prompt_override {
+            // `Some(None)` clears the override, `Some(Some(text))` replaces it.
+            model.system_prompt_override = normalize_system_prompt(system_prompt_override)?;
         }
         if !model.capabilities.reasoning {
             model.reasoning_levels.clear();
@@ -1639,6 +1695,38 @@ fn default_generation() -> u64 {
     1
 }
 
+/// Validate a registry-supplied system prompt and collapse blanks to `None`.
+///
+/// Unlike the other string validators here, this one **permits newlines and
+/// tabs**: a system prompt is prose, and rejecting `\n` would force every
+/// override onto a single line. Only NUL and the remaining control characters
+/// are refused, because those are what break JSON round-tripping and terminal
+/// rendering downstream.
+fn normalize_system_prompt(prompt: Option<String>) -> Result<Option<String>, CoreError> {
+    let Some(raw) = prompt else { return Ok(None) };
+    let prompt = raw.trim();
+    if prompt.is_empty() {
+        // Writing an empty string is how the panel and the CLI clear an override
+        // they no longer want; it must not become an empty system prompt.
+        return Ok(None);
+    }
+    if prompt.chars().count() > MAX_SYSTEM_PROMPT_CHARS {
+        return Err(CoreError::InvalidSystemPrompt(format!(
+            "longer than {MAX_SYSTEM_PROMPT_CHARS} characters"
+        )));
+    }
+    if let Some(bad) = prompt
+        .chars()
+        .find(|c| c.is_control() && *c != '\n' && *c != '\t')
+    {
+        return Err(CoreError::InvalidSystemPrompt(format!(
+            "contains control character U+{:04X}",
+            bad as u32
+        )));
+    }
+    Ok(Some(prompt.to_owned()))
+}
+
 fn validate_static_headers(headers: &BTreeMap<String, String>) -> Result<(), CoreError> {
     for (name, value) in headers {
         validate_header_name(name).map_err(|_| CoreError::InvalidHeader(name.clone()))?;
@@ -2536,7 +2624,7 @@ mod tests {
                 logical_model_id,
                 provider_id,
                 upstream_model_id,
-                protocol: ProviderProtocol::Responses,
+                protocol: ProviderProtocol::ChatCompletions,
             }) if logical_model_id == "newapi/qwen3.8"
                 && provider_id == "newapi"
                 && upstream_model_id == "qwen3.8"
@@ -2683,6 +2771,185 @@ mod tests {
         assert_eq!(
             registry.provider("newapi").unwrap().models[0].context_window,
             None
+        );
+    }
+
+    /// A registry-supplied prompt replaces Codex's own, so it has to survive a
+    /// write/read round trip exactly — trailing whitespace trimmed, interior
+    /// newlines and tabs preserved, because the prompt is prose.
+    #[test]
+    fn system_prompt_override_is_trimmed_and_persisted() {
+        let mut registry = ProviderRegistry::empty("/tmp/does-not-matter.json");
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://api.example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "qwen3.8", "Qwen").unwrap();
+        model.system_prompt_override = Some("  Line one\n\tLine two  ".to_owned());
+        registry.add_model(model).unwrap();
+
+        let stored = registry.provider("newapi").unwrap().models[0]
+            .system_prompt_override
+            .clone();
+        assert_eq!(stored.as_deref(), Some("Line one\n\tLine two"));
+
+        let json = serde_json::to_string(&registry.file).unwrap();
+        let reloaded: ProviderRegistryFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.providers[0].models[0].system_prompt_override,
+            stored
+        );
+    }
+
+    /// Blank means "no override". Without that, a user clearing a text field in the
+    /// panel would ship an empty system prompt and the model would stop behaving
+    /// like a Codex agent entirely.
+    #[test]
+    fn a_blank_system_prompt_override_is_cleared() {
+        assert_eq!(
+            normalize_system_prompt(Some("   \n\t ".to_owned())).unwrap(),
+            None
+        );
+        assert_eq!(normalize_system_prompt(None).unwrap(), None);
+
+        let mut registry = ProviderRegistry::empty("/tmp/does-not-matter.json");
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://api.example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "qwen3.8", "Qwen").unwrap();
+        model.system_prompt_override = Some("Custom prompt.".to_owned());
+        registry.add_model(model).unwrap();
+
+        registry
+            .edit_model(
+                "newapi/qwen3.8",
+                ModelEdit {
+                    system_prompt_override: Some(Some("   ".to_owned())),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.provider("newapi").unwrap().models[0].system_prompt_override,
+            None
+        );
+
+        // `Some(None)` is the explicit clear the panel's checkbox sends.
+        registry
+            .edit_model(
+                "newapi/qwen3.8",
+                ModelEdit {
+                    system_prompt_override: Some(Some("Another prompt.".to_owned())),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+        registry
+            .edit_model(
+                "newapi/qwen3.8",
+                ModelEdit {
+                    system_prompt_override: Some(None),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry.provider("newapi").unwrap().models[0].system_prompt_override,
+            None
+        );
+    }
+
+    /// Editing an unrelated field must not disturb the override: `ModelEdit`'s
+    /// outer `None` means "leave it alone", which is what every existing caller
+    /// (and every `..ModelEdit::default()`) relies on.
+    #[test]
+    fn an_unrelated_edit_leaves_the_system_prompt_override_alone() {
+        let mut registry = ProviderRegistry::empty("/tmp/does-not-matter.json");
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://api.example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "qwen3.8", "Qwen").unwrap();
+        model.system_prompt_override = Some("Custom prompt.".to_owned());
+        registry.add_model(model).unwrap();
+
+        registry
+            .edit_model(
+                "newapi/qwen3.8",
+                ModelEdit {
+                    display_name: Some("Renamed".to_owned()),
+                    ..ModelEdit::default()
+                },
+            )
+            .unwrap();
+
+        let model = &registry.provider("newapi").unwrap().models[0];
+        assert_eq!(model.display_name, "Renamed");
+        assert_eq!(
+            model.system_prompt_override.as_deref(),
+            Some("Custom prompt.")
+        );
+    }
+
+    /// Newlines are legal in a prompt; NUL, carriage returns and the rest of the
+    /// control range are not, because those are what corrupt the JSON round trip
+    /// and the terminal that prints the model summary.
+    #[test]
+    fn system_prompt_override_rejects_control_characters_other_than_newline_and_tab() {
+        assert!(normalize_system_prompt(Some("a\nb\tc".to_owned())).is_ok());
+        for bad in ["a\u{0}b", "a\rb", "a\u{1b}[31mb", "a\u{7f}b"] {
+            let error = normalize_system_prompt(Some(bad.to_owned()))
+                .expect_err("`{bad}` must be rejected");
+            assert!(
+                matches!(error, CoreError::InvalidSystemPrompt(_)),
+                "got {error:?}"
+            );
+        }
+    }
+
+    /// The bound exists so one typo cannot produce a `models.json` that Codex
+    /// refuses to load. It is checked on add, on edit, and again when a hand-edited
+    /// registry is validated on load.
+    #[test]
+    fn system_prompt_override_is_bounded() {
+        let oversized = "a".repeat(MAX_SYSTEM_PROMPT_CHARS + 1);
+        assert!(matches!(
+            normalize_system_prompt(Some(oversized)),
+            Err(CoreError::InvalidSystemPrompt(_))
+        ));
+        assert!(normalize_system_prompt(Some("a".repeat(MAX_SYSTEM_PROMPT_CHARS))).is_ok());
+
+        let mut registry = ProviderRegistry::empty("/tmp/does-not-matter.json");
+        registry
+            .add_provider(ProviderConfig::new("NewAPI", "https://api.example.test/v1").unwrap())
+            .unwrap();
+        let mut model = CustomModel::new("newapi", "qwen3.8", "Qwen").unwrap();
+        model.system_prompt_override = Some("a".repeat(MAX_SYSTEM_PROMPT_CHARS + 1));
+        let error = registry.add_model(model).expect_err("must be rejected");
+        assert!(
+            matches!(error, CoreError::InvalidSystemPrompt(_)),
+            "got {error:?}"
+        );
+    }
+
+    /// Registries written before this field existed must still load, and models
+    /// without an override must not grow a `"system_prompt_override": null` key —
+    /// an older build reading the file should see exactly what it wrote.
+    #[test]
+    fn system_prompt_override_is_optional_on_the_wire() {
+        let legacy = r#"{
+            "logical_model_id": "newapi/qwen3.8",
+            "upstream_model_id": "qwen3.8",
+            "display_name": "Qwen"
+        }"#;
+        let parsed: CustomModel = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.system_prompt_override, None);
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            !serialized
+                .as_object()
+                .unwrap()
+                .contains_key("system_prompt_override"),
+            "got {serialized}"
         );
     }
 }

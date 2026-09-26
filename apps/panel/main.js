@@ -1941,6 +1941,126 @@ async function refreshAccounts() {
   }
 }
 
+// --------------------------------------------------------------------------
+// auth.json 切换备份
+// --------------------------------------------------------------------------
+
+function formatBackupTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "时间未知";
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString();
+}
+
+function renderAuthBackupRow(backup) {
+  const identity = backup.email || backup.account_id || "身份未知";
+  const status = backup.unreadable
+    ? `<span class="m3-chip m3-chip--error m3-chip--sm">无法解析</span>`
+    : backup.has_usable_credentials
+      ? `<span class="m3-chip m3-chip--success m3-chip--sm">可恢复</span>`
+      : `<span class="m3-chip m3-chip--warning m3-chip--sm">无有效凭证</span>`;
+  const detail = backup.unreadable
+    ? escapeHtml(backup.unreadable)
+    : `${escapeHtml(backup.name)} · ${String(backup.size_bytes)} 字节`;
+  // A backup with nothing usable in it would log Codex out if restored, so the
+  // button is only offered for the ones the backend says are restorable.
+  const action = backup.unreadable || !backup.has_usable_credentials
+    ? ""
+    : `<button class="m3-btn m3-btn-tonal m3-btn-xs" type="button"
+               data-restore-backup="${escapeHtml(backup.name)}">恢复此备份</button>`;
+  return `
+    <li class="m3-list-item">
+      <div class="m3-list-item__content">
+        <div class="m3-list-item__headline m3-body-medium-emphasized">${escapeHtml(identity)}</div>
+        <div class="m3-body-small m3-text-variant">${formatBackupTime(backup.modified_at)} · ${detail}</div>
+      </div>
+      <div class="m3-list-item__support">${status}</div>
+      <div class="m3-list-item__trailing">${action}</div>
+    </li>
+  `;
+}
+
+async function refreshAuthBackups() {
+  const list = document.querySelector("#auth-backups-list");
+  if (!list) return;
+  try {
+    const backups = await api("/api/v1/accounts/backups");
+    const rows = Array.isArray(backups) ? backups : [];
+    if (!rows.length) {
+      list.innerHTML = `
+        <li class="m3-list-item">
+          <div class="m3-list-item__content">
+            <div class="m3-body-small m3-text-muted">
+              暂无备份。每次切换官方账号前都会自动生成一份。
+            </div>
+          </div>
+        </li>
+      `;
+      return;
+    }
+    list.innerHTML = rows.map(renderAuthBackupRow).join("");
+    list.querySelectorAll("[data-restore-backup]").forEach((button) => {
+      button.onclick = () => restoreAuthBackup(button.dataset.restoreBackup, button);
+    });
+  } catch (error) {
+    list.innerHTML = `
+      <li class="m3-list-item">
+        <div class="m3-list-item__content">
+          <div class="m3-body-small m3-text-error">读取备份失败：${escapeHtml(error.message)}</div>
+        </div>
+      </li>
+    `;
+  }
+}
+
+async function restoreAuthBackup(name, button) {
+  // This replaces the login Codex is using right now. Ask, and say what happens
+  // to the session being replaced, because a restore is itself backed up and the
+  // user needs to know the undo is not one-way.
+  const confirmed = window.confirm(
+    `确定用备份「${name}」恢复登录态吗？\n\n` +
+    "这会用该备份内容覆盖 Codex 当前的 auth.json。\n" +
+    "被覆盖的当前登录态会自动另存为一份新备份，所以这一步同样可以退回。\n" +
+    "恢复后需要完全退出并重新启动 Codex 才会生效。"
+  );
+  if (!confirmed) return;
+  await withBusy(button, async () => {
+    try {
+      await api("/api/v1/accounts/backups/restore", {
+        method: "POST",
+        body: JSON.stringify({ name, restart_codex: false }),
+      });
+      notify("登录态已恢复，请完全退出并重新启动 Codex。", false, {
+        label: "重启 Codex",
+        onClick: () => restartCodexForAccounts(),
+      });
+      await refreshAuthBackups();
+      await refreshAccounts();
+    } catch (error) {
+      notify(error.message, true);
+    }
+  });
+}
+
+const authBackupsRefreshBtn = bindClick("#refresh-auth-backups-btn");
+authBackupsRefreshBtn.onclick = () => withBusy(authBackupsRefreshBtn, refreshAuthBackups);
+
+const authBackupsCleanBtn = bindClick("#clean-auth-backups-btn");
+authBackupsCleanBtn.onclick = () => withBusy(authBackupsCleanBtn, async () => {
+  if (!window.confirm(
+    "确定清空全部登录态备份吗？\n\n备份里包含完整的登录令牌副本。\n" +
+    "清空后将无法再退回之前的账号，Codex 当前的 auth.json 不受影响。"
+  )) {
+    return;
+  }
+  try {
+    const result = await api("/api/v1/accounts/backups/clean", { method: "POST" });
+    notify(`已清空 ${result.removed ?? 0} 个登录态备份`);
+    await refreshAuthBackups();
+  } catch (error) {
+    notify(error.message, true);
+  }
+});
+
 let accountUsageRefreshPromise = null;
 const accountUsageRequests = new Map();
 
@@ -1950,7 +2070,10 @@ function fetchAccountUsage(accountId) {
   const existing = accountUsageRequests.get(accountId);
   if (existing) return existing;
 
-  const request = api(`/api/v1/accounts/${accountId}/usage`).finally(() => {
+  // The id is a UUID in practice, but the account store is a user-editable JSON
+  // document, so encode it: a `/`, `?`, `#` or `%` in an id would otherwise
+  // silently retarget the request at a different endpoint.
+  const request = api(`/api/v1/accounts/${encodeURIComponent(accountId)}/usage`).finally(() => {
     if (accountUsageRequests.get(accountId) === request) {
       accountUsageRequests.delete(accountId);
     }
@@ -2077,6 +2200,7 @@ function renderModelRow(model) {
     form.clear_context_window.checked = false;
     form.context_window.disabled = false;
     setModelCapabilityForm(form, model.capabilities, model.reasoning_levels);
+    loadEditModelSystemPrompt(model.logical_model_id);
     openDialog("edit-model-dialog");
   };
 
@@ -2434,6 +2558,7 @@ async function refreshAll() {
     refreshDesktopStatus(),
     refreshSecurityStatus(),
     refreshAccounts(),
+    refreshAuthBackups(),
     refreshProviders(),
   ]);
 }
@@ -2558,16 +2683,24 @@ checkAccountBtn.onclick = () => withBusy(checkAccountBtn, async () => {
 });
 
 const restartCodexBtn = bindClick("#overview-restart-codex-btn");
-restartCodexBtn.onclick = () => withBusy(restartCodexBtn, async () => {
-  try {
-    const res = await api("/api/v1/accounts/restart-codex", { method: "POST" });
-    const started = res.started_pid ? `，新 app-server PID ${res.started_pid}` : "";
-    notify(`Codex 已重启（已清理 ${res.terminated_pids.length} 个残留进程${started}）`);
-    await refreshAccounts();
-  } catch (err) {
-    notify(err.message, true);
-  }
-});
+restartCodexBtn.onclick = () => restartCodexForAccounts(restartCodexBtn);
+
+// Shared by the overview button and the snackbar action offered after an
+// auth.json backup restore. Both need the same restart, and the restore path has
+// no button of its own to put a spinner on.
+async function restartCodexForAccounts(button = null) {
+  const task = async () => {
+    try {
+      const res = await api("/api/v1/accounts/restart-codex", { method: "POST" });
+      const started = res.started_pid ? `，新 app-server PID ${res.started_pid}` : "";
+      notify(`Codex 已重启（已清理 ${res.terminated_pids.length} 个残留进程${started}）`);
+      await refreshAccounts();
+    } catch (err) {
+      notify(err.message, true);
+    }
+  };
+  return button ? withBusy(button, task) : task();
+}
 
 async function handleCaptureAccount() {
   const name = await m3Prompt("保存当前官方账号", "给当前登录的官方账号起个备注名称（可留空，系统会自动生成）：", "");
@@ -2782,6 +2915,71 @@ addModelForm.addEventListener("submit", async (e) => {
   });
 });
 
+// --------------------------------------------------------------------------
+// 编辑模型：系统提示词覆盖
+// --------------------------------------------------------------------------
+
+// The model list only carries `has_system_prompt_override`, because an override can
+// be 256 KiB and every model of every provider is listed at once. So the text has
+// to be fetched per model when the dialog opens — and until this existed the panel
+// could set and clear an override but never show what was in force, which meant
+// editing it meant guessing at what was already there.
+//
+// `state` is what keeps the submit handler honest: "not loaded", "loaded empty" and
+// "loaded with text" must not be conflated, or saving an unrelated field would
+// silently wipe an override the user never got to see.
+const editModelSystemPrompt = { modelId: null, state: "idle", value: "" };
+let systemPromptRequestSeq = 0;
+const MAX_SYSTEM_PROMPT_CHARS = 256 * 1024;
+
+async function loadEditModelSystemPrompt(logicalModelId) {
+  const request = ++systemPromptRequestSeq;
+  editModelSystemPrompt.modelId = logicalModelId;
+  editModelSystemPrompt.state = "loading";
+  editModelSystemPrompt.value = "";
+  renderEditModelSystemPrompt();
+  try {
+    const detail = await api("/api/v1/models/show", {
+      method: "POST",
+      body: JSON.stringify({ logical_model_id: logicalModelId }),
+    });
+    // A second model may have been opened while this was in flight; writing the
+    // late answer into the dialog would paste one model's prompt into another.
+    if (request !== systemPromptRequestSeq) return;
+    editModelSystemPrompt.value =
+      detail && typeof detail.system_prompt_override === "string"
+        ? detail.system_prompt_override
+        : "";
+    editModelSystemPrompt.state = "ready";
+    renderEditModelSystemPrompt();
+  } catch (err) {
+    if (request !== systemPromptRequestSeq) return;
+    editModelSystemPrompt.state = "error";
+    renderEditModelSystemPrompt(err.message);
+  }
+}
+
+function renderEditModelSystemPrompt(errorMessage) {
+  const field = document.querySelector("#m3-edit-model-form [name='system_prompt_override']");
+  const hint = document.querySelector("#edit-model-system-prompt-hint");
+  const clear = document.querySelector("#edit-model-clear-system-prompt");
+  if (!field || !hint) return;
+  const ready = editModelSystemPrompt.state === "ready";
+  field.disabled = !ready;
+  if (clear) clear.disabled = !ready;
+  if (!ready) {
+    field.value = "";
+    hint.textContent = editModelSystemPrompt.state === "error"
+      ? `无法读取当前覆盖：${errorMessage || "未知错误"}。这个字段不会被保存，其余设置仍可修改。`
+      : "当前状态读取中…";
+    return;
+  }
+  field.value = editModelSystemPrompt.value;
+  hint.textContent = editModelSystemPrompt.value
+    ? `已存在覆盖（${editModelSystemPrompt.value.length} 字符）。清空此处或勾选上方复选框即可交还给 Codex。`
+    : "该模型当前使用 Codex 自己生成的系统提示词。仅在确实需要时才覆盖。";
+}
+
 const editModelForm = document.querySelector("#m3-edit-model-form");
 if (editModelForm) {
   bindModelCapabilityForm(editModelForm);
@@ -2803,16 +3001,37 @@ if (editModelForm) {
           throw new Error("上下文长度必须是正整数");
         }
         const metadata = readModelCapabilityForm(editModelForm);
+        const logicalModelId = String(form.get("logical_model_id") || "");
+        const body = {
+          logical_model_id: logicalModelId,
+          display_name: String(form.get("display_name") || "").trim(),
+          context_window: clearContext?.checked ? null : parsedContext,
+          clear_context_window: Boolean(clearContext?.checked),
+          capabilities: metadata.capabilities,
+          reasoning_levels: metadata.reasoning_levels,
+        };
+        // The override is only sent when it was actually read back and actually
+        // changed. Posting the textarea unconditionally would wipe an override the
+        // read never surfaced — a failed `/models/show` leaves the field empty and
+        // disabled, and an empty field is indistinguishable from a deliberate
+        // clear.
+        const clearPrompt = editModelForm.querySelector("[name='clear_system_prompt']");
+        const promptValue = String(form.get("system_prompt_override") || "");
+        if (clearPrompt?.checked) {
+          body.clear_system_prompt = true;
+        } else if (
+          editModelSystemPrompt.state === "ready"
+          && editModelSystemPrompt.modelId === logicalModelId
+          && promptValue !== editModelSystemPrompt.value
+        ) {
+          if (Array.from(promptValue).length > MAX_SYSTEM_PROMPT_CHARS) {
+            throw new Error(`系统提示词不能超过 ${MAX_SYSTEM_PROMPT_CHARS} 个字符`);
+          }
+          body.system_prompt_override = promptValue;
+        }
         await api("/api/v1/models/edit", {
           method: "POST",
-          body: JSON.stringify({
-            logical_model_id: form.get("logical_model_id"),
-            display_name: String(form.get("display_name") || "").trim(),
-            context_window: clearContext?.checked ? null : parsedContext,
-            clear_context_window: Boolean(clearContext?.checked),
-            capabilities: metadata.capabilities,
-            reasoning_levels: metadata.reasoning_levels,
-          }),
+          body: JSON.stringify(body),
         });
         closeDialog("edit-model-dialog");
         await finishCatalogMutation("模型已更新");
@@ -3029,7 +3248,18 @@ bindClick("#settings-security-form").onsubmit = async (e) => {
         sessionToken = res.token;
         localStorage.setItem("codex_mp_token", sessionToken);
       }
-      notify("访问安全配置已更新");
+      // The bind address is chosen once when the panel process starts, so saving
+      // 「允许外网/局域网访问」 does not change what is actually listening. Say so
+      // instead of letting a green toast imply the switch took effect — turning
+      // remote access *off* and still being reachable from the LAN is the
+      // dangerous direction.
+      if (res.restart_required && res.restart_message) {
+        notify(res.restart_message, true);
+      } else if (res.remote_warning) {
+        notify("访问安全配置已更新。" + res.remote_warning);
+      } else {
+        notify("访问安全配置已更新");
+      }
       await refreshSecurityStatus();
     } catch (err) {
       notify(err.message, true);

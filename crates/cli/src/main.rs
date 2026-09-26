@@ -33,6 +33,14 @@ const MAX_CLI_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// files. A missing EOF on stdin must not let a caller grow this process until
 /// the allocator or the OS kills it.
 const MAX_CLI_SECRET_INPUT_BYTES: usize = 1024 * 1024;
+/// Byte cap for a system prompt read from a file or a pipe.
+///
+/// Deliberately looser than the character limit core enforces: UTF-8 can use up
+/// to four bytes per character, and the useful error for an over-long prompt is
+/// core's `InvalidSystemPrompt`, not an opaque read failure. The cap here only
+/// exists so a `--system-prompt-file /dev/zero` cannot grow this process without
+/// bound before that validation runs.
+const MAX_CLI_SYSTEM_PROMPT_BYTES: u64 = 4 * 1024 * 1024;
 const ROUTER_HEALTH_INTERVAL: Duration = Duration::from_secs(2);
 const ROUTER_RECOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const ROUTER_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -94,7 +102,7 @@ async fn recover_router_with_backoff(
 #[command(
     name = "codex-mp",
     version,
-    about = "Codex MultiProvider: secure provider registry and loopback model router"
+    about = "Codex OmniBridge: secure provider registry and loopback model router"
 )]
 struct Cli {
     #[arg(long, env = "CODEX_MP_REGISTRY")]
@@ -147,6 +155,29 @@ enum Command {
         #[command(subcommand)]
         command: WebCommand,
     },
+    /// Inspect and undo changes to the official-account state OmniBridge keeps.
+    Accounts {
+        #[command(subcommand)]
+        command: AccountsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccountsCommand {
+    /// Print the managed accounts and which one Codex is signed in as now.
+    List,
+    /// List the reversible `auth.bak-switch-*` copies of Codex's auth.json.
+    Backups,
+    /// Make one switch backup the live session again.
+    Restore(AccountsRestoreArgs),
+    /// Delete every switch backup, keeping none.
+    CleanBackups,
+}
+
+#[derive(Debug, Args)]
+struct AccountsRestoreArgs {
+    /// The backup file name printed by `codex-mp accounts backups`.
+    name: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -250,7 +281,10 @@ enum ModelCommand {
 struct AddProviderArgs {
     name: String,
     base_url: String,
-    #[arg(long, value_enum, default_value_t = ProtocolArg::Responses)]
+    /// Wire protocol the provider speaks. `chat-completions` (the default) makes
+    /// OmniBridge translate Codex's Responses requests; pick `responses` only for
+    /// a provider that natively serves `/v1/responses`.
+    #[arg(long, value_enum, default_value_t = ProtocolArg::ChatCompletions)]
     protocol: ProtocolArg,
     #[arg(long, value_enum, default_value_t = AuthStrategyArg::Bearer)]
     auth_strategy: AuthStrategyArg,
@@ -302,10 +336,32 @@ struct AddModelArgs {
     display_name: Option<String>,
     #[arg(long)]
     context_window: Option<u64>,
+    /// Advertise no tool support for this model.
+    ///
+    /// Tools are on by default here even though `ModelCapabilities::default()` is
+    /// fail-closed. Those two defaults answer different questions: the derived one
+    /// means "provider discovery told us nothing, so claim nothing", while an
+    /// explicit `model add` is a user asking to drive Codex — a coding agent —
+    /// with this model. Defaulting that to text-only would produce a model that
+    /// can be selected and then cannot edit a single file.
     #[arg(long)]
     no_tools: bool,
     #[arg(long)]
     images: bool,
+    /// Replace the system prompt Codex sends for this model.
+    ///
+    /// By default the generated catalog entry carries Codex's own agent prompt
+    /// with only its model-identity sentence rewritten, which is what you want for
+    /// almost every model. Use this only when a specific upstream misbehaves under
+    /// it. Note that the `apply_patch` tool stays enabled either way, so a
+    /// replacement prompt still has to describe the apply_patch freeform format or
+    /// the model will be offered a tool whose grammar it has never seen.
+    #[arg(long, conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+    /// Read the replacement system prompt from a file, or from stdin when the path
+    /// is `-`.
+    #[arg(long, value_name = "PATH", conflicts_with = "system_prompt")]
+    system_prompt_file: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -317,6 +373,30 @@ struct EditModelArgs {
     context_window: Option<u64>,
     #[arg(long)]
     clear_context_window: bool,
+    /// Replace the system prompt Codex sends for this model. See
+    /// `codex-mp model add --help` for when that is a good idea.
+    #[arg(
+        long,
+        conflicts_with = "system_prompt_file",
+        conflicts_with = "clear_system_prompt"
+    )]
+    system_prompt: Option<String>,
+    /// Read the replacement system prompt from a file, or from stdin when the path
+    /// is `-`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "system_prompt",
+        conflicts_with = "clear_system_prompt"
+    )]
+    system_prompt_file: Option<String>,
+    /// Go back to Codex's own agent prompt for this model.
+    #[arg(
+        long,
+        conflicts_with = "system_prompt",
+        conflicts_with = "system_prompt_file"
+    )]
+    clear_system_prompt: bool,
 }
 
 #[derive(Debug, Args)]
@@ -399,15 +479,26 @@ struct UninstallArgs {
     /// Keep the Provider registry and keyring entries for a later reinstall.
     #[arg(long)]
     keep_provider_data: bool,
+    /// Keep the saved official accounts, their stored tokens and the auth.json
+    /// switch backups. Codex's own `auth.json` is never removed either way.
+    #[arg(long)]
+    keep_account_data: bool,
     /// Endpoint file used by an already running panel/manager.
     #[arg(long)]
     endpoint_file: Option<PathBuf>,
 }
 
+/// Wire protocol a custom provider speaks.
+///
+/// Declaration order is the order clap lists the values in `--help`, so the
+/// default comes first. `chat-completions` is the default because that is what
+/// the gateways this app is pointed at (NewAPI, OneAPI, OpenRouter, vLLM,
+/// Ollama, LM Studio) actually implement; `responses` is for the rare provider
+/// that natively serves the OpenAI Responses API.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProtocolArg {
-    Responses,
     ChatCompletions,
+    Responses,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -497,6 +588,129 @@ async fn main() -> Result<()> {
             }),
         Command::Desktop { command } => desktop_command(&registry_path, command),
         Command::Web { command } => web_command(&registry_path, &cli.codex_bin, command).await,
+        Command::Accounts { command } => accounts_command(command),
+    }
+}
+
+/// Inspect and undo changes to the official-account state.
+///
+/// These commands exist because `switch_to_account` overwrites Codex's own
+/// `auth.json`, and until now the only recovery path was editing that file by
+/// hand. The backups it needs are already being written on every switch — they
+/// were simply never listed, and nothing could put one back.
+fn accounts_command(command: AccountsCommand) -> Result<()> {
+    let manager = codex_mp_manager::AccountManager::new().map_err(|error| {
+        anyhow::anyhow!(
+            "official-account commands need the directory Codex keeps auth.json in \
+             (set $CODEX_HOME to point at it): {error}"
+        )
+    })?;
+    match command {
+        AccountsCommand::List => {
+            let active = manager.check_active_status()?;
+            println!(
+                "codex auth.json: {}",
+                match (active.is_logged_in, active.auth_mode.as_deref()) {
+                    (true, Some(mode)) => format!("signed in (auth_mode={mode})"),
+                    (true, None) => "signed in".to_owned(),
+                    (false, Some(mode)) => format!("not signed in (auth_mode={mode})"),
+                    (false, None) => "no usable official session".to_owned(),
+                }
+            );
+            if let Some(email) = &active.email {
+                println!(
+                    "  account: {email}{}",
+                    match &active.plan_type {
+                        Some(plan) => format!(" ({plan})"),
+                        None => String::new(),
+                    }
+                );
+            }
+            let accounts = manager.list_accounts()?;
+            if accounts.is_empty() {
+                println!(
+                    "\nno managed accounts saved; use the web panel's \
+                     「保存当前官方账号」 to capture the one Codex is using now"
+                );
+                return Ok(());
+            }
+            println!("{} managed account(s):", accounts.len());
+            for account in accounts {
+                let identity = account.email.as_deref().unwrap_or("(unknown e-mail)");
+                let state = serde_json::to_value(&account.credential_state)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                println!(
+                    "  {} {} [{state}] {}",
+                    if account.is_active { "*" } else { " " },
+                    account.id,
+                    account.name,
+                );
+                println!("      {identity}");
+            }
+            Ok(())
+        }
+        AccountsCommand::Backups => {
+            let backups = manager.list_auth_backups()?;
+            if backups.is_empty() {
+                println!(
+                    "no switch backups in {}; one is written automatically every \
+                     time you change account",
+                    manager.codex_home().display()
+                );
+                return Ok(());
+            }
+            println!("{} backup(s) of auth.json, newest first:", backups.len());
+            for backup in backups {
+                let who = backup
+                    .email
+                    .as_deref()
+                    .or(backup.account_id.as_deref())
+                    .unwrap_or("unknown identity");
+                println!(
+                    "  {}  {}  {who}  auth_mode={}  {}",
+                    backup.name,
+                    codex_mp_manager::format_epoch_secs(backup.modified_at),
+                    backup.auth_mode.as_deref().unwrap_or("-"),
+                    if let Some(reason) = &backup.unreadable {
+                        format!("UNREADABLE ({reason})")
+                    } else if backup.has_usable_credentials {
+                        "restorable".to_owned()
+                    } else {
+                        "no usable credentials".to_owned()
+                    },
+                );
+            }
+            println!(
+                "\nrestore one with: codex-mp accounts restore <name>\n\
+                 a restore backs up the session it replaces, so it is itself reversible."
+            );
+            Ok(())
+        }
+        AccountsCommand::Restore(args) => {
+            let restored = manager.restore_auth_backup(&args.name)?;
+            println!(
+                "restored auth.json from {} ({} bytes){}",
+                restored.name,
+                restored.size_bytes,
+                restored
+                    .email
+                    .as_deref()
+                    .map(|email| format!(", account {email}"))
+                    .unwrap_or_default()
+            );
+            println!(
+                "Codex is still running the previous session in memory: fully quit it \
+                 and start it again, or use the panel's restart action."
+            );
+            Ok(())
+        }
+        AccountsCommand::CleanBackups => {
+            let removed = manager.remove_auth_backups();
+            println!("removed {removed} switch backup(s); auth.json itself was left alone");
+            Ok(())
+        }
     }
 }
 
@@ -709,6 +923,39 @@ async fn provider_command(path: &PathBuf, command: ProviderCommand) -> Result<()
     Ok(())
 }
 
+/// Resolve `--system-prompt` / `--system-prompt-file` into one optional prompt.
+///
+/// clap rejects both flags together, so this only has to pick a source. A path of
+/// `-` reads stdin, matching how `--api-key-stdin` behaves for secrets.
+///
+/// The text is returned unvalidated on purpose: `ProviderRegistry::add_model` and
+/// `edit_model` run `normalize_system_prompt`, and letting them own the rules
+/// means the CLI and the web panel cannot drift apart on what a legal prompt is.
+fn read_system_prompt(inline: Option<String>, file: Option<String>) -> Result<Option<String>> {
+    if let Some(prompt) = inline {
+        return Ok(Some(prompt));
+    }
+    let Some(source) = file else {
+        return Ok(None);
+    };
+    if source == "-" {
+        let mut buffer = Vec::new();
+        io::stdin()
+            .take(MAX_CLI_SYSTEM_PROMPT_BYTES.saturating_add(1))
+            .read_to_end(&mut buffer)
+            .context("failed to read the system prompt from stdin")?;
+        if buffer.len() as u64 > MAX_CLI_SYSTEM_PROMPT_BYTES {
+            bail!("the system prompt exceeds the {MAX_CLI_SYSTEM_PROMPT_BYTES} byte limit");
+        }
+        return Ok(Some(
+            String::from_utf8(buffer).context("the system prompt is not valid UTF-8")?,
+        ));
+    }
+    read_to_string_limited(&source, MAX_CLI_SYSTEM_PROMPT_BYTES)
+        .map(Some)
+        .with_context(|| format!("failed to read the system prompt from `{source}`"))
+}
+
 async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
     let (mut registry, _lock) = ProviderRegistry::load_locked(path)?;
     match command {
@@ -724,6 +971,8 @@ async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
             model.context_window = args.context_window;
             model.capabilities.tools = !args.no_tools;
             model.capabilities.images = args.images;
+            model.system_prompt_override =
+                read_system_prompt(args.system_prompt, args.system_prompt_file)?;
             registry.add_model(model.clone())?;
             registry.save()?;
             println!("added model `{}`", model.logical_model_id);
@@ -733,11 +982,20 @@ async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
             if args.display_name.is_none()
                 && args.context_window.is_none()
                 && !args.clear_context_window
+                && args.system_prompt.is_none()
+                && args.system_prompt_file.is_none()
+                && !args.clear_system_prompt
             {
                 bail!(
-                    "model edit requires --display-name, --context-window, or --clear-context-window"
+                    "model edit requires --display-name, --context-window, --clear-context-window, \
+                     --system-prompt, --system-prompt-file, or --clear-system-prompt"
                 );
             }
+            let system_prompt_override = if args.clear_system_prompt {
+                Some(None)
+            } else {
+                read_system_prompt(args.system_prompt, args.system_prompt_file)?.map(Some)
+            };
             let logical_model_id = args.logical_model_id.clone();
             registry.edit_model(
                 &logical_model_id,
@@ -748,6 +1006,7 @@ async fn model_command(path: &PathBuf, command: ModelCommand) -> Result<()> {
                     } else {
                         args.context_window.map(Some)
                     },
+                    system_prompt_override,
                     ..ModelEdit::default()
                 },
             )?;
@@ -954,10 +1213,14 @@ fn doctor(path: &Path, codex_bin: &Path) -> Result<()> {
     }
 
     match catalog_binary_for(path, codex_bin) {
-        Ok(binary) if binary.exists() => println!("PASS Codex executable: {}", binary.display()),
+        Ok(binary) if binary.is_file() => println!("PASS Codex executable: {}", binary.display()),
         Ok(binary) => {
             issues += 1;
-            println!("WARN Codex executable: not found at {}", binary.display());
+            println!(
+                "WARN Codex executable: `{}` is not a readable file; install stock Codex, or \
+                 point at it with `codex-mp --codex-binary <path>`",
+                binary.display()
+            );
         }
         Err(error) => {
             issues += 1;
@@ -1019,14 +1282,21 @@ fn status(path: &std::path::Path, codex_bin: &std::path::Path) -> Result<()> {
 }
 
 fn catalog_binary_for(registry_path: &Path, configured: &Path) -> Result<PathBuf> {
+    // Resolve a bare command name through `PATH` before returning it. Callers
+    // report and probe the result with `Path::exists`, which is CWD-relative: a
+    // stock `codex` living on `PATH` — the normal installation — used to come back
+    // as the literal `"codex"`, not exist relative to wherever the user happened to
+    // be standing, and make `doctor` warn "Codex executable: not found at codex"
+    // about a working setup.
     if configured != Path::new("codex") {
-        return Ok(configured.to_path_buf());
+        return Ok(resolve_executable(configured));
     }
     let Ok(paths) = DesktopPaths::discover() else {
-        return Ok(configured.to_path_buf());
+        return Ok(resolve_executable(configured));
     };
     let manifest_path = DesktopPaths::manifest_path_for_registry(registry_path);
     if manifest_path.exists() {
+        // Already absolute (the manifest's pinned entrypoint), so nothing to resolve.
         return Ok(paths.catalog_binary(&manifest_path)?);
     }
     Ok(paths.entrypoint)
@@ -1574,10 +1844,25 @@ async fn reload_running_router(registry_path: &Path) -> Result<()> {
         Err(error) => {
             // Not fatal: the registry is saved and the next Router start picks it
             // up. Say so instead of failing an otherwise successful command.
-            eprintln!(
-                "codex-mp: saved the change, but the running router did not reload it ({error}); \
-                 restart the router to apply it"
-            );
+            //
+            // But first find out whether a Router is even there. An endpoint file
+            // outlives its process through a SIGKILL, a power loss or a container
+            // restart, and the old blanket "the *running* router did not reload it;
+            // restart the router" then sent the user to restart a service that was
+            // already down — and to conclude that the restart they had just done
+            // silently failed. The change is applied on the next start either way.
+            let probe_url = format!("http://127.0.0.1:{router_port}/v1");
+            if router_is_reachable(&probe_url).await {
+                eprintln!(
+                    "codex-mp: saved the change, but the running router on port {router_port} \
+                     did not reload it ({error}); run `codex-mp router restart` to apply it"
+                );
+            } else {
+                println!(
+                    "codex-mp: change saved. No router is listening on port {router_port}, \
+                     so there was nothing to reload; it takes effect when the router starts."
+                );
+            }
             Ok(())
         }
     }
@@ -1815,6 +2100,64 @@ async fn uninstall(path: &Path, args: UninstallArgs) -> Result<()> {
     if remove_registry {
         remove_empty_state_directory(path);
     }
+
+    // Account state is a separate unit of user data from the provider registry,
+    // so it has its own opt-out. Left in place it is the worse of the two
+    // leftovers: `accounts.json` plus one keyring entry *per account*, and an
+    // `auth.bak-switch-*` file for every account switch ever done — each of them a
+    // complete, still-valid set of ChatGPT OAuth tokens sitting in the config
+    // directory after the program that could read them has been uninstalled.
+    //
+    // Codex's own `auth.json` is deliberately untouched: that is the user's
+    // official login, not OmniBridge state, and deleting it would make an
+    // uninstall indistinguishable from logging them out.
+    if !args.keep_account_data {
+        match codex_mp_manager::AccountManager::new() {
+            Ok(manager) => match manager.purge_account_data() {
+                Ok(report) => {
+                    println!(
+                        "removed account state (accounts={}, auth_backups={}, store_removed={})",
+                        report.accounts, report.backups_removed, report.store_removed
+                    );
+                    if report.accounts > 0 {
+                        // Say plainly what is irrecoverable. Codex's `auth.json`
+                        // only ever holds the *current* session, so every other
+                        // saved account existed solely in the store that was just
+                        // deleted — and re-adding them means signing in again.
+                        println!(
+                            "note: the {} saved account(s) above could not be re-added after \
+                             this point; only the account Codex is signed in as now survives. \
+                             Use --keep-account-data on the next uninstall to retain them.",
+                            report.accounts
+                        );
+                    }
+                    if !report.undeleted_credentials.is_empty() {
+                        println!(
+                            "warning: {} saved account token(s) could not be deleted from \
+                             your credential store and are still on this machine: {}",
+                            report.undeleted_credentials.len(),
+                            report.undeleted_credentials.join(", ")
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "codex-mp: saved official accounts and their tokens were NOT removed \
+                     ({error}); run `codex-mp accounts list` to see them, or delete \
+                     the accounts store by hand"
+                ),
+            },
+            Err(error) => eprintln!(
+                "codex-mp: no Codex home could be resolved, so account state was left \
+                 in place ({error})"
+            ),
+        }
+    } else {
+        println!(
+            "official accounts, their stored tokens and auth.json switch backups \
+             preserved (--keep-account-data)"
+        );
+    }
+
     println!(
         "uninstalled integration (restored_config={restored}, restored_desktop={desktop_restored}, removed_credentials={removed_credentials}, removed_registry={remove_registry})"
     );
@@ -1851,6 +2194,57 @@ fn should_remove_provider_data(keep_provider_data: bool, registry_path: &Path) -
 #[cfg(test)]
 mod router_reachability_tests {
     use super::*;
+    use tempfile::tempdir;
+
+    /// Regression: `catalog_binary_for` handed back the configured value verbatim,
+    /// so a bare command name left it for callers to probe with `Path::exists` —
+    /// which is CWD-relative. `doctor` therefore warned "Codex executable: not found
+    /// at codex" about a healthy PATH-installed Codex, and `status` printed the same
+    /// unusable relative name as the catalog source.
+    ///
+    /// Asserted with `sh`, which is on `PATH` in every environment these tests run
+    /// in, so the ambient `PATH` is never mutated.
+    #[test]
+    fn a_bare_executable_name_is_resolved_before_it_is_reported() {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("providers.json");
+
+        let resolved = catalog_binary_for(&registry, Path::new("sh")).expect("a PATH lookup");
+        if !resolved.is_absolute() {
+            // Only legitimate if there is genuinely no `sh` on PATH at all.
+            assert!(
+                std::env::var_os("PATH").is_none(),
+                "a bare name must be resolved to an absolute path, got {resolved:?}"
+            );
+            return;
+        }
+        assert!(
+            resolved.is_file(),
+            "resolved to a non-existent path: {resolved:?}"
+        );
+
+        // A name that does not exist must stay unusable rather than be reported as
+        // found — `doctor` has to keep warning in that case.
+        let missing = catalog_binary_for(&registry, Path::new("codex-mp-definitely-not-installed"))
+            .expect("an unresolved name is not an error");
+        assert!(!missing.is_file(), "{missing:?} must not look installed");
+    }
+
+    /// An explicit path is passed through, and a real file at that path is reported
+    /// as readable: `doctor`'s probe must work on it without any `PATH` involved.
+    #[test]
+    fn an_explicit_codex_path_survives_resolution() {
+        let directory = tempdir().unwrap();
+        let registry = directory.path().join("providers.json");
+        let binary = directory.path().join("bin");
+        std::fs::create_dir_all(&binary).unwrap();
+        let binary = binary.join("codex");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let resolved = catalog_binary_for(&registry, &binary).expect("an explicit path resolves");
+        assert_eq!(resolved, binary);
+        assert!(resolved.is_file());
+    }
 
     /// The `/readyz` probe must be derived from the provider `base_url`, which
     /// carries a `/v1` path segment that has to be stripped.

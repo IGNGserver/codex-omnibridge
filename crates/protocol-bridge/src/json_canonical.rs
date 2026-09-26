@@ -55,15 +55,94 @@ pub fn canonical_json_string(value: &Value) -> String {
     }
 }
 
+/// Re-serialize a JSON document only when doing so cannot change a number.
+///
+/// `serde_json::Value` stores a number as `i64`, `u64` or `f64`. An integer
+/// literal wider than `u64` — a `uint256` from a chain query, a 26-digit
+/// database id, a product of two big primes — is therefore parsed as `f64` and
+/// printed back in scientific notation with the low digits replaced by zeros:
+/// `12345678901234567890123` becomes `1.2345678901234568e22`. Canonicalization
+/// is a cache-key and whitespace normalization, never a licence to rewrite the
+/// payload, and silently corrupting a tool argument or a tool result sends the
+/// model (and whatever it calls next) a different number than the user's.
+///
+/// So every numeric literal in the source text is compared against what
+/// `serde_json` would print for it. Any mismatch — including harmless
+/// reformattings such as `1e2` → `100.0` — makes the caller keep the original
+/// text verbatim instead of canonicalizing it. Losing key ordering on those rare
+/// documents costs a cache hit; losing digits costs correctness.
+pub fn json_text_canonicalizes_losslessly(text: &str) -> bool {
+    json_number_literals(text)
+        .into_iter()
+        .all(|literal| rendered_number(literal).is_some_and(|rendered| rendered == literal))
+}
+
+/// What `serde_json` prints for a bare numeric literal, or `None` when the
+/// literal is not a JSON number this crate can represent.
+fn rendered_number(literal: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(literal) {
+        Ok(Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Raw source text of every numeric literal in a **valid** JSON document.
+///
+/// Numbers inside strings must not be reported: `"id": "1e999"` is text and
+/// canonicalization leaves it alone. The scan tracks string state and honours
+/// backslash escapes so a `\"` does not end the string early.
+fn json_number_literals(text: &str) -> Vec<&str> {
+    const NUMBER_BYTES: &[u8] = b"0123456789.eE+-";
+    let bytes = text.as_bytes();
+    let mut literals = Vec::new();
+    let mut index = 0;
+    let mut in_string = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            match byte {
+                // Skip the escaped byte as well, so `"\\"` does not look like
+                // the string ended.
+                b'\\' => index += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'-' || byte.is_ascii_digit() {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && NUMBER_BYTES.contains(&bytes[index]) {
+                index += 1;
+            }
+            literals.push(&text[start..index]);
+            continue;
+        }
+        index += 1;
+    }
+
+    literals
+}
+
 pub fn canonicalize_json_string_if_parseable(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return value.to_string();
     }
 
-    serde_json::from_str::<Value>(trimmed)
-        .map(|parsed| canonical_json_string(&parsed))
-        .unwrap_or_else(|_| value.to_string())
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) if json_text_canonicalizes_losslessly(trimmed) => canonical_json_string(&parsed),
+        // Either not JSON, or JSON whose numbers `serde_json` cannot represent
+        // exactly. Both cases must pass the caller's bytes through untouched.
+        _ => value.to_string(),
+    }
 }
 
 /// Normalize a tool-call `arguments` string into a valid JSON payload.
@@ -193,5 +272,113 @@ mod tests {
             canonicalize_tool_arguments(Some(&json!({"b": 2, "a": 1}))),
             r#"{"a":1,"b":2}"#
         );
+    }
+
+    // ------------------------------------------------------------------
+    // numeric precision
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn canonicalize_json_string_if_parseable_sorts_keys_when_numbers_survive() {
+        assert_eq!(
+            canonicalize_json_string_if_parseable(r#"{ "b": 2, "a": [1, -3, 4.5] }"#),
+            r#"{"a":[1,-3,4.5],"b":2}"#
+        );
+    }
+
+    /// A `u64`-wide integer is exactly representable and must still be
+    /// canonicalized; only literals `serde_json` would reprint differently are
+    /// protected.
+    #[test]
+    fn canonicalize_keeps_wide_but_exact_integers() {
+        assert_eq!(
+            canonicalize_json_string_if_parseable(r#"{ "b": 1, "a": 18446744073709551615 }"#),
+            r#"{"a":18446744073709551615,"b":1}"#
+        );
+    }
+
+    #[test]
+    fn canonicalize_refuses_to_corrupt_an_integer_wider_than_u64() {
+        let input = r#"{ "b": 1, "a": 12345678901234567890123 }"#;
+        assert_eq!(
+            canonicalize_json_string_if_parseable(input),
+            input,
+            "a >u64 integer must be passed through byte-for-byte, not turned into 1.234…e22"
+        );
+        assert!(
+            !json_text_canonicalizes_losslessly(input),
+            "the guard must report this document as unsafe to rewrite"
+        );
+    }
+
+    #[test]
+    fn canonicalize_refuses_to_corrupt_a_negative_integer_below_i64() {
+        let input = r#"{"delta":-99999999999999999999999999}"#;
+        assert_eq!(canonicalize_json_string_if_parseable(input), input);
+    }
+
+    /// One unsafe number anywhere in the document disables canonicalization for
+    /// the whole document; a partial rewrite would be worse than none.
+    #[test]
+    fn one_wide_integer_disables_canonicalization_for_the_whole_document() {
+        let input = r#"{ "z": 1, "nested": { "y": [ { "x": 12345678901234567890123 } ] } }"#;
+        assert_eq!(canonicalize_json_string_if_parseable(input), input);
+    }
+
+    /// Numbers inside strings are text. Canonicalization already leaves strings
+    /// alone, and the scanner must not mistake them for literals — otherwise
+    /// every tool result quoting a big id as a string would stop being
+    /// canonicalized and lose its cache key for no reason.
+    #[test]
+    fn numeric_text_inside_a_string_does_not_disable_canonicalization() {
+        assert_eq!(
+            canonicalize_json_string_if_parseable(r#"{ "b": 1, "a": "12345678901234567890123" }"#),
+            r#"{"a":"12345678901234567890123","b":1}"#
+        );
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_the_string_early() {
+        // The `\"` must not flip the scanner out of string state, or the digits
+        // after it would be read as a bare number literal.
+        assert_eq!(
+            canonicalize_json_string_if_parseable(r#"{ "b": 1, "a": "say \"hi\" 1e999" }"#),
+            r#"{"a":"say \"hi\" 1e999","b":1}"#
+        );
+    }
+
+    #[test]
+    fn a_trailing_backslash_inside_a_string_is_not_an_escape_of_the_quote() {
+        assert_eq!(
+            canonicalize_json_string_if_parseable(r#"{ "b": 1, "a": "C:\\path\\" }"#),
+            r#"{"a":"C:\\path\\","b":1}"#
+        );
+    }
+
+    /// Reformattings that change the literal's text but not its value are still
+    /// refused: the contract is "the bytes the caller sent are the bytes the
+    /// model sees", and a scientific-notation argument is what a strict gateway
+    /// may have been given.
+    #[test]
+    fn scientific_notation_is_passed_through_verbatim() {
+        let input = r#"{"a":1e2}"#;
+        assert_eq!(canonicalize_json_string_if_parseable(input), input);
+    }
+
+    #[test]
+    fn tool_arguments_inherit_the_precision_guard() {
+        let input = r#"{ "amount": 12345678901234567890123 }"#;
+        assert_eq!(canonicalize_tool_arguments_str(input), input);
+        // The empty-arguments coercion still applies.
+        assert_eq!(canonicalize_tool_arguments_str("  "), "{}");
+    }
+
+    #[test]
+    fn json_number_literals_skips_strings_and_reports_every_number() {
+        assert_eq!(
+            json_number_literals(r#"{"a":1,"b":[-2.5,"33",{"c":4e1}],"d":"x"}"#),
+            vec!["1", "-2.5", "4e1"]
+        );
+        assert!(json_number_literals(r#"{"a":"no numbers here"}"#).is_empty());
     }
 }

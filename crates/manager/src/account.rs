@@ -32,6 +32,13 @@ const ACCOUNT_CREDENTIAL_SERVICE: &str = "dev.codex-multiprovider.accounts";
 /// Only this many `auth.bak-switch-*` copies are kept. Each one contains live
 /// OAuth tokens, so an unbounded pile of them is a credential-leak hazard.
 const MAX_AUTH_BACKUPS: usize = 3;
+/// How many times [`AccountManager::switch_to_account`] will re-try its
+/// compare-and-swap against `auth.json` before giving up.
+///
+/// Codex refreshes its token on its own schedule, so a single collision is
+/// plausible; three consecutive ones mean something is writing the file
+/// continuously and looping further would just delay the error the user needs.
+const AUTH_SWITCH_ATTEMPTS: usize = 3;
 const MAX_ACCOUNT_STORE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -219,6 +226,13 @@ pub enum AccountError {
     CodexHomeNotFound,
     #[error("Failed to parse auth.json: {0}")]
     AuthJsonInvalid(String),
+    /// A switch backup was asked for but is not on disk.
+    #[error("No switch backup named `{0}`")]
+    BackupNotFound(String),
+    /// A switch backup exists but must not be restored (wrong name shape, escaped
+    /// the Codex home, or carries no usable session).
+    #[error("Switch backup `{0}` cannot be restored")]
+    BackupInvalid(String),
     #[error("Credential store error: {0}")]
     Credential(#[from] CredentialStoreError),
     #[error("Codex restart failed: {0}")]
@@ -238,6 +252,8 @@ impl AccountError {
             Self::UsageCheckFailed { status: 429, .. } => "usage_rate_limited",
             Self::UsageCheckFailed { .. } => "usage_check_failed",
             Self::RestartFailed(_) => "restart_failed",
+            Self::BackupNotFound(_) => "backup_not_found",
+            Self::BackupInvalid(_) => "backup_invalid",
             Self::Network(_) => "network_error",
             Self::RefreshFailed(_) => "refresh_failed",
             _ => "account_operation_failed",
@@ -475,6 +491,119 @@ pub struct ActiveAccountStatus {
     pub account_id: Option<String>,
     pub matched_account_id: Option<String>,
     pub auth_mode: Option<String>,
+}
+
+/// Which credential scheme an `auth.json` document carries, preferring what it
+/// states and falling back to what it contains.
+///
+/// Codex writes an explicit `auth_mode`, but a document assembled by hand, by an
+/// older build, or by a third-party login helper can omit it while still holding a
+/// real ChatGPT token bundle. Requiring the key made the panel report 「未登录」 for
+/// a session Codex itself was using happily — and `switch_to_account` merges those
+/// fields through unchanged, so the account list and the live session disagreed.
+///
+/// Inferring from the shape is safe in the direction that matters: a `tokens`
+/// section only ever means the official OAuth flow, and `OPENAI_API_KEY` only ever
+/// means key auth. An explicit value always wins, so nothing Codex declared can be
+/// overridden here.
+fn effective_auth_mode(document: &serde_json::Value) -> Option<&str> {
+    if let Some(mode) = document.get("auth_mode").and_then(|value| value.as_str()) {
+        return Some(mode);
+    }
+    let has_oauth_tokens = document
+        .get("tokens")
+        .and_then(|tokens| {
+            tokens
+                .get("access_token")
+                .or_else(|| tokens.get("refresh_token"))
+                .or_else(|| tokens.get("id_token"))
+        })
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_oauth_tokens {
+        return Some("chatgpt");
+    }
+    document
+        .get("OPENAI_API_KEY")
+        .and_then(|value| value.as_str())
+        .filter(|key| !key.trim().is_empty())
+        .map(|_| "apikey")
+}
+
+/// File-name prefix for the pre-switch copies written by
+/// [`AccountManager::write_auth_backup`].
+const AUTH_BACKUP_PREFIX: &str = "auth.bak-switch-";
+
+/// Whether `name` has exactly the shape [`AccountManager::write_auth_backup`]
+/// produces: `auth.bak-switch-<unix-seconds>-<uuid>`.
+///
+/// This is a allow-list rather than a block-list, and it is the reason
+/// [`AccountManager::restore_auth_backup`] can take a bare file name from a
+/// browser. Anything containing a separator, a `.` run, an encoding trick or a
+/// timestamp that is not all digits fails here before the filesystem is touched.
+fn is_auth_backup_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(AUTH_BACKUP_PREFIX) else {
+        return false;
+    };
+    let Some((stamp, id)) = rest.split_once('-') else {
+        return false;
+    };
+    !stamp.is_empty()
+        && stamp.bytes().all(|byte| byte.is_ascii_digit())
+        && uuid::Uuid::parse_str(id).is_ok()
+}
+
+/// Whether `auth.json` still holds exactly the bytes it was read as.
+///
+/// The check behind the compare-and-swap in [`AccountManager::switch_to_account`],
+/// split out so the `Option` handling is testable: `None` means "absent or
+/// unreadable", so *absent then present* and *present then absent* both count as
+/// a change, and only absent-then-absent is stable. Getting that inversion wrong
+/// would silently reintroduce the lost write this exists to prevent.
+fn auth_unchanged_since(auth_path: &Path, observed: Option<&str>) -> bool {
+    let current = read_to_string_limited(auth_path, MAX_AUTH_FILE_BYTES).ok();
+    current.as_deref() == observed
+}
+
+/// A pre-switch copy of `auth.json`, described without ever exposing the tokens it
+/// holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthBackupInfo {
+    /// File name only — never a path. [`AccountManager::restore_auth_backup`]
+    /// takes this back, so the API cannot be aimed at an arbitrary file.
+    pub name: String,
+    /// Seconds since the epoch, from the file's own modification time.
+    pub modified_at: u64,
+    pub size_bytes: u64,
+    /// Whose session the copy holds, read from its own `id_token`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    /// Whether restoring it would actually produce a working session.
+    pub has_usable_credentials: bool,
+    /// Why the document could not be parsed, when it could not.
+    ///
+    /// An unreadable backup is still listed: it is precisely the file a user
+    /// recovering from a bad switch needs to be able to see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+/// What [`AccountManager::purge_account_data`] removed, and what it could not.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct AccountPurgeReport {
+    /// Managed accounts that were in the store.
+    pub accounts: usize,
+    /// Account ids whose keyring entry survived. These are live OAuth tokens, so
+    /// this has to be reported to the user rather than logged and forgotten.
+    pub undeleted_credentials: Vec<String>,
+    /// `auth.bak-switch-*` copies deleted. Each held a full second token set.
+    pub backups_removed: usize,
+    /// Whether the accounts store file itself went away.
+    pub store_removed: bool,
 }
 
 pub struct AccountManager {
@@ -729,14 +858,13 @@ impl AccountManager {
             }
         };
 
-        let auth_mode = active_auth
-            .get("auth_mode")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let auth_mode = effective_auth_mode(&active_auth).map(str::to_owned);
 
-        // `auth.json` can also contain an API-key or an incomplete/old
-        // document. Its mere presence must not make the panel claim that an
-        // official OAuth session is active.
+        // `auth.json` can also hold an API key or an incomplete/old document. Its
+        // mere presence must not make the panel claim that an official OAuth
+        // session is active — but a *missing* `auth_mode` on a document that
+        // clearly carries ChatGPT tokens must not make it claim the reverse
+        // either; see [`effective_auth_mode`].
         if auth_mode.as_deref() != Some("chatgpt") {
             return Ok(ActiveAccountStatus {
                 is_logged_in: false,
@@ -1000,7 +1128,8 @@ impl AccountManager {
             .delete(&account_credential_reference(id))
             .map_err(|error| {
                 AccountError::Credential(CredentialStoreError::Backend(format!(
-                    "removed account `{id}` from the store but could not delete its stored                      credentials; a live token may remain: {error}"
+                    "removed account `{id}` from the store but could not delete its \
+                     stored credentials; a live token may remain: {error}"
                 )))
             })?;
         Ok(true)
@@ -1045,48 +1174,79 @@ impl AccountManager {
         let auth_path = self.auth_json_path();
         let _auth_lock = FileLock::acquire(&auth_path)?;
 
-        // Read existing auth.json if any to preserve other untouched fields (like OPENAI_API_KEY if present)
-        let mut auth_doc: serde_json::Map<String, serde_json::Value> =
-            match self.read_active_auth()? {
+        // Read, merge and write as a compare-and-swap loop.
+        //
+        // `auth.json` is not ours alone. Codex's app-server refreshes its own
+        // access token and writes the whole file back, and it has no idea
+        // `auth.json.lock` exists — it never takes it. A plain read-merge-write
+        // could therefore overwrite a token Codex minted *after* we read, leaving
+        // the user with a stale access token in a file that looked untouched, and
+        // every later request from the switched account failing authentication.
+        //
+        // Re-reading the exact bytes immediately before the write shrinks the
+        // window from "the whole merge" to the rename itself, and retrying makes a
+        // collision cost one more loop instead of costing the session. The
+        // remaining window cannot be closed from this side; only Codex could, by
+        // locking its own file.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            // Read existing auth.json to preserve fields this switch does not own
+            // (an `OPENAI_API_KEY` section, for instance).
+            let observed = read_to_string_limited(&auth_path, MAX_AUTH_FILE_BYTES).ok();
+            let mut auth_doc: serde_json::Map<String, serde_json::Value> = match observed
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok())
+            {
                 Some(serde_json::Value::Object(map)) => map,
                 _ => serde_json::Map::new(),
             };
 
-        // Update auth_mode to chatgpt
-        auth_doc.insert(
-            "auth_mode".into(),
-            serde_json::Value::String("chatgpt".into()),
-        );
+            // Update auth_mode to chatgpt
+            auth_doc.insert(
+                "auth_mode".into(),
+                serde_json::Value::String("chatgpt".into()),
+            );
 
-        // Serialize tokens
-        let tokens_val = serde_json::to_value(&account.tokens)?;
-        auth_doc.insert("tokens".into(), tokens_val);
+            // Serialize tokens
+            let tokens_val = serde_json::to_value(&account.tokens)?;
+            auth_doc.insert("tokens".into(), tokens_val);
 
-        if let Some(lr) = &account.last_refresh {
-            auth_doc.insert("last_refresh".into(), serde_json::Value::String(lr.clone()));
-        } else {
             auth_doc.insert(
                 "last_refresh".into(),
-                serde_json::Value::String(chrono_iso_now()),
+                serde_json::Value::String(
+                    account.last_refresh.clone().unwrap_or_else(chrono_iso_now),
+                ),
             );
+
+            let mut bytes = serde_json::to_vec_pretty(&auth_doc)?;
+            bytes.push(b'\n');
+
+            // Did anything land while we were composing?
+            if !auth_unchanged_since(&auth_path, observed.as_deref()) {
+                if attempts >= AUTH_SWITCH_ATTEMPTS {
+                    return Err(AccountError::AuthJsonInvalid(format!(
+                        "auth.json was rewritten by another process {attempts} times \
+                         during the switch; close the running Codex session and retry"
+                    )));
+                }
+                continue;
+            }
+
+            // Backup existing auth.json before writing. A backup contains a live
+            // refresh token, so old copies are pruned to a small bounded set and
+            // each one is written through an atomic, 0600 temp file.
+            if auth_path.exists() {
+                self.write_auth_backup(&auth_path)?;
+            } else if let Some(parent) = auth_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            // `auth.json` holds live OAuth tokens; it must never be group/world
+            // readable, not even for the instant between create and chmod.
+            codex_mp_core::write_private_atomic(&auth_path, &bytes)?;
+            return Ok(account);
         }
-
-        // Backup existing auth.json before writing. A backup contains a live
-        // refresh token, so old copies are pruned to a small bounded set and each
-        // one is written through an atomic, 0600 temp file.
-        if auth_path.exists() {
-            self.write_auth_backup(&auth_path)?;
-        } else if let Some(parent) = auth_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut bytes = serde_json::to_vec_pretty(&auth_doc)?;
-        bytes.push(b'\n');
-        // `auth.json` holds live OAuth tokens; it must never be group/world
-        // readable, not even for the instant between create and chmod.
-        codex_mp_core::write_private_atomic(&auth_path, &bytes)?;
-
-        Ok(account)
     }
 
     /// Copy the current `auth.json` aside before a switch, keeping only the most
@@ -1146,6 +1306,269 @@ impl AccountManager {
             }
         }
         Ok(())
+    }
+
+    // ---------------- Pre-switch auth.json backups ---------------- //
+
+    /// List the `auth.bak-switch-*` copies currently in the Codex home, newest
+    /// first.
+    ///
+    /// Each entry is described by what its own document says rather than by the
+    /// accounts store, because a backup can hold an account that has since been
+    /// deleted — and it is exactly those copies the user needs to be able to
+    /// recognise when undoing a bad switch.
+    pub fn list_auth_backups(&self) -> Result<Vec<AuthBackupInfo>, AccountError> {
+        let auth_path = self.auth_json_path();
+        let Some(parent) = auth_path.parent() else {
+            return Ok(Vec::new());
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return Ok(Vec::new());
+        };
+        let mut backups: Vec<(SystemTime, AuthBackupInfo)> = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_auth_backup_name(&name) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            let modified_at = modified
+                .duration_since(UNIX_EPOCH)
+                .map(|age| age.as_secs())
+                .unwrap_or(0);
+            let path = entry.path();
+            let size_bytes = metadata.len();
+            let info = match self.describe_auth_backup(&path) {
+                Ok(described) => AuthBackupInfo {
+                    name,
+                    modified_at,
+                    size_bytes,
+                    unreadable: None,
+                    ..described
+                },
+                Err(error) => {
+                    // A backup that cannot be parsed is still worth listing —
+                    // hiding it would hide the one file a user trying to recover
+                    // most needs to see. The reason travels with the entry.
+                    AuthBackupInfo {
+                        name,
+                        modified_at,
+                        size_bytes,
+                        email: None,
+                        account_id: None,
+                        auth_mode: None,
+                        has_usable_credentials: false,
+                        unreadable: Some(error.to_string()),
+                    }
+                }
+            };
+            backups.push((modified, info));
+        }
+        // Ordered on the file system's own sub-second mtime, **not** on the name.
+        // The name embeds a *second*-resolution stamp plus a random UUID, so two
+        // backups made inside one second — which a restore always produces, since
+        // it backs up the session it is about to replace — would otherwise order
+        // by UUID digits and put an older login above the newer one. "Newest first"
+        // is the whole point of the list: the top row is the undo the user wants.
+        backups.sort_by(|(left_time, left), (right_time, right)| {
+            right_time
+                .cmp(left_time)
+                .then_with(|| right.name.cmp(&left.name))
+        });
+        Ok(backups.into_iter().map(|(_, info)| info).collect())
+    }
+
+    /// Parse a backup for display: which identity it holds and whether it could
+    /// actually log Codex back in. Never returns token material.
+    fn describe_auth_backup(&self, path: &Path) -> Result<AuthBackupInfo, AccountError> {
+        let content = read_to_string_limited(path, MAX_AUTH_FILE_BYTES)?;
+        let document: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|error| AccountError::AuthJsonInvalid(error.to_string()))?;
+        let tokens = document
+            .get("tokens")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AccountTokens>(value).ok());
+        let profile = tokens
+            .as_ref()
+            .and_then(|tokens| tokens.id_token.as_deref())
+            .and_then(|id_token| parse_id_token_claims(id_token).ok())
+            .unwrap_or_default();
+        let account_id = tokens
+            .as_ref()
+            .and_then(|tokens| tokens.account_id.clone())
+            .or(profile.chatgpt_account_id);
+        Ok(AuthBackupInfo {
+            name: String::new(),
+            modified_at: 0,
+            size_bytes: 0,
+            email: profile.email,
+            account_id,
+            auth_mode: effective_auth_mode(&document).map(str::to_owned),
+            has_usable_credentials: tokens
+                .as_ref()
+                .is_some_and(|tokens| tokens.has_usable_credentials()),
+            unreadable: None,
+        })
+    }
+
+    /// Put a pre-switch copy of `auth.json` back, making it the live session
+    /// again.
+    ///
+    /// Accepts a backup **name**, never a path, and re-validates that name against
+    /// the exact shape [`Self::write_auth_backup`] writes, so the API cannot be
+    /// pointed at an arbitrary file. The resolved path is then checked to sit
+    /// directly inside the Codex home after canonicalisation, which is what stops
+    /// a symlink planted there from redirecting the write.
+    ///
+    /// The session being replaced is itself backed up first, so a restore is
+    /// reversible too. Codex is *not* restarted: its app-server holds the old
+    /// session in memory, and silently killing it would be a worse surprise than
+    /// telling the caller to use the existing restart action.
+    pub fn restore_auth_backup(&self, name: &str) -> Result<AuthBackupInfo, AccountError> {
+        if !is_auth_backup_name(name) {
+            return Err(AccountError::BackupInvalid(format!(
+                "`{name}` is not a switch-backup file name"
+            )));
+        }
+        let auth_path = self.auth_json_path();
+        let candidate = auth_path
+            .parent()
+            .ok_or(AccountError::CodexHomeNotFound)?
+            .join(name);
+        // Resolve both sides before comparing: `codex_home` may itself be
+        // reachable through a symlink, and a raw string prefix check would then
+        // reject a legitimate restore.
+        let home = fs::canonicalize(auth_path.parent().expect("checked above"))
+            .map_err(|_| AccountError::CodexHomeNotFound)?;
+        let resolved = fs::canonicalize(&candidate)
+            .map_err(|_| AccountError::BackupNotFound(name.to_owned()))?;
+        if resolved.parent() != Some(home.as_path()) || !resolved.is_file() {
+            return Err(AccountError::BackupInvalid(name.to_owned()));
+        }
+
+        let bytes = read_to_string_limited(&resolved, MAX_AUTH_FILE_BYTES)?.into_bytes();
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AccountError::AuthJsonInvalid(error.to_string()))?;
+        // Restoring `{"tokens": {}}` or a truncated write would log the user out
+        // and destroy the session they were trying to fix, so refuse first.
+        let restores_a_usable_session = document
+            .get("tokens")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<AccountTokens>(value).ok())
+            .is_some_and(|tokens| tokens.has_usable_credentials())
+            || document
+                .get("OPENAI_API_KEY")
+                .and_then(|value| value.as_str())
+                .is_some_and(|key| !key.trim().is_empty());
+        if !restores_a_usable_session {
+            return Err(AccountError::BackupInvalid(format!(
+                "`{name}` holds no usable credentials; restoring it would log Codex out"
+            )));
+        }
+
+        let _auth_lock = FileLock::acquire(&auth_path)?;
+        if auth_path.exists() {
+            self.write_auth_backup(&auth_path)?;
+        }
+        codex_mp_core::write_private_atomic(&auth_path, &bytes)?;
+
+        let mut described = self.describe_auth_backup(&auth_path)?;
+        described.name = name.to_owned();
+        described.size_bytes = bytes.len() as u64;
+        described.modified_at = fs::metadata(&auth_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|age| age.as_secs())
+            .unwrap_or(0);
+        Ok(described)
+    }
+
+    /// Delete every `auth.bak-switch-*` copy, keeping none, and report how many
+    /// went away.
+    ///
+    /// Each copy is a complete second set of live OAuth tokens sitting in the
+    /// Codex config directory. `codex-mp accounts clean-backups` exposes this, and
+    /// uninstall runs it as part of [`Self::purge_account_data`]. `auth.json`
+    /// itself is never touched.
+    pub fn remove_auth_backups(&self) -> usize {
+        self.remove_all_auth_backups(&self.auth_json_path())
+    }
+
+    fn remove_all_auth_backups(&self, auth_path: &Path) -> usize {
+        let Some(parent) = auth_path.parent() else {
+            return 0;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.filter_map(Result::ok) {
+            if !is_auth_backup_name(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => eprintln!(
+                    "codex-mp: could not remove auth backup {}: {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+        removed
+    }
+
+    /// Remove every piece of account state OmniBridge owns, for uninstall.
+    ///
+    /// `auth.json` is deliberately **not** touched. It is Codex's own login file,
+    /// not OmniBridge state, and an uninstall that logged the user out of their
+    /// official subscription would be indistinguishable from data loss. What does
+    /// go is everything this program added around that file: the accounts store,
+    /// the keyring entries it points at, and the `auth.bak-switch-*` copies —
+    /// each of which is a complete second set of live OAuth tokens sitting in the
+    /// user's config directory with no owner left to delete them.
+    ///
+    /// Credential deletions are collected rather than short-circuited: one
+    /// unreachable keyring entry must not leave the remaining tokens behind, and
+    /// the count has to be reported instead of swallowed, because
+    /// `delete_account` used to print a warning while a refresh token stayed on
+    /// the machine.
+    pub fn purge_account_data(&self) -> Result<AccountPurgeReport, AccountError> {
+        let (file, _lock) = self.load_file_locked()?;
+        let mut report = AccountPurgeReport {
+            accounts: file.accounts.len(),
+            ..Default::default()
+        };
+
+        for account in &file.accounts {
+            let reference = account_credential_reference(&account.id);
+            if let Err(error) = self.credentials.delete(&reference) {
+                eprintln!(
+                    "codex-mp: could not delete stored credentials for account `{}`: {error}",
+                    account.id
+                );
+                report.undeleted_credentials.push(account.id.clone());
+            }
+        }
+
+        report.backups_removed = self.remove_auth_backups();
+
+        if self.store_path.exists() {
+            match fs::remove_file(&self.store_path) {
+                Ok(()) => report.store_removed = true,
+                Err(error) => eprintln!(
+                    "codex-mp: could not remove the accounts store {}: {error}",
+                    self.store_path.display()
+                ),
+            }
+        }
+        Ok(report)
     }
 
     // ---------------- Refresh Token & Usage Query ---------------- //
@@ -2072,7 +2495,15 @@ fn now_secs() -> u64 {
 /// `auth.json` stores `last_refresh` as a timestamp string that Codex parses;
 /// writing bare Unix seconds there corrupted its refresh bookkeeping.
 fn chrono_iso_now() -> String {
-    let secs = now_secs();
+    format_epoch_secs(now_secs())
+}
+
+/// Render a Unix-second count as an ISO-8601 UTC timestamp.
+///
+/// Exposed so the CLI can label the backups it lists without taking on a date
+/// crate; it is the same formatter `auth.json`'s own `last_refresh` uses, so the
+/// two are directly comparable.
+pub fn format_epoch_secs(secs: u64) -> String {
     let days = secs / 86_400;
     let seconds_of_day = secs % 86_400;
     let (hour, minute, second) = (
@@ -3578,5 +4009,424 @@ exec "$app" app-server --endpoint-file "$endpoint"
         let item2 = list_after.iter().find(|a| a.id == acc2.id).unwrap();
         assert!(!item1.is_active);
         assert!(item2.is_active);
+    }
+
+    /// `id_token` carrying test@example.com / acc-1 / plus.
+    const ID_TOKEN_ACC1: &str = "dummy.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20iLCJuYW1lIjoidGVzdHVzZXIiLCJzdWIiOiIxMjMiLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjLTEifX0.dummy";
+    /// `id_token` carrying user2@example.com / acc-2 / free.
+    const ID_TOKEN_ACC2: &str = "dummy.eyJlbWFpbCI6InVzZXIyQGV4YW1wbGUuY29tIiwibmFtZSI6InVzZXIyIiwic3ViIjoiNDU2IiwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoiZnJlZSIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjYy0yIn19.dummy";
+
+    fn tokens(id_token: &str, access: &str, refresh: &str, account_id: &str) -> AccountTokens {
+        AccountTokens {
+            id_token: Some(id_token.into()),
+            access_token: Some(access.into()),
+            refresh_token: Some(refresh.into()),
+            account_id: Some(account_id.into()),
+        }
+    }
+
+    fn write_auth_json(path: &Path, document: &serde_json::Value) {
+        fs::write(path, serde_json::to_string_pretty(document).unwrap()).unwrap();
+    }
+
+    fn auth_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn memory_account_manager(dir: &Path) -> AccountManager {
+        let codex_home = dir.join("codex_home");
+        fs::create_dir_all(&codex_home).unwrap();
+        AccountManager::with_credential_store(
+            dir.join("accounts.json"),
+            &codex_home,
+            Arc::new(codex_mp_credentials::MemoryCredentialStore::default()),
+        )
+    }
+
+    /// A switch must be undoable, and the undo must not leak the tokens it is
+    /// protecting. `list_auth_backups` / `restore_auth_backup` are the only ways
+    /// to get here without hand-editing `auth.json`.
+    #[test]
+    fn a_switch_backup_is_listed_described_restored_and_never_leaks_tokens() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        let auth_path = manager.auth_json_path();
+        write_auth_json(
+            &auth_path,
+            &serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": ID_TOKEN_ACC1,
+                    "access_token": "at-1",
+                    "refresh_token": "rt-1",
+                    "account_id": "acc-1"
+                }
+            }),
+        );
+        manager.capture_current_auth(Some("First".into())).unwrap();
+        let second = manager
+            .import_or_update_account(
+                tokens(ID_TOKEN_ACC2, "at-2", "rt-2", "acc-2"),
+                None,
+                Some("Second".into()),
+            )
+            .unwrap();
+
+        manager.switch_to_account(&second.id).unwrap();
+        assert_eq!(
+            auth_json(&auth_path)["tokens"]["refresh_token"].as_str(),
+            Some("rt-2"),
+            "the switch should have installed account 2"
+        );
+
+        let backups = manager.list_auth_backups().unwrap();
+        assert_eq!(backups.len(), 1, "one switch, one backup");
+        assert!(is_auth_backup_name(&backups[0].name));
+        assert_eq!(backups[0].email.as_deref(), Some("test@example.com"));
+        assert_eq!(backups[0].account_id.as_deref(), Some("acc-1"));
+        assert_eq!(backups[0].auth_mode.as_deref(), Some("chatgpt"));
+        assert!(backups[0].has_usable_credentials);
+        assert!(backups[0].unreadable.is_none());
+        // The panel serialises this straight to a browser.
+        let listed = serde_json::to_string(&backups).unwrap();
+        for secret in ["rt-1", "at-1", "rt-2", "at-2", ID_TOKEN_ACC1] {
+            assert!(
+                !listed.contains(secret),
+                "the backup listing exposed credential material `{secret}`: {listed}"
+            );
+        }
+
+        // Restore the pre-switch session.
+        manager.restore_auth_backup(&backups[0].name).unwrap();
+        assert_eq!(
+            auth_json(&auth_path)["tokens"]["refresh_token"].as_str(),
+            Some("rt-1")
+        );
+        // The restore backed up what it replaced, so it is itself undoable.
+        let after_restore = manager.list_auth_backups().unwrap();
+        assert_eq!(
+            after_restore.len(),
+            2,
+            "a restore must back up its own input"
+        );
+        let newest = &after_restore[0];
+        // Both files were written inside the same second, so this is exactly the
+        // case where ordering on the name's second-resolution stamp (then on random
+        // UUID digits) puts the older login on top. The newest must be first: it is
+        // the undo the user is looking for.
+        assert!(
+            after_restore
+                .windows(2)
+                .all(|pair| pair[0].modified_at >= pair[1].modified_at),
+            "the list must be newest-first: {:?}",
+            after_restore
+                .iter()
+                .map(|entry| (entry.modified_at, &entry.name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            newest.email.as_deref(),
+            Some("user2@example.com"),
+            "the most recent backup must be the session the restore replaced, not the \
+             one it restored from"
+        );
+        manager.restore_auth_backup(&newest.name).unwrap();
+        assert_eq!(
+            auth_json(&auth_path)["tokens"]["refresh_token"].as_str(),
+            Some("rt-2")
+        );
+    }
+
+    /// Restore accepts a bare file name from a browser, so the name shape is the
+    /// only thing between that call and an arbitrary file.
+    #[test]
+    fn only_real_switch_backup_names_are_accepted() {
+        for accepted in [
+            "auth.bak-switch-1700000000-5b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a",
+            "auth.bak-switch-0-00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(is_auth_backup_name(accepted), "`{accepted}` is ours");
+        }
+        for rejected in [
+            "auth.json",
+            "auth.bak-switch-1700000000",
+            "auth.bak-switch-1700000000-",
+            "auth.bak-switch-not-a-number-5b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a",
+            "auth.bak-switch-1700000000-../../etc/passwd",
+            "auth.bak-switch-1700000000-5b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a/",
+            "auth.bak-switch-1700000000-5b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a.bak",
+            "",
+        ] {
+            assert!(
+                !is_auth_backup_name(rejected),
+                "`{rejected}` must never resolve to a restore target"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_rejects_unknown_and_unusable_backups_without_touching_the_session() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        let auth_path = manager.auth_json_path();
+        write_auth_json(
+            &auth_path,
+            &serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"refresh_token": "rt-live", "account_id": "acc-1"}
+            }),
+        );
+        let before = fs::read_to_string(&auth_path).unwrap();
+
+        let missing = "auth.bak-switch-1700000000-5b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a";
+        assert!(matches!(
+            manager.restore_auth_backup(missing),
+            Err(AccountError::BackupNotFound(_))
+        ));
+        assert!(matches!(
+            manager.restore_auth_backup("auth.json"),
+            Err(AccountError::BackupInvalid(_))
+        ));
+
+        // A truncated or logged-out copy would overwrite a working session with
+        // nothing, so it is refused rather than restored.
+        let unusable = "auth.bak-switch-1700000001-6b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a";
+        fs::write(
+            manager.codex_home().join(unusable),
+            serde_json::json!({"auth_mode": "chatgpt", "tokens": {}}).to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.restore_auth_backup(unusable),
+            Err(AccountError::BackupInvalid(_))
+        ));
+        assert_eq!(fs::read_to_string(&auth_path).unwrap(), before);
+    }
+
+    /// A name we accept could still be a **symlink** planted inside the Codex
+    /// home, pointing anywhere on the filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_backup_cannot_redirect_the_restore_outside_the_codex_home() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        let auth_path = manager.auth_json_path();
+        write_auth_json(
+            &auth_path,
+            &serde_json::json!({"tokens": {"refresh_token": "rt-live"}}),
+        );
+
+        let outside = dir.path().join("outside.json");
+        write_auth_json(
+            &outside,
+            &serde_json::json!({"tokens": {"refresh_token": "attacker"}}),
+        );
+        std::os::unix::fs::symlink(
+            &outside,
+            manager
+                .codex_home()
+                .join("auth.bak-switch-1700000002-7b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            manager.restore_auth_backup(
+                "auth.bak-switch-1700000002-7b8f0f2e-4c1f-4b7a-9a97-1f0f7c9d2e3a"
+            ),
+            Err(AccountError::BackupInvalid(_))
+        ));
+        assert_eq!(
+            auth_json(&auth_path)["tokens"]["refresh_token"].as_str(),
+            Some("rt-live"),
+            "a refused restore must leave the live session alone"
+        );
+    }
+
+    /// An `auth.json` that predates the `auth_mode` key, or was assembled by
+    /// hand, still holds a working ChatGPT session. Requiring the key made the
+    /// panel report 「未登录」 for a login Codex was using happily.
+    #[test]
+    fn a_session_is_recognised_from_its_shape_when_auth_mode_is_absent() {
+        let with_tokens = serde_json::json!({
+            "tokens": {"access_token": "at", "refresh_token": "rt", "account_id": "acc-1"}
+        });
+        assert_eq!(effective_auth_mode(&with_tokens), Some("chatgpt"));
+
+        let with_api_key = serde_json::json!({"OPENAI_API_KEY": "sk-live"});
+        assert_eq!(effective_auth_mode(&with_api_key), Some("apikey"));
+
+        assert_eq!(effective_auth_mode(&serde_json::json!({})), None);
+        assert_eq!(
+            effective_auth_mode(&serde_json::json!({"tokens": {"access_token": "  "}})),
+            None,
+            "a blank token is not a session"
+        );
+
+        // An explicit declaration always wins; inference must never override it.
+        let explicit = serde_json::json!({
+            "auth_mode": "apikey",
+            "tokens": {"refresh_token": "rt"}
+        });
+        assert_eq!(effective_auth_mode(&explicit), Some("apikey"));
+    }
+
+    #[test]
+    fn check_active_status_accepts_an_auth_json_that_omits_auth_mode() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        write_auth_json(
+            &manager.auth_json_path(),
+            &serde_json::json!({
+                "tokens": {
+                    "id_token": ID_TOKEN_ACC1,
+                    "access_token": "at-1",
+                    "refresh_token": "rt-1",
+                    "account_id": "acc-1"
+                }
+            }),
+        );
+
+        let status = manager.check_active_status().unwrap();
+        assert!(
+            status.is_logged_in,
+            "a real token bundle with no `auth_mode` is still a live session"
+        );
+        assert_eq!(status.auth_mode.as_deref(), Some("chatgpt"));
+        assert_eq!(status.email.as_deref(), Some("test@example.com"));
+
+        // An empty document is still not a session.
+        write_auth_json(&manager.auth_json_path(), &serde_json::json!({}));
+        let status = manager.check_active_status().unwrap();
+        assert!(!status.is_logged_in);
+        assert_eq!(status.auth_mode, None);
+    }
+
+    /// The compare-and-swap in `switch_to_account` hinges on this comparison, and
+    /// the failure mode is a silently lost write rather than an error — so the
+    /// `Option` handling is pinned down directly.
+    #[test]
+    fn the_auth_change_check_treats_absent_and_present_as_different() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        assert!(auth_unchanged_since(&path, None), "absent → absent");
+        fs::write(&path, r#"{"a":1}"#).unwrap();
+        assert!(
+            auth_unchanged_since(&path, Some(r#"{"a":1}"#)),
+            "unchanged bytes"
+        );
+        assert!(
+            !auth_unchanged_since(&path, Some(r#"{"a":2}"#)),
+            "content changed underneath us"
+        );
+        assert!(
+            !auth_unchanged_since(&path, None),
+            "the file appeared after we read it as absent"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(
+            !auth_unchanged_since(&path, Some(r#"{"a":1}"#)),
+            "the file disappeared after we read it"
+        );
+    }
+
+    /// A switch replaces the token section and keeps everything else: the merge
+    /// exists so an `OPENAI_API_KEY` or a field from a newer Codex build survives
+    /// changing account.
+    #[test]
+    fn a_switch_replaces_only_the_fields_it_owns() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        let auth_path = manager.auth_json_path();
+        write_auth_json(
+            &auth_path,
+            &serde_json::json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": "sk-keep-me",
+                "tokens": {"refresh_token": "rt-1", "account_id": "acc-1"},
+                "some_future_codex_field": {"nested": true}
+            }),
+        );
+        let second = manager
+            .import_or_update_account(
+                tokens(ID_TOKEN_ACC2, "at-2", "rt-2", "acc-2"),
+                None,
+                Some("Second".into()),
+            )
+            .unwrap();
+
+        manager.switch_to_account(&second.id).unwrap();
+        let after = auth_json(&auth_path);
+        assert_eq!(after["OPENAI_API_KEY"].as_str(), Some("sk-keep-me"));
+        assert_eq!(after["some_future_codex_field"]["nested"], true);
+        assert_eq!(after["auth_mode"].as_str(), Some("chatgpt"));
+        assert_eq!(after["tokens"]["refresh_token"].as_str(), Some("rt-2"));
+        assert!(
+            after["last_refresh"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "the switch must stamp its own refresh time"
+        );
+    }
+
+    /// Uninstall has to leave no live tokens behind — but must not log the user
+    /// out of Codex either, because `auth.json` is theirs, not ours.
+    #[test]
+    fn purging_account_data_removes_tokens_and_backups_but_keeps_the_live_login() {
+        let dir = tempdir().unwrap();
+        let manager = memory_account_manager(dir.path());
+        let auth_path = manager.auth_json_path();
+        write_auth_json(
+            &auth_path,
+            &serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": ID_TOKEN_ACC1,
+                    "access_token": "at-1",
+                    "refresh_token": "rt-1",
+                    "account_id": "acc-1"
+                }
+            }),
+        );
+        manager.capture_current_auth(Some("First".into())).unwrap();
+        let second = manager
+            .import_or_update_account(
+                tokens(ID_TOKEN_ACC2, "at-2", "rt-2", "acc-2"),
+                None,
+                Some("Second".into()),
+            )
+            .unwrap();
+        manager.switch_to_account(&second.id).unwrap();
+        assert!(!manager.list_auth_backups().unwrap().is_empty());
+        assert!(manager.store_path().exists());
+        // Snapshot *after* the switch: the purge must not touch `auth.json`, and
+        // the switch legitimately did.
+        let live = fs::read_to_string(&auth_path).unwrap();
+
+        let report = manager.purge_account_data().unwrap();
+        assert_eq!(report.accounts, 2);
+        assert_eq!(report.backups_removed, 1);
+        assert!(report.store_removed);
+        assert!(
+            report.undeleted_credentials.is_empty(),
+            "a working credential store must delete every account token"
+        );
+
+        assert!(!manager.store_path().exists(), "the store must be gone");
+        assert!(
+            manager.list_auth_backups().unwrap().is_empty(),
+            "every backup copy of the token set must be gone"
+        );
+        assert_eq!(
+            fs::read_to_string(&auth_path).unwrap(),
+            live,
+            "auth.json is Codex's own login and must survive an uninstall"
+        );
+
+        // Purging twice is not an error: there is simply nothing left.
+        let again = manager.purge_account_data().unwrap();
+        assert_eq!(again.accounts, 0);
+        assert_eq!(again.backups_removed, 0);
+        assert!(!again.store_removed);
     }
 }
