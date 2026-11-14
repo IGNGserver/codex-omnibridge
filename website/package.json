@@ -1,0 +1,24 @@
+{
+  "name": "codex-omnibridge-website",
+  "private": true,
+  "version": "0.1.2",
+  "description": "Official Website for Codex OmniBridge — Precision Photonic Multi-Model Router & M3 Expressive Control Center",
+  "type": "module",
+  "scripts": {
+    "generate:glb": "node scripts/build-photonic-glb.mjs",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "verify": "node scripts/verify-website.mjs"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/three": "^0.170.0",
+    "playwright-core": "^1.53.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

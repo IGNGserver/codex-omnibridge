@@ -1,0 +1,168 @@
+/* ==========================================================================
+   Codex OmniBridge Official Website — Optical Lab + M3 Expressive Tokens
+   Self-hosted variable fonts (zero external CDN requests) + CIELAB HCT roles
+   ========================================================================== */
+
+@font-face {
+  font-family: 'Material Symbols Outlined';
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block;
+  src: url('/fonts/material-symbols-outlined.woff2') format('woff2-variations');
+}
+
+@font-face {
+  font-family: 'Roboto Flex';
+  font-style: normal;
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url('/fonts/roboto-flex-latin.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+2074, U+20AC, U+2122, U+2191,
+    U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: 'Roboto Flex';
+  font-style: normal;
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url('/fonts/roboto-flex-latin-ext.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02BD-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: 'Noto Sans SC';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/noto-sans-sc.woff2') format('woff2-variations');
+  unicode-range: U+2E80-2EFF, U+2F00-2FDF, U+3000-303F, U+3040-30FF, U+3100-312F,
+    U+31A0-31BF, U+31F0-31FF, U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF,
+    U+F900-FAFF, U+FE10-FE1F, U+FE30-FE4F, U+FF00-FFEF, U+20000-2A6DF;
+}
+
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined';
+  font-weight: normal;
+  font-style: normal;
+  font-size: 20px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: 'FILL' 0, 'wght' 450, 'GRAD' 0, 'opsz' 24;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+/* Subset-safe codepoint glyph classes matching apps/panel/icons.css */
+.m3-i-account-circle::before { content: "\e853"; }
+.m3-i-add::before { content: "\e145"; }
+.m3-i-add-task::before { content: "\f23a"; }
+.m3-i-arrow-drop-down::before { content: "\e5c5"; }
+.m3-i-autorenew::before { content: "\e028"; }
+.m3-i-badge::before { content: "\ea67"; }
+.m3-i-bookmark-add::before { content: "\e598"; }
+.m3-i-brightness-auto::before { content: "\e1ab"; }
+.m3-i-check::before { content: "\e5ca"; }
+.m3-i-check-circle::before { content: "\e86c"; }
+.m3-i-dark-mode::before { content: "\e51c"; }
+.m3-i-dashboard::before { content: "\e871"; }
+.m3-i-delete::before { content: "\e872"; }
+.m3-i-desktop-windows::before { content: "\e30c"; }
+.m3-i-dns::before { content: "\e875"; }
+.m3-i-edit::before { content: "\e150"; }
+.m3-i-error::before { content: "\e000"; }
+.m3-i-help::before { content: "\e887"; }
+.m3-i-hub::before { content: "\e9f4"; }
+.m3-i-info::before { content: "\e88e"; }
+.m3-i-install-desktop::before { content: "\eb71"; }
+.m3-i-light-mode::before { content: "\e518"; }
+.m3-i-login::before { content: "\ea77"; }
+.m3-i-logout::before { content: "\e9ba"; }
+.m3-i-manage-accounts::before { content: "\f02e"; }
+.m3-i-neurology::before { content: "\e10e"; }
+.m3-i-playlist-add::before { content: "\e03b"; }
+.m3-i-refresh::before { content: "\e5d5"; }
+.m3-i-restart-alt::before { content: "\f053"; }
+.m3-i-router::before { content: "\e328"; }
+.m3-i-save::before { content: "\e161"; }
+.m3-i-security::before { content: "\e32a"; }
+.m3-i-settings-backup-restore::before { content: "\e8ba"; }
+.m3-i-swap-horiz::before { content: "\e8d4"; }
+.m3-i-sync::before { content: "\e627"; }
+.m3-i-travel-explore::before { content: "\e2db"; }
+.m3-i-tune::before { content: "\e429"; }
+.m3-i-upload-file::before { content: "\e9fc"; }
+.m3-i-verified-user::before { content: "\e8e8"; }
+.m3-i-visibility::before { content: "\e417"; }
+.m3-i-visibility-off::before { content: "\e8f5"; }
+
+:root {
+  /* Typography stacks */
+  --omni-font-sans: "Roboto Flex", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --omni-font-mono: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Monaco,
+    Consolas, "Liberation Mono", "Noto Sans SC", monospace;
+
+  /* Precision Photonic Bench Atmosphere (Dark Optical Vacuum) */
+  --omni-bg-void: #030a0c;
+  --omni-bg-bench: #071215;
+  --omni-surface-glass: rgba(8, 20, 23, 0.76);
+  --omni-surface-glass-strong: rgba(10, 24, 28, 0.90);
+  --omni-surface-elevated: rgba(16, 34, 39, 0.86);
+  --omni-surface-card: rgba(9, 22, 26, 0.82);
+
+  /* Text hierarchy — WCAG AA+ contrast verified against #071215 */
+  --omni-text-primary: #ebf7f9;
+  --omni-text-secondary: #b3ccd1;
+  --omni-text-muted: #7f9ba1;
+
+  /* Optical Spectral Wavelength Accents */
+  --omni-cyan: #00daf2;
+  --omni-cyan-soft: #96f0ff;
+  --omni-cyan-deep: #004f58;
+  --omni-violet: #d97bff;
+  --omni-amber: #feb958;
+  --omni-emerald: #4ef09c;
+  --omni-blue: #5cb3ff;
+  --omni-coral: #ffb3ae;
+
+  /* Active dynamic route wavelength (updated via JS on model switch) */
+  --omni-active-accent: #00daf2;
+  --omni-active-secondary: #96f0ff;
+
+  /* Hairlines & specular borders */
+  --omni-border-subtle: rgba(150, 240, 255, 0.13);
+  --omni-border-strong: rgba(0, 218, 242, 0.36);
+  --omni-shadow-instrument:
+    0 24px 64px rgba(0, 0, 0, 0.62),
+    0 1px 0 rgba(188, 235, 243, 0.10) inset;
+
+  /* Authentic M3 Expressive Damped-Harmonic Spring Curves */
+  --md-sys-motion-spring-fast-spatial: linear(0, 0.0368, 0.1298, 0.2563, 0.3975, 0.5394, 0.6719, 0.7885, 0.8858, 0.9626, 1.0196, 1.0586, 1.0821, 1.093, 1.0943, 1.0886, 1.0785, 1.0658, 1.0523, 1.039, 1.027, 1.0165, 1.008, 1.0014, 0.9966, 0.9935, 0.9917, 0.991, 0.9912, 0.9919, 0.993, 0.9942, 0.9955, 0.9967, 0.9978, 0.9987, 0.9995, 1, 1.0004, 1.0007, 1);
+  --md-sys-motion-spring-fast-spatial-duration: 407ms;
+  --md-sys-motion-spring-default-spatial: linear(0, 0.0208, 0.0739, 0.1478, 0.2337, 0.3245, 0.4153, 0.5025, 0.5838, 0.6577, 0.7235, 0.7808, 0.8301, 0.8716, 0.906, 0.9341, 0.9566, 0.9742, 0.9876, 0.9977, 1.0049, 1.0098, 1.0128, 1.0145, 1.0151, 1.015, 1.0143, 1.0132, 1.012, 1.0106, 1.0092, 1.0079, 1.0066, 1.0055, 1.0044, 1.0035, 1.0028, 1.0021, 1.0015, 1.0011, 1);
+  --md-sys-motion-spring-default-spatial-duration: 443ms;
+  --md-sys-motion-spring-fast-effects: linear(0, 0.0133, 0.0475, 0.0957, 0.1526, 0.2142, 0.2775, 0.3406, 0.4018, 0.4602, 0.5151, 0.5661, 0.6132, 0.6563, 0.6954, 0.7308, 0.7626, 0.7911, 0.8165, 0.8391, 0.8592, 0.8769, 0.8926, 0.9063, 0.9185, 0.9291, 0.9384, 0.9465, 0.9536, 0.9598, 0.9652, 0.9699, 0.974, 0.9776, 0.9806, 0.9833, 0.9856, 0.9876, 0.9893, 0.9908, 1);
+  --md-sys-motion-spring-fast-effects-duration: 140ms;
+
+  /* Layout measurements */
+  --omni-max-width: 1380px;
+  --omni-header-h: 68px;
+
+  color-scheme: dark;
+}
+
+.m3-numeric {
+  font-variant-numeric: tabular-nums;
+}
