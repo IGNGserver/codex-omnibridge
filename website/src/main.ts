@@ -3,27 +3,32 @@ import './styles/main.css';
 import './styles/panel-sandbox.css';
 
 import {
-  INTERNAL_MODULE_STAGES,
+  HOW_IT_WORKS_STEPS,
   MODEL_ROUTE_PRESETS,
+  RELEASE_PLATFORMS,
   WORKSPACE_CRATES,
   type ModelRoutePreset,
+  type RoutePathKind,
 } from './data/productData';
 import { PhotonicStage, type CalloutPinProjection } from './scene/PhotonicStage';
 import { ThreadSimulator } from './ui/ThreadSimulator';
 import { PanelSandbox } from './ui/PanelSandbox';
 
-/* ==========================================================================
-   Codex OmniBridge Official Website — Orchestrator
-   Synchronizes 3D Photonic Hardware Stage, Scroll Fly-Through & Interactive UI
-   ========================================================================== */
+type SiteTheme = 'light' | 'dark';
 
-const NODE_TO_STAGE_ID: Record<string, string> = {
-  Module_Ingress: 'stage-router',
-  Module_Registry: 'stage-catalog',
-  Module_Crossbar: 'stage-router',
-  Module_ProtocolBridge: 'stage-bridge',
-  Module_KeychainVault: 'stage-vault',
-  Manifold_Egress: 'stage-bridge',
+const THEME_STORAGE_KEY = 'omnibridge-site-theme';
+
+const SUN_ICON_SVG =
+  '<svg class="omni-svg-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 18a6 6 0 1 1 0-12 6 6 0 0 1 0 12Zm0-15V1h1v2h-1Zm0 20v-2h1v2h-1ZM4.22 5.64 2.8 4.22l.71-.7 1.42 1.4-.71.72Zm15.56 15.56-1.42-1.42.71-.7 1.42 1.4-.71.72ZM1 12h2v1H1v-1Zm20 0h2v1h-2v-1ZM4.22 18.36l-.71-.7 1.42-1.42.7.71-1.41 1.41Zm15.56-15.56.71.71-1.42 1.41-.7-.71 1.41-1.41Z"/></svg>';
+
+const MOON_ICON_SVG =
+  '<svg class="omni-svg-icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12.1 22c5.52 0 10-4.48 10-10 0-.47-.04-.92-.1-1.37a7.5 7.5 0 0 1-8.63-8.63c-.45-.06-.9-.1-1.37-.1a10 10 0 0 0 .1 20Z"/></svg>';
+
+const PIN_TO_STEP_ID: Record<string, string> = {
+  'pin-ingress': 'card-step-router',
+  'pin-crossbar': 'card-step-router',
+  'pin-bridge': 'card-step-bridge',
+  'pin-vault': 'card-step-security',
 };
 
 function escapeHtml(raw: string): string {
@@ -38,457 +43,419 @@ function formatInlineCode(text: string): string {
   return escapeHtml(text).replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 
-function bootstrap() {
-  let activePreset: ModelRoutePreset = MODEL_ROUTE_PRESETS[0];
+function routeColorVar(kind: RoutePathKind, theme: SiteTheme): string {
+  if (kind === 'official') return theme === 'light' ? '#006874' : '#36d9ef';
+  if (kind === 'bridge') return theme === 'light' ? '#7b4384' : '#d6a4e8';
+  return theme === 'light' ? '#2b6832' : '#7ae896';
+}
+
+function detectPlatformId(): 'macos-arm' | 'macos-x64' | 'windows-x64' | 'linux-x64' {
+  const ua = navigator.userAgent.toLowerCase();
+  if (ua.includes('win')) return 'windows-x64';
+  if (ua.includes('mac')) return 'macos-arm';
+  if (ua.includes('linux') && !ua.includes('android')) return 'linux-x64';
+  return 'macos-arm';
+}
+
+function getInitialTheme(): SiteTheme {
+  const attr = document.documentElement.dataset.siteTheme;
+  if (attr === 'dark' || attr === 'light') return attr;
+  return 'light';
+}
+
+function init() {
+  let currentTheme: SiteTheme = getInitialTheme();
+  let currentPreset: ModelRoutePreset = MODEL_ROUTE_PRESETS[0];
+  let activePinId: string | null = null;
   let freeInspect = false;
 
-  // 1. Render static-data-driven DOM sections synchronously before first frame
-  renderHeroRouteButtons();
-  renderInsideStations();
-  renderWorkspaceCrates();
-
-  // 2. Prepare persistent 3D Callout Reticle Pin elements (zero per-frame DOM churn)
-  const pinsLayer = document.getElementById('photonic-pins-layer');
-  const pinElements = new Map<string, HTMLButtonElement>();
-
-  const ensurePinElement = (pin: CalloutPinProjection): HTMLButtonElement => {
-    let el = pinElements.get(pin.id);
-    if (!el) {
-      el = document.createElement('button');
-      el.type = 'button';
-      el.className = 'callout-pin';
-      el.dataset.pinId = pin.id;
-      el.innerHTML = `
-        <span class="callout-pin__reticle" aria-hidden="true"></span>
-        <span class="callout-pin__text">
-          <span class="callout-pin__label">${escapeHtml(pin.label)}</span>
-          <span class="callout-pin__sub">${escapeHtml(pin.sublabel)}</span>
-        </span>
-      `;
-      el.addEventListener('click', () => {
-        const map: Record<string, string> = {
-          'pin-ingress': 'stage-router',
-          'pin-registry': 'stage-catalog',
-          'pin-crossbar': 'stage-router',
-          'pin-bridge': 'stage-bridge',
-          'pin-vault': 'stage-vault',
-          'pin-egress': 'stage-bridge',
-        };
-        const targetId = map[pin.id];
-        const targetEl = targetId ? document.getElementById(targetId) : null;
-        if (freeInspect) setFreeInspect(false);
-        targetEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      });
-      pinsLayer?.appendChild(el);
-      pinElements.set(pin.id, el);
-    }
-    return el;
-  };
-
-  // 3. Mount 3D Photonic Hardware Stage
+  const presetsGrid = document.getElementById('route-presets-grid');
+  const pinsLayer = document.getElementById('stage-pins-layer');
   const stageContainer = document.getElementById('photonic-stage');
-  const stage = stageContainer
-    ? new PhotonicStage(stageContainer, {
-        onPinsUpdate: (pins) => {
-          for (const p of pins) {
-            const el = ensurePinElement(p);
-            if (!p.visible) {
-              el.style.opacity = '0';
-              el.style.pointerEvents = 'none';
-            } else {
-              el.style.opacity = '1';
-              el.style.pointerEvents = 'auto';
-              el.style.transform = `translate3d(${p.x.toFixed(1)}px, ${p.y.toFixed(1)}px, 0) translate(-50%, -50%)`;
+  const btnFreeInspect = document.getElementById('btn-free-inspect') as HTMLButtonElement | null;
+  const btnResetView = document.getElementById('btn-reset-view') as HTMLButtonElement | null;
+  const btnTheme = document.getElementById('btn-site-theme') as HTMLButtonElement | null;
+  const themeIcon = document.getElementById('site-theme-icon');
+  const themeLabel = document.getElementById('site-theme-label');
+
+  // 1. OS-aware hero download CTA
+  const detectedOsId = detectPlatformId();
+  const detectedCard = RELEASE_PLATFORMS.find((p) => p.id === detectedOsId) || RELEASE_PLATFORMS[0];
+  const heroDownloadBtn = document.getElementById('hero-download-btn') as HTMLAnchorElement | null;
+  const heroDownloadLabel = document.getElementById('hero-download-label');
+  if (heroDownloadBtn && heroDownloadLabel && detectedCard.links[0]) {
+    heroDownloadBtn.href = detectedCard.links[0].url;
+    heroDownloadBtn.target = '_blank';
+    heroDownloadLabel.textContent = `下载 ${detectedCard.title} v0.1.2`;
+  }
+
+  // 2. Render 6 model preset buttons
+  if (presetsGrid) {
+    presetsGrid.innerHTML = MODEL_ROUTE_PRESETS.map(
+      (preset, index) => `
+      <button
+        type="button"
+        role="tab"
+        aria-selected="${index === 0 ? 'true' : 'false'}"
+        class="route-preset-btn ${index === 0 ? 'is-active' : ''}"
+        data-preset-id="${preset.id}"
+        data-route-kind="${preset.routeKind}"
+      >
+        <div class="route-btn-top">
+          <span class="route-btn-vendor">${escapeHtml(preset.vendorBadge)}</span>
+          <span class="route-btn-dot" aria-hidden="true"></span>
+        </div>
+        <span class="route-btn-title">${escapeHtml(preset.shortLabel)}</span>
+        <span class="route-btn-model">${escapeHtml(preset.logicalModelId)}</span>
+      </button>
+    `,
+    ).join('');
+  }
+
+  // 3. Render How-It-Works 4 plain-Chinese cards
+  const howGrid = document.getElementById('how-steps-grid');
+  if (howGrid) {
+    howGrid.innerHTML = HOW_IT_WORKS_STEPS.map(
+      (step) => `
+      <article class="how-card" id="card-${step.id}">
+        <div class="how-card-head">
+          <span class="how-card-badge">
+            <span class="how-icon-wrap">
+              <span class="material-symbols-outlined ${step.iconClass}" aria-hidden="true"></span>
+            </span>
+            <span>${escapeHtml(step.stepTag)}</span>
+          </span>
+          <span class="how-crate-tag">${escapeHtml(step.crateTag)}</span>
+        </div>
+        <h3>${escapeHtml(step.title)}</h3>
+        <p class="how-card-lead">${escapeHtml(step.lead)}</p>
+        <ul class="how-points">
+          ${step.points.map((pt) => `<li>${formatInlineCode(pt)}</li>`).join('')}
+        </ul>
+      </article>
+    `,
+    ).join('');
+  }
+
+  // 4. Render collapsible 10 workspace crates
+  const cratesList = document.getElementById('crates-list');
+  if (cratesList) {
+    cratesList.innerHTML = WORKSPACE_CRATES.map(
+      (item) => `
+      <div class="crate-item">
+        <div class="crate-item-head">
+          <code>${escapeHtml(item.crate)}</code>
+          <span class="crate-layer">${escapeHtml(item.layer)}</span>
+        </div>
+        <p>${escapeHtml(item.responsibility)}</p>
+        <span class="crate-highlight">${escapeHtml(item.highlight)}</span>
+      </div>
+    `,
+    ).join('');
+  }
+
+  // 5. Render 4 platform download cards (real v0.1.2 GitHub release assets)
+  const downloadGrid = document.getElementById('download-grid');
+  if (downloadGrid) {
+    downloadGrid.innerHTML = RELEASE_PLATFORMS.map((platform) => {
+      const primaryLink = platform.links[0];
+      const secondaryLinks = platform.links.slice(1);
+      const isDetected = platform.id === detectedOsId;
+      return `
+        <article class="download-card ${isDetected ? 'is-detected' : ''}" id="download-card-${platform.id}">
+          <span class="download-os-tag">${escapeHtml(platform.osTag)}</span>
+          <h3>${escapeHtml(platform.title)}</h3>
+          <p>${escapeHtml(platform.desc)}</p>
+          <div class="download-links">
+            <a
+              class="m3-btn ${isDetected ? 'm3-btn--primary' : 'm3-btn--tonal'} m3-btn--sm"
+              href="${escapeHtml(primaryLink.url)}"
+              target="_blank"
+              rel="noopener"
+            >
+              ${escapeHtml(primaryLink.label)}
+            </a>
+            ${
+              secondaryLinks.length
+                ? `<div class="download-secondary-row">
+                    ${secondaryLinks
+                      .map(
+                        (link) => `
+                        <a
+                          class="m3-btn m3-btn--outlined m3-btn--sm"
+                          href="${escapeHtml(link.url)}"
+                          target="_blank"
+                          rel="noopener"
+                        >
+                          ${escapeHtml(link.label)}
+                        </a>
+                      `,
+                      )
+                      .join('')}
+                  </div>`
+                : ''
             }
-            el.classList.toggle('is-highlighted', p.highlighted);
-          }
-        },
-        onModuleSelect: (nodeName) => {
-          const targetStageId = NODE_TO_STAGE_ID[nodeName];
-          const card = targetStageId ? document.getElementById(targetStageId) : null;
-          if (card) {
-            if (freeInspect) setFreeInspect(false);
-            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        },
-      })
-    : null;
+          </div>
+        </article>
+      `;
+    }).join('');
+  }
 
-  // 4. Unified Model Route Selection Handler (syncs Hero Dock + CSS spectral accent + 3D Stage)
-  const applyModelRoute = (preset: ModelRoutePreset) => {
-    activePreset = preset;
-    document.documentElement.style.setProperty('--omni-active-accent', preset.accentHex);
-    document.documentElement.style.setProperty('--omni-active-secondary', preset.secondaryHex);
+  // 6. Initialize 3D Router Stage
+  let stage: PhotonicStage | null = null;
+  if (stageContainer) {
+    stage = new PhotonicStage(stageContainer, {
+      onPinsUpdate: (pins) => renderPins(pins),
+      onModuleSelect: (nodeName) => {
+        const pinId =
+          nodeName === 'Module_ProtocolBridge'
+            ? 'pin-bridge'
+            : nodeName === 'Module_KeychainVault'
+              ? 'pin-vault'
+              : nodeName === 'Module_Crossbar'
+                ? 'pin-crossbar'
+                : 'pin-ingress';
+        activePinId = pinId;
+        const cardId = PIN_TO_STEP_ID[pinId];
+        if (cardId) {
+          document.getElementById(cardId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      },
+    });
+    stage.setSiteTheme(currentTheme);
+  }
 
-    document.querySelectorAll<HTMLButtonElement>('[data-route-preset]').forEach((btn) => {
-      const isSelected = btn.dataset.routePreset === preset.id;
+  function renderPins(pins: CalloutPinProjection[]) {
+    if (!pinsLayer) return;
+    if (pinsLayer.childElementCount !== pins.length) {
+      pinsLayer.innerHTML = pins
+        .map(
+          (pin) => `
+          <button
+            type="button"
+            class="stage-pin"
+            data-pin-id="${pin.id}"
+            title="${escapeHtml(`${pin.label} · ${pin.sublabel}`)}"
+          >
+            <span class="stage-pin-dot" aria-hidden="true"></span>
+            <span>${escapeHtml(pin.label)}</span>
+          </button>
+        `,
+        )
+        .join('');
+
+      pinsLayer.querySelectorAll<HTMLButtonElement>('[data-pin-id]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.pinId || '';
+          activePinId = id;
+          const cardId = PIN_TO_STEP_ID[id];
+          if (cardId) {
+            document.getElementById(cardId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        });
+      });
+    }
+
+    pins.forEach((pin) => {
+      const btn = pinsLayer.querySelector<HTMLButtonElement>(`[data-pin-id="${pin.id}"]`);
+      if (!btn) return;
+      btn.style.left = `${pin.x.toFixed(1)}px`;
+      btn.style.top = `${pin.y.toFixed(1)}px`;
+      btn.classList.toggle('is-hidden', !pin.visible);
+      btn.classList.toggle('is-active', activePinId === pin.id || pin.highlighted);
+    });
+  }
+
+  // 7. Route readout synchronization
+  function applyPreset(presetId: string) {
+    const preset = MODEL_ROUTE_PRESETS.find((p) => p.id === presetId) || MODEL_ROUTE_PRESETS[0];
+    currentPreset = preset;
+
+    document.documentElement.style.setProperty(
+      '--omni-active-accent',
+      routeColorVar(preset.routeKind, currentTheme),
+    );
+
+    presetsGrid?.querySelectorAll<HTMLButtonElement>('[data-preset-id]').forEach((btn) => {
+      const isSelected = btn.dataset.presetId === preset.id;
       btn.classList.toggle('is-active', isSelected);
       btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
     });
 
-    updateHeroWireReadout(preset);
-    stage?.setModelPreset(preset);
-  };
+    const badgeEl = document.getElementById('readout-badge');
+    const protoEl = document.getElementById('readout-protocol');
+    const sumEl = document.getElementById('readout-summary');
+    const logicalEl = document.getElementById('readout-logical');
+    const egressEl = document.getElementById('readout-egress');
+    const authEl = document.getElementById('readout-auth');
+    const capsEl = document.getElementById('readout-caps');
 
-  // Wire Hero 6-Model buttons
-  document.querySelectorAll<HTMLButtonElement>('[data-route-preset]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const found = MODEL_ROUTE_PRESETS.find((p) => p.id === btn.dataset.routePreset);
-      if (found) applyModelRoute(found);
-    });
-  });
-
-  // Initialize initial route readout
-  applyModelRoute(activePreset);
-
-  // 5. Mount Same-Thread 4-Turn Simulator
-  const threadMount = document.getElementById('thread-simulator-mount');
-  if (threadMount) {
-    new ThreadSimulator(threadMount, (preset) => {
-      applyModelRoute(preset);
-    });
-  }
-
-  // 6. Mount Authentic Material 3 Expressive Control Panel Sandbox
-  const panelMount = document.getElementById('panel-sandbox-mount');
-  if (panelMount) {
-    new PanelSandbox(panelMount, {
-      onRoutePreview: (preset) => {
-        applyModelRoute(preset);
-      },
-      onSyncCatalog: () => {
-        stage?.triggerCatalogSyncEffect();
-      },
-    });
-  }
-
-  // 7. Wire Top Hardware Controls (Quartz Canopy & 3D Free Orbit Inspect)
-  const canopyBtn = document.getElementById('btn-toggle-canopy');
-  const canopyLabel = document.getElementById('label-toggle-canopy');
-  canopyBtn?.addEventListener('click', () => {
-    if (!stage) return;
-    const isOpen = stage.toggleCanopyManual();
-    canopyBtn.setAttribute('aria-pressed', isOpen ? 'true' : 'false');
-    if (canopyLabel) {
-      canopyLabel.textContent = isOpen ? '闭合石英机盖' : '掀开石英机盖';
+    if (badgeEl) {
+      badgeEl.textContent = preset.routeBadge;
+      badgeEl.dataset.routeKind = preset.routeKind;
     }
-  });
+    if (protoEl) protoEl.textContent = preset.protocolLabel;
+    if (sumEl) sumEl.textContent = preset.summary;
+    if (logicalEl) logicalEl.textContent = preset.logicalModelId;
+    if (egressEl) egressEl.textContent = `${preset.egressEndpoint} → ${preset.upstreamModelId}`;
+    if (authEl) authEl.textContent = `${preset.authAction}（${preset.authDetail}）`;
+    if (capsEl) {
+      capsEl.innerHTML = preset.capabilities
+        .map((cap) => `<span class="cap-pill">${escapeHtml(cap)}</span>`)
+        .join('');
+    }
 
-  const freeBtn = document.getElementById('btn-free-inspect');
-  const exitFreeBtn = document.getElementById('btn-exit-free-inspect');
-
-  function setFreeInspect(next: boolean) {
-    freeInspect = next;
-    document.body.classList.toggle('is-free-inspect', freeInspect);
-    freeBtn?.setAttribute('aria-pressed', freeInspect ? 'true' : 'false');
-    stage?.setFreeInspectMode(freeInspect);
+    stage?.setModelPreset(preset);
   }
 
-  freeBtn?.addEventListener('click', () => setFreeInspect(!freeInspect));
-  exitFreeBtn?.addEventListener('click', () => setFreeInspect(false));
+  presetsGrid?.querySelectorAll<HTMLButtonElement>('[data-preset-id]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.presetId;
+      if (id) applyPreset(id);
+    });
+  });
+
+  // 8. 3D inspect & reset controls
+  function setFreeInspect(enabled: boolean) {
+    freeInspect = enabled;
+    stage?.setFreeInspectMode(enabled);
+    if (btnFreeInspect) {
+      btnFreeInspect.classList.toggle('is-active', enabled);
+      btnFreeInspect.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      btnFreeInspect.textContent = enabled ? '退出旋转' : '3D 自由旋转';
+    }
+  }
+
+  btnFreeInspect?.addEventListener('click', () => {
+    setFreeInspect(!freeInspect);
+  });
+
+  btnResetView?.addEventListener('click', () => {
+    setFreeInspect(false);
+    stage?.resetCameraView();
+  });
+
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && freeInspect) {
       setFreeInspect(false);
+      stage?.resetCameraView();
     }
   });
 
-  // 8. Wire CLI Quickstart Tabs & Copy Buttons
-  document.querySelectorAll<HTMLButtonElement>('[data-cli-tab]').forEach((tabBtn) => {
-    tabBtn.addEventListener('click', () => {
-      const target = tabBtn.dataset.cliTab;
-      document.querySelectorAll<HTMLButtonElement>('[data-cli-tab]').forEach((b) => {
-        const active = b.dataset.cliTab === target;
-        b.classList.toggle('is-active', active);
-        b.setAttribute('aria-selected', active ? 'true' : 'false');
-      });
-      document.querySelectorAll<HTMLElement>('[data-cli-pane]').forEach((pane) => {
-        pane.classList.toggle('is-active', pane.dataset.cliPane === target);
-      });
-    });
-  });
+  // 9. Mount Interactive Panel Sandbox
+  const panelRoot = document.getElementById('panel-sandbox-root');
+  const panelSandbox = panelRoot
+    ? new PanelSandbox(panelRoot, {
+        onRoutePreview: (preset) => {
+          applyPreset(preset.id);
+          document.getElementById('router-stage-card')?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+          });
+        },
+        onSyncCatalog: () => {
+          stage?.triggerCatalogSyncEffect();
+        },
+      })
+    : null;
 
-  document.querySelectorAll<HTMLButtonElement>('[data-copy-target]').forEach((copyBtn) => {
-    copyBtn.addEventListener('click', async () => {
-      const id = copyBtn.dataset.copyTarget;
-      const codeEl = id ? document.getElementById(id) : null;
-      if (!codeEl) return;
-      const raw = codeEl.textContent || '';
+  // 10. Mount Single-Thread Simulator
+  const threadRoot = document.getElementById('thread-simulator-root');
+  if (threadRoot) {
+    new ThreadSimulator(threadRoot, (preset) => {
+      applyPreset(preset.id);
+    });
+  }
+
+  // 11. Site Light/Dark Theme Sync across Website, 3D Stage & Sandbox
+  function applyTheme(theme: SiteTheme, persist = false) {
+    currentTheme = theme;
+    document.documentElement.dataset.siteTheme = theme;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) {
+      meta.setAttribute('content', theme === 'dark' ? '#0b1516' : '#f6feff');
+    }
+    if (themeIcon) {
+      themeIcon.innerHTML = theme === 'dark' ? SUN_ICON_SVG : MOON_ICON_SVG;
+    }
+    if (themeLabel) {
+      themeLabel.textContent = theme === 'dark' ? '浅色模式' : '深色模式';
+    }
+    if (persist) {
       try {
-        await navigator.clipboard.writeText(raw);
-        const orig = copyBtn.textContent;
-        copyBtn.textContent = '✓ 已复制';
-        window.setTimeout(() => {
-          copyBtn.textContent = orig;
-        }, 1800);
-      } catch {
-        copyBtn.textContent = '请手动复制';
-      }
+        localStorage.setItem(THEME_STORAGE_KEY, theme);
+      } catch {}
+    }
+    document.documentElement.style.setProperty(
+      '--omni-active-accent',
+      routeColorVar(currentPreset.routeKind, theme),
+    );
+    stage?.setSiteTheme(theme);
+    panelSandbox?.setTheme(theme);
+  }
+
+  btnTheme?.addEventListener('click', () => {
+    applyTheme(currentTheme === 'light' ? 'dark' : 'light', true);
+  });
+
+  applyTheme(currentTheme, false);
+  applyPreset(MODEL_ROUTE_PRESETS[0].id);
+
+  // 12. CLI Workbench Tabs & Copy
+  const cliWorkbench = document.getElementById('cli-workbench');
+  const cliCopyBtn = document.getElementById('cli-copy-btn');
+  cliWorkbench?.querySelectorAll<HTMLButtonElement>('[data-cli-tab]').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const target = tab.dataset.cliTab;
+      cliWorkbench.querySelectorAll<HTMLButtonElement>('[data-cli-tab]').forEach((t) => {
+        const active = t.dataset.cliTab === target;
+        t.classList.toggle('is-active', active);
+        t.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      cliWorkbench.querySelectorAll<HTMLElement>('[data-cli-panel]').forEach((panel) => {
+        panel.classList.toggle('is-active', panel.dataset.cliPanel === target);
+      });
     });
   });
 
-  // 9. Scroll-Driven Camera Choreography & Active Section / Module Highlighting
-  const heroEl = document.getElementById('hero-matrix');
-  const insideEl = document.getElementById('inside-matrix');
-  const threadEl = document.getElementById('thread-lab');
-  const panelEl = document.getElementById('panel-showcase');
-  const archEl = document.getElementById('architecture-matrix');
-  const quickEl = document.getElementById('quickstart');
+  cliCopyBtn?.addEventListener('click', async () => {
+    const activeCode = cliWorkbench?.querySelector('.cli-panel.is-active code')?.textContent || '';
+    if (!activeCode) return;
+    try {
+      await navigator.clipboard.writeText(activeCode);
+      cliCopyBtn.textContent = '已复制';
+      window.setTimeout(() => {
+        cliCopyBtn.textContent = '复制命令';
+      }, 1800);
+    } catch {
+      cliCopyBtn.textContent = '请手动选中复制';
+      window.setTimeout(() => {
+        cliCopyBtn.textContent = '复制命令';
+      }, 1800);
+    }
+  });
 
-  const stageCards = INTERNAL_MODULE_STAGES.map((s) => document.getElementById(s.id));
-  const hudIndexEl = document.getElementById('inside-hud-index');
-  const hudTitleEl = document.getElementById('inside-hud-title');
-
-  let scrollTicking = false;
-  const syncScrollChoreography = () => {
-    scrollTicking = false;
-    const vh = Math.max(1, window.innerHeight);
-
-    const heroRect = heroEl?.getBoundingClientRect();
-    const insideRect = insideEl?.getBoundingClientRect();
-    const threadRect = threadEl?.getBoundingClientRect();
-    const panelRect = panelEl?.getBoundingClientRect();
-
-    // Hero progress 0..1
-    const heroProgress = heroRect
-      ? Math.max(0, Math.min(1, -heroRect.top / Math.max(1, heroRect.height * 0.85)))
-      : 0;
-
-    // Inside Matrix active & continuous progress 0..1 across the 4 module cards
-    const insideActive = Boolean(
-      insideRect && insideRect.top < vh * 0.58 && insideRect.bottom > vh * 0.32,
+  // 13. Highlight active section link in top nav
+  const navLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('[data-nav-target]'));
+  if ('IntersectionObserver' in window && navLinks.length > 0) {
+    const navObserver = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible?.target?.id) return;
+        navLinks.forEach((link) => {
+          link.classList.toggle('is-active', link.dataset.navTarget === visible.target.id);
+        });
+      },
+      { rootMargin: '-25% 0px -55% 0px', threshold: [0.1, 0.4, 0.7] },
     );
-    let insideProgress = 0;
-    if (insideRect) {
-      const span = Math.max(1, insideRect.height - vh * 0.65);
-      insideProgress = Math.max(0, Math.min(1, (vh * 0.42 - insideRect.top) / span));
-    }
-
-    // Highlight active module card & sticky HUD by nearest viewport center
-    let activeStageIdx = 0;
-    let bestDist = Number.POSITIVE_INFINITY;
-    stageCards.forEach((card, idx) => {
-      if (!card) return;
-      const r = card.getBoundingClientRect();
-      const center = (r.top + r.bottom) * 0.5;
-      const dist = Math.abs(center - vh * 0.45);
-      if (dist < bestDist) {
-        bestDist = dist;
-        activeStageIdx = idx;
-      }
-    });
-    stageCards.forEach((card, idx) => {
-      card?.classList.toggle('is-active', insideActive && idx === activeStageIdx);
-    });
-    document.querySelectorAll<HTMLButtonElement>('[data-jump-stage]').forEach((btn, idx) => {
-      btn.classList.toggle('is-active', idx === activeStageIdx);
-    });
-    if (insideActive) {
-      const curStage = INTERNAL_MODULE_STAGES[activeStageIdx];
-      if (hudIndexEl) hudIndexEl.textContent = curStage.indexLabel;
-      if (hudTitleEl) {
-        hudTitleEl.textContent = `当前聚焦：${curStage.title}（${curStage.crateName}）`;
-      }
-    }
-
-    // Thread simulator active check
-    const threadActive = Boolean(
-      threadRect && threadRect.top < vh * 0.55 && threadRect.bottom > vh * 0.25,
-    );
-
-    // Dim 3D background slightly when user reaches dense M3 Panel / Architecture / CLI sections
-    const dimBackground = Boolean(panelRect && panelRect.top < vh * 0.48);
-    document.body.dataset.stageDim = dimBackground ? 'true' : 'false';
-
-    stage?.updateScrollChoreography({
-      heroProgress,
-      insideActive,
-      insideProgress,
-      threadActive,
-    });
-
-    // Update top nav active pill
-    const sections: Array<[string, HTMLElement | null]> = [
-      ['hero-matrix', heroEl],
-      ['inside-matrix', insideEl],
-      ['thread-lab', threadEl],
-      ['panel-showcase', panelEl],
-      ['architecture-matrix', archEl],
-      ['quickstart', quickEl],
-    ];
-    let currentSecId = 'hero-matrix';
-    for (const [id, sec] of sections) {
-      if (!sec) continue;
-      const r = sec.getBoundingClientRect();
-      if (r.top <= vh * 0.42) {
-        currentSecId = id;
-      }
-    }
-    document.querySelectorAll<HTMLAnchorElement>('[data-nav-sec]').forEach((link) => {
-      link.classList.toggle('is-active', link.dataset.navSec === currentSecId);
-    });
-  };
-
-  window.addEventListener(
-    'scroll',
-    () => {
-      if (!scrollTicking) {
-        scrollTicking = true;
-        requestAnimationFrame(syncScrollChoreography);
-      }
-    },
-    { passive: true },
-  );
-  syncScrollChoreography();
-}
-
-/* -------------------------------------------------------------------------- */
-/*  DOM Section Builders                                                      */
-/* -------------------------------------------------------------------------- */
-
-function renderHeroRouteButtons() {
-  const grid = document.getElementById('hero-route-grid');
-  if (!grid) return;
-
-  grid.innerHTML = MODEL_ROUTE_PRESETS.map(
-    (p, idx) => `
-      <button
-        type="button"
-        role="tab"
-        class="route-preset-btn ${idx === 0 ? 'is-active' : ''}"
-        aria-selected="${idx === 0 ? 'true' : 'false'}"
-        data-route-preset="${p.id}"
-        style="--preset-accent: ${p.accentHex}"
-      >
-        <span class="route-preset-btn__vendor">${escapeHtml(p.vendorBadge)}</span>
-        <span class="route-preset-btn__name">${escapeHtml(p.shortLabel)}</span>
-        <span class="route-preset-btn__slug">${escapeHtml(p.logicalModelId)}</span>
-      </button>
-    `,
-  ).join('');
-}
-
-function updateHeroWireReadout(preset: ModelRoutePreset) {
-  const badgeEl = document.getElementById('ro-badge');
-  const protoEl = document.getElementById('ro-protocol');
-  const summaryEl = document.getElementById('ro-summary');
-  const capsEl = document.getElementById('ro-caps');
-  const modelsEl = document.getElementById('ro-models');
-  const authEl = document.getElementById('ro-auth');
-  const endpointsEl = document.getElementById('ro-endpoints');
-  const pipelineEl = document.getElementById('ro-pipeline');
-  const benchKicker = document.getElementById('hero-bench-kicker');
-  const benchDesc = document.getElementById('hero-bench-desc');
-
-  if (badgeEl) badgeEl.textContent = preset.routeBadge;
-  if (protoEl) protoEl.textContent = preset.protocolLabel;
-  if (summaryEl) summaryEl.textContent = preset.summary;
-  if (capsEl) {
-    capsEl.innerHTML = preset.capabilities.map((c) => `<span>${escapeHtml(c)}</span>`).join('');
-  }
-  if (modelsEl) {
-    modelsEl.textContent = `${preset.logicalModelId} ➔ ${preset.upstreamModelId}`;
-  }
-  if (authEl) {
-    authEl.textContent = `${preset.authAction}（${preset.authDetail}）`;
-  }
-  if (endpointsEl) {
-    endpointsEl.textContent = `127.0.0.1:8787/v1 ➔ ${preset.egressEndpoint}`;
-  }
-  if (pipelineEl) {
-    pipelineEl.textContent = `${preset.bridgePipeline} · [${preset.contextWindow}]`;
-  }
-  if (benchKicker) {
-    benchKicker.textContent = `OPTICAL BENCH // ${preset.routeBadge}`;
-    benchKicker.style.color = preset.accentHex;
-  }
-  if (benchDesc) {
-    benchDesc.textContent = `MEMS 偏航角 ${(preset.gimbalYawRad * (180 / Math.PI)).toFixed(1)}° · 钥匙箱状态：${
-      preset.vaultActive ? '已啮合注入 Keyring 密钥' : '物理旁路（无需第三方密钥）'
-    }`;
-  }
-}
-
-function renderInsideStations() {
-  const mount = document.getElementById('inside-stations-mount');
-  const hudNav = document.getElementById('inside-hud-nav');
-  if (!mount) return;
-
-  mount.innerHTML = INTERNAL_MODULE_STAGES.map(
-    (s, idx) => `
-      <article
-        class="module-stage-card ${idx === 0 ? 'is-active' : ''}"
-        id="${s.id}"
-        style="--stage-accent: ${s.accentHex}"
-      >
-        <div class="module-stage-meta">
-          <span class="omni-kicker-mono" style="color:${s.accentHex}">${escapeHtml(s.indexLabel)}</span>
-          <span class="module-crate-tag">${escapeHtml(s.crateName)}</span>
-        </div>
-        <h3>${escapeHtml(s.title)}</h3>
-        <p class="module-stage-subtitle">${escapeHtml(s.subtitle)}</p>
-
-        <div class="module-telemetry-bar">
-          <code>${escapeHtml(s.telemetryCode)}</code>
-        </div>
-
-        <div class="module-spec-grid">
-          ${s.specs
-            .map(
-              (sp) => `
-            <div class="module-spec-item">
-              <span>${escapeHtml(sp.label)}</span>
-              <strong>${escapeHtml(sp.value)}</strong>
-            </div>
-          `,
-            )
-            .join('')}
-        </div>
-
-        <ul class="module-bullet-list">
-          ${s.bullets.map((b) => `<li>${formatInlineCode(b)}</li>`).join('')}
-        </ul>
-      </article>
-    `,
-  ).join('');
-
-  if (hudNav) {
-    const shortNames = ['01 目录合成', '02 逐轮分流', '03 协议棱镜', '04 钥匙箱隔离'];
-    hudNav.innerHTML = INTERNAL_MODULE_STAGES.map(
-      (s, idx) => `
-        <button
-          type="button"
-          class="inside-jump-btn ${idx === 0 ? 'is-active' : ''}"
-          data-jump-stage="${s.id}"
-        >
-          ${escapeHtml(shortNames[idx] || s.title)}
-        </button>
-      `,
-    ).join('');
-
-    hudNav.querySelectorAll<HTMLButtonElement>('[data-jump-stage]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const id = btn.dataset.jumpStage;
-        const el = id ? document.getElementById(id) : null;
-        el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      });
+    navLinks.forEach((link) => {
+      const id = link.dataset.navTarget;
+      const el = id ? document.getElementById(id) : null;
+      if (el) navObserver.observe(el);
     });
   }
 }
 
-function renderWorkspaceCrates() {
-  const mount = document.getElementById('crates-grid-mount');
-  if (!mount) return;
-
-  mount.innerHTML = WORKSPACE_CRATES.map(
-    (c) => `
-      <article class="crate-card">
-        <span class="crate-card__layer">${escapeHtml(c.layer)}</span>
-        <strong class="crate-card__name">${escapeHtml(c.crate)}</strong>
-        <p class="crate-card__desc">${escapeHtml(c.responsibility)}</p>
-        <div class="crate-card__highlight">✦ ${escapeHtml(c.highlight)}</div>
-      </article>
-    `,
-  ).join('');
-}
-
-bootstrap();
+init();

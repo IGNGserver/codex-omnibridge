@@ -1,20 +1,14 @@
 #!/usr/bin/env node
 /**
- * Parametric CAD-Grade Binary glTF 2.0 (.glb) Synthesizer
- * Target: Codex OmniBridge Photonic Switching Matrix Mk.IV
+ * Parametric Binary glTF 2.0 (.glb) Synthesizer
+ * Target: Codex OmniBridge Smart 3-Way Router Stage (M3 Expressive Edition)
  *
- * Generates `public/models/omnibridge-photonic-matrix.glb` with named,
- * pivot-accurate sub-assemblies mapped 1-to-1 to Codex OmniBridge's Rust crates:
- *   - Chassis_Base           : Machined anodized titanium optical breadboard & heatsinks
- *   - Canopy_Port / Starboard: Retractable borosilicate quartz optical covers
- *   - Module_Ingress         : Stock Codex `/v1/responses` unified collimator
- *   - Module_Registry        : Model catalog & capability encoder wheels (crates/catalog)
- *   - Module_Crossbar        : Per-turn MEMS gimbal beam-director (crates/router)
- *   - Channel_Official_Bypass: Zero-translation official OpenAI sapphire rail
- *   - Module_ProtocolBridge  : Brewster dispersion prism stack (crates/protocol-bridge)
- *   - Module_KeychainVault   : OS Keychain Faraday vault & auth barrier (crates/credentials)
- *   - Module_LocalLoop       : Toroidal local inference resonator (127.0.0.1 loopback)
- *   - Manifold_Egress        : Tri-port output manifold (Official / Cloud Bridge / Local)
+ * Clean, open industrial architecture (zero fog-inducing enclosures) visually
+ * demonstrating:
+ *   Unified Ingress (`127.0.0.1:8787`) -> Catalog Rings -> Rotary Crossbar ->
+ *     - Upper Lane : Official OpenAI Direct Bypass (`Z = -1.12`)
+ *     - Middle Lane: Protocol Translator + Isolated Keychain Vault (`Z = 0.0`)
+ *     - Lower Lane : Local Offline Loopback (`127.0.0.1`, `Z = +1.12`)
  */
 
 import fs from 'node:fs';
@@ -27,91 +21,73 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_OUT = path.resolve(__dirname, '../public/models/omnibridge-photonic-matrix.glb');
 const OUT_PATH = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_OUT;
 
-/* -------------------------------------------------------------------------- */
-/*  Material Palette (PBR Metallic-Roughness + Emissive + Alpha Blend)        */
-/* -------------------------------------------------------------------------- */
-
 const MATERIALS = [
   {
-    name: 'Titanium_Obsidian',
-    baseColorFactor: [0.055, 0.078, 0.09, 1.0],
-    metallicFactor: 0.88,
-    roughnessFactor: 0.28,
+    name: 'Platform_Ceramic',
+    baseColorFactor: [0.85, 0.91, 0.92, 1.0],
+    metallicFactor: 0.06,
+    roughnessFactor: 0.44,
   },
   {
-    name: 'Titanium_Brushed_Gunmetal',
-    baseColorFactor: [0.14, 0.185, 0.205, 1.0],
-    metallicFactor: 0.92,
-    roughnessFactor: 0.22,
+    name: 'Chassis_Slate',
+    baseColorFactor: [0.22, 0.30, 0.32, 1.0],
+    metallicFactor: 0.58,
+    roughnessFactor: 0.34,
   },
   {
-    name: 'Titanium_Champagne_Hardware',
-    baseColorFactor: [0.76, 0.66, 0.50, 1.0],
-    metallicFactor: 0.95,
-    roughnessFactor: 0.18,
+    name: 'Hardware_Silver',
+    baseColorFactor: [0.76, 0.82, 0.84, 1.0],
+    metallicFactor: 0.86,
+    roughnessFactor: 0.24,
   },
   {
-    name: 'Copper_Coil_Anodized',
-    baseColorFactor: [0.85, 0.46, 0.22, 1.0],
-    metallicFactor: 0.94,
-    roughnessFactor: 0.20,
+    name: 'Hardware_Copper',
+    baseColorFactor: [0.76, 0.52, 0.30, 1.0],
+    metallicFactor: 0.82,
+    roughnessFactor: 0.26,
   },
   {
-    name: 'Borosilicate_Quartz_Shell',
-    baseColorFactor: [0.62, 0.88, 0.96, 0.18],
-    metallicFactor: 0.05,
-    roughnessFactor: 0.06,
+    name: 'Crystal_Lens',
+    baseColorFactor: [0.68, 0.91, 0.96, 0.36],
+    metallicFactor: 0.02,
+    roughnessFactor: 0.08,
     alphaMode: 'BLEND',
-    doubleSided: true,
+    doubleSided: false,
   },
   {
-    name: 'Dichroic_Prism_Crystal',
-    baseColorFactor: [0.52, 0.92, 1.0, 0.46],
-    metallicFactor: 0.10,
-    roughnessFactor: 0.04,
-    emissiveFactor: [0.02, 0.14, 0.20],
-    alphaMode: 'BLEND',
-    doubleSided: true,
+    name: 'Indicator_Official',
+    baseColorFactor: [0.0, 0.65, 0.72, 1.0],
+    metallicFactor: 0.12,
+    roughnessFactor: 0.25,
+    emissiveFactor: [0.0, 0.35, 0.40],
   },
   {
-    name: 'Emitter_Cyan_Primary',
-    baseColorFactor: [0.0, 0.86, 0.95, 1.0],
-    metallicFactor: 0.1,
-    roughnessFactor: 0.15,
-    emissiveFactor: [0.0, 0.86, 0.96],
+    name: 'Indicator_Bridge',
+    baseColorFactor: [0.58, 0.31, 0.63, 1.0],
+    metallicFactor: 0.12,
+    roughnessFactor: 0.25,
+    emissiveFactor: [0.34, 0.16, 0.38],
   },
   {
-    name: 'Emitter_Violet_Bridge',
-    baseColorFactor: [0.85, 0.48, 1.0, 1.0],
-    metallicFactor: 0.1,
-    roughnessFactor: 0.15,
-    emissiveFactor: [0.72, 0.30, 0.96],
+    name: 'Indicator_Vault',
+    baseColorFactor: [0.78, 0.50, 0.05, 1.0],
+    metallicFactor: 0.12,
+    roughnessFactor: 0.25,
+    emissiveFactor: [0.42, 0.25, 0.02],
   },
   {
-    name: 'Emitter_Amber_Vault',
-    baseColorFactor: [1.0, 0.72, 0.32, 1.0],
-    metallicFactor: 0.1,
-    roughnessFactor: 0.15,
-    emissiveFactor: [0.95, 0.62, 0.16],
-  },
-  {
-    name: 'Emitter_Emerald_Local',
-    baseColorFactor: [0.30, 0.95, 0.68, 1.0],
-    metallicFactor: 0.1,
-    roughnessFactor: 0.15,
-    emissiveFactor: [0.18, 0.86, 0.56],
+    name: 'Indicator_Local',
+    baseColorFactor: [0.20, 0.54, 0.24, 1.0],
+    metallicFactor: 0.12,
+    roughnessFactor: 0.25,
+    emissiveFactor: [0.10, 0.34, 0.14],
   },
 ];
 
 const MAT = Object.fromEntries(MATERIALS.map((m, idx) => [m.name, idx]));
 
-/* -------------------------------------------------------------------------- */
-/*  Geometry Helpers                                                          */
-/* -------------------------------------------------------------------------- */
-
 function prep(geom, transform) {
-  let g = geom.index ? geom.toNonIndexed() : geom.clone();
-  // Ensure clean POSITION and NORMAL only so mergeGeometries never mismatches attributes
+  const g = geom.index ? geom.toNonIndexed() : geom.clone();
   if (!g.getAttribute('normal')) {
     g.computeVertexNormals();
   }
@@ -131,7 +107,7 @@ function trs(x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sx = 1, sy = 1, sz = 1
   return m;
 }
 
-function chamferedPlate(w, h, d, bevel = 0.18) {
+function chamferedPlate(w, h, d, bevel = 0.22) {
   const hw = w / 2;
   const hd = d / 2;
   const b = Math.min(bevel, hw * 0.4, hd * 0.4);
@@ -154,7 +130,6 @@ function chamferedPlate(w, h, d, bevel = 0.18) {
     bevelSegments: 2,
     curveSegments: 4,
   });
-  // Orient extrusion along +Y centered at Y=0
   extrude.rotateX(-Math.PI / 2);
   extrude.translate(0, -h / 2, 0);
   extrude.computeVertexNormals();
@@ -187,475 +162,361 @@ function mergeList(geoms) {
   return mergeGeometries(geoms, false);
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Scene Graph Builder                                                       */
-/* -------------------------------------------------------------------------- */
-
-function buildPhotonicMatrixHierarchy() {
+function buildRouterStageHierarchy() {
   const nodes = [];
 
-  function addNode({ name, translation = [0, 0, 0], rotation = [0, 0, 0, 1], scale = [1, 1, 1], primitives = [], children = [] }) {
+  function addNode({
+    name,
+    translation = [0, 0, 0],
+    rotation = [0, 0, 0, 1],
+    scale = [1, 1, 1],
+    primitives = [],
+    children = [],
+  }) {
     const idx = nodes.length;
     nodes.push({ name, translation, rotation, scale, primitives, children });
     return idx;
   }
 
-  // 1. Chassis_Base: Precision Optical Breadboard + Heatsinks + Rails + Standoffs
+  // 1. Chassis_Base: Clean M3-sculpted tabletop ceramic & anodized slate deck
   {
-    const darkParts = [];
-    const gunmetalParts = [];
-    const goldParts = [];
-    const cyanParts = [];
+    const ceramicParts = [];
+    const slateParts = [];
+    const silverParts = [];
+    const accentParts = [];
 
-    // Main optical baseplate & recessed sub-frame
-    darkParts.push(prep(chamferedPlate(6.6, 0.22, 4.1, 0.36), trs(0, -0.52, 0)));
-    gunmetalParts.push(prep(chamferedPlate(6.28, 0.08, 3.78, 0.28), trs(0, -0.36, 0)));
-    darkParts.push(prep(chamferedPlate(5.86, 0.05, 3.36, 0.22), trs(0, -0.30, 0)));
+    ceramicParts.push(prep(chamferedPlate(6.4, 0.20, 3.85, 0.42), trs(0, -0.44, 0)));
+    slateParts.push(prep(chamferedPlate(5.95, 0.08, 3.45, 0.34), trs(0, -0.32, 0)));
+    ceramicParts.push(prep(chamferedPlate(5.65, 0.05, 3.16, 0.26), trs(0, -0.27, 0)));
 
-    // 22 underside heatsink fins
-    for (let i = -10; i <= 10; i++) {
-      const x = i * 0.27;
-      darkParts.push(prep(new THREE.BoxGeometry(0.055, 0.22, 3.64), trs(x, -0.72, 0)));
-    }
-
-    // 4 shock-absorbing corner feet + gold collar rings
-    for (const sx of [-2.75, 2.75]) {
-      for (const sz of [-1.62, 1.62]) {
-        gunmetalParts.push(prep(new THREE.CylinderGeometry(0.22, 0.26, 0.14, 24), trs(sx, -0.84, sz)));
-        goldParts.push(prep(new THREE.TorusGeometry(0.23, 0.018, 10, 24), trs(sx, -0.78, sz, Math.PI / 2, 0, 0)));
+    // 4 clean aluminum feet
+    for (const sx of [-2.6, 2.6]) {
+      for (const sz of [-1.45, 1.45]) {
+        slateParts.push(prep(new THREE.CylinderGeometry(0.19, 0.22, 0.12, 24), trs(sx, -0.59, sz)));
+        silverParts.push(prep(new THREE.TorusGeometry(0.20, 0.016, 10, 24), trs(sx, -0.54, sz, Math.PI / 2, 0, 0)));
       }
     }
 
-    // Precision longitudinal optical bench guide rails (along X)
-    for (const z of [-1.52, -1.08, 0.0, 1.08, 1.58]) {
-      const railW = Math.abs(z) > 1.4 ? 5.9 : 5.2;
-      const railH = Math.abs(z) > 1.4 ? 0.07 : 0.035;
-      gunmetalParts.push(prep(new THREE.BoxGeometry(railW, railH, 0.07), trs(0, -0.26, z)));
+    // Subtle track guide beds for the 3 output lanes
+    for (const z of [-1.12, 0.0, 1.12]) {
+      silverParts.push(prep(new THREE.BoxGeometry(5.1, 0.025, 0.08), trs(0.15, -0.24, z)));
     }
 
-    // Perimeter M3 socket cap bolts & corner pillars
-    for (const sx of [-2.96, -1.48, 0, 1.48, 2.96]) {
-      for (const sz of [-1.76, 1.76]) {
-        goldParts.push(prep(new THREE.CylinderGeometry(0.042, 0.042, 0.05, 6), trs(sx, -0.30, sz)));
-      }
-    }
-    for (const [cx, cz] of [[-2.92, -1.72], [2.92, -1.72], [-2.92, 1.72], [2.92, 1.72]]) {
-      gunmetalParts.push(prep(new THREE.CylinderGeometry(0.08, 0.09, 1.06, 16), trs(cx, 0.18, cz)));
-      goldParts.push(prep(new THREE.CylinderGeometry(0.105, 0.105, 0.06, 6), trs(cx, 0.72, cz)));
-    }
-
-    // Edge status light strips embedded in optical bench
-    cyanParts.push(prep(new THREE.BoxGeometry(5.4, 0.018, 0.022), trs(0, -0.31, -1.89)));
-    cyanParts.push(prep(new THREE.BoxGeometry(5.4, 0.018, 0.022), trs(0, -0.31, 1.89)));
+    // Front & rear slim status strips
+    accentParts.push(prep(new THREE.BoxGeometry(4.8, 0.016, 0.022), trs(0, -0.30, 1.73)));
+    accentParts.push(prep(new THREE.BoxGeometry(4.8, 0.016, 0.022), trs(0, -0.30, -1.73)));
 
     addNode({
       name: 'Chassis_Base',
       primitives: [
-        { geom: mergeList(darkParts), material: MAT.Titanium_Obsidian },
-        { geom: mergeList(gunmetalParts), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(goldParts), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(cyanParts), material: MAT.Emitter_Cyan_Primary },
+        { geom: mergeList(ceramicParts), material: MAT.Platform_Ceramic },
+        { geom: mergeList(slateParts), material: MAT.Chassis_Slate },
+        { geom: mergeList(silverParts), material: MAT.Hardware_Silver },
+        { geom: mergeList(accentParts), material: MAT.Indicator_Official },
       ],
     });
   }
 
-  // 2. Canopy_Port (-Z half) & Canopy_Starboard (+Z half): Split Retractable Quartz Enclosure
-  for (const side of [-1, 1]) {
-    const glassParts = [];
-    const frameParts = [];
-    const latchParts = [];
-
-    const zCenter = side * 0.92;
-    // Top quartz plate (half-width)
-    glassParts.push(prep(chamferedPlate(5.96, 0.045, 1.78, 0.18), trs(0, 0.76, zCenter)));
-    // Angled side quartz wall
-    glassParts.push(prep(new THREE.BoxGeometry(5.84, 0.92, 0.038), trs(0, 0.26, side * 1.80)));
-
-    // Tension ribs & frame rails
-    frameParts.push(prep(new THREE.BoxGeometry(6.02, 0.055, 0.08), trs(0, 0.76, side * 0.05)));
-    frameParts.push(prep(new THREE.BoxGeometry(6.02, 0.065, 0.09), trs(0, 0.75, side * 1.78)));
-    for (const rx of [-2.2, -0.75, 0.75, 2.2]) {
-      frameParts.push(prep(new THREE.BoxGeometry(0.06, 0.055, 1.76), trs(rx, 0.77, zCenter)));
-      latchParts.push(prep(new THREE.BoxGeometry(0.11, 0.08, 0.06), trs(rx, 0.76, side * 1.82)));
-    }
-
-    addNode({
-      name: side < 0 ? 'Canopy_Port' : 'Canopy_Starboard',
-      primitives: [
-        { geom: mergeList(frameParts), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(latchParts), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(glassParts), material: MAT.Borosilicate_Quartz_Shell },
-      ],
-    });
-  }
-
-  // 3. Module_Ingress: Stock Codex `/v1/responses` Optical Collimator (X = -2.62, Y = 0.08, Z = 0)
+  // 2. Module_Ingress: Codex Unified Entry (`127.0.0.1:8787`)
   {
-    const body = [];
-    const accents = [];
+    const slate = [];
+    const silver = [];
     const lens = [];
-    const glow = [];
+    const accent = [];
 
-    // Multi-stepped collimator barrel along X axis (Cylinder default is Y, so rotateZ = PI/2)
-    body.push(prep(new THREE.BoxGeometry(0.46, 0.68, 0.82), trs(-0.18, -0.10, 0)));
-    body.push(prep(new THREE.CylinderGeometry(0.34, 0.38, 0.56, 32), trs(0.08, 0.04, 0, 0, 0, Math.PI / 2)));
-    body.push(prep(new THREE.CylinderGeometry(0.26, 0.30, 0.36, 32), trs(0.44, 0.04, 0, 0, 0, Math.PI / 2)));
-
-    // Knurled focus collar & SMA coax sync connectors
-    for (let k = 0; k < 16; k++) {
-      const a = (k / 16) * Math.PI * 2;
-      accents.push(
-        prep(
-          new THREE.BoxGeometry(0.24, 0.025, 0.025),
-          trs(0.12, 0.04 + Math.cos(a) * 0.355, Math.sin(a) * 0.355, a, 0, 0),
-        ),
-      );
-    }
-    accents.push(prep(new THREE.CylinderGeometry(0.07, 0.07, 0.24, 16), trs(-0.48, 0.16, -0.24, 0, 0, Math.PI / 2)));
-    accents.push(prep(new THREE.CylinderGeometry(0.07, 0.07, 0.24, 16), trs(-0.48, 0.16, 0.24, 0, 0, Math.PI / 2)));
-
-    // Objective crystal & cyan emitter ring
-    lens.push(prep(new THREE.CylinderGeometry(0.21, 0.21, 0.08, 28), trs(0.61, 0.04, 0, 0, 0, Math.PI / 2)));
-    glow.push(prep(new THREE.TorusGeometry(0.25, 0.022, 12, 32), trs(0.62, 0.04, 0, 0, Math.PI / 2, 0)));
-    glow.push(prep(new THREE.TorusGeometry(0.32, 0.018, 12, 32), trs(-0.44, 0.04, 0, 0, Math.PI / 2, 0)));
+    slate.push(prep(chamferedPlate(0.68, 0.44, 0.88, 0.14), trs(-0.08, -0.04, 0)));
+    silver.push(prep(new THREE.CylinderGeometry(0.30, 0.34, 0.46, 32), trs(0.22, 0.06, 0, 0, 0, Math.PI / 2)));
+    silver.push(prep(new THREE.CylinderGeometry(0.065, 0.065, 0.20, 16), trs(-0.42, 0.08, -0.22, 0, 0, Math.PI / 2)));
+    silver.push(prep(new THREE.CylinderGeometry(0.065, 0.065, 0.20, 16), trs(-0.42, 0.08, 0.22, 0, 0, Math.PI / 2)));
+    lens.push(prep(new THREE.CylinderGeometry(0.19, 0.19, 0.06, 28), trs(0.46, 0.06, 0, 0, 0, Math.PI / 2)));
+    accent.push(prep(new THREE.TorusGeometry(0.24, 0.022, 12, 32), trs(0.47, 0.06, 0, 0, Math.PI / 2, 0)));
 
     addNode({
       name: 'Module_Ingress',
-      translation: [-2.62, 0.06, 0],
+      translation: [-2.55, 0.04, 0],
       primitives: [
-        { geom: mergeList(body), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(accents), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(lens), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(glow), material: MAT.Emitter_Cyan_Primary },
+        { geom: mergeList(slate), material: MAT.Chassis_Slate },
+        { geom: mergeList(silver), material: MAT.Hardware_Silver },
+        { geom: mergeList(lens), material: MAT.Crystal_Lens },
+        { geom: mergeList(accent), material: MAT.Indicator_Official },
       ],
     });
   }
 
-  // 4. Module_Registry: Model Catalog & Capability Encoder Wheels (`crates/catalog`)
+  // 3. Module_Registry: Model Catalog Rings (`crates/catalog`)
   {
-    // Child Wheel A (outer encoder ring rotating around X axis)
-    const wheelAGeom = [];
-    const wheelAGlow = [];
-    wheelAGeom.push(prep(hollowRing(0.56, 0.43, 0.07, 44), trs(0, 0, 0, 0, Math.PI / 2, 0)));
-    for (let i = 0; i < 12; i++) {
-      const a = (i / 12) * Math.PI * 2;
-      wheelAGeom.push(
+    const outer = [];
+    const outerAccent = [];
+    outer.push(prep(hollowRing(0.50, 0.39, 0.065, 44), trs(0, 0, 0, 0, Math.PI / 2, 0)));
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      outer.push(
         prep(
-          new THREE.BoxGeometry(0.09, 0.05, 0.035),
-          trs(0, Math.cos(a) * 0.58, Math.sin(a) * 0.58, a, 0, 0),
+          new THREE.BoxGeometry(0.08, 0.045, 0.032),
+          trs(0, Math.cos(a) * 0.515, Math.sin(a) * 0.515, a, 0, 0),
         ),
       );
     }
-    wheelAGlow.push(prep(new THREE.TorusGeometry(0.49, 0.014, 10, 40), trs(0.042, 0, 0, 0, Math.PI / 2, 0)));
+    outerAccent.push(prep(new THREE.TorusGeometry(0.44, 0.015, 10, 40), trs(0.036, 0, 0, 0, Math.PI / 2, 0)));
 
-    const wheelAIdx = addNode({
+    const wheelOuterIdx = addNode({
       name: 'Registry_Wheel_Outer',
-      translation: [-0.08, 0.08, 0],
+      translation: [-0.07, 0.08, 0],
       primitives: [
-        { geom: mergeList(wheelAGeom), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(wheelAGlow), material: MAT.Emitter_Cyan_Primary },
+        { geom: mergeList(outer), material: MAT.Hardware_Silver },
+        { geom: mergeList(outerAccent), material: MAT.Indicator_Official },
       ],
     });
 
-    // Child Wheel B (inner counter-rotating sapphire optical filter disk)
-    const wheelBFrame = [];
-    const wheelBCrystal = [];
-    wheelBFrame.push(prep(hollowRing(0.39, 0.25, 0.06, 36), trs(0, 0, 0, 0, Math.PI / 2, 0)));
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2;
-      wheelBCrystal.push(
-        prep(
-          new THREE.CylinderGeometry(0.065, 0.065, 0.05, 18),
-          trs(0, Math.cos(a) * 0.32, Math.sin(a) * 0.32, 0, 0, Math.PI / 2),
-        ),
-      );
-    }
-    wheelBCrystal.push(prep(new THREE.CylinderGeometry(0.21, 0.21, 0.05, 24), trs(0, 0, 0, 0, 0, Math.PI / 2)));
-
-    const wheelBIdx = addNode({
+    const innerFrame = [];
+    innerFrame.push(prep(hollowRing(0.35, 0.24, 0.055, 36), trs(0, 0, 0, 0, Math.PI / 2, 0)));
+    const wheelInnerIdx = addNode({
       name: 'Registry_Wheel_Inner',
-      translation: [0.09, 0.08, 0],
-      primitives: [
-        { geom: mergeList(wheelBFrame), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(wheelBCrystal), material: MAT.Dichroic_Prism_Crystal },
-      ],
+      translation: [0.07, 0.08, 0],
+      primitives: [{ geom: mergeList(innerFrame), material: MAT.Chassis_Slate }],
     });
 
-    // Static mount cradle for Registry
-    const mountParts = [];
-    mountParts.push(prep(new THREE.BoxGeometry(0.44, 0.16, 1.32), trs(0, -0.26, 0)));
-    mountParts.push(prep(new THREE.BoxGeometry(0.34, 0.72, 0.10), trs(0, 0.04, -0.66)));
-    mountParts.push(prep(new THREE.BoxGeometry(0.34, 0.72, 0.10), trs(0, 0.04, 0.66)));
+    const cradle = [];
+    cradle.push(prep(chamferedPlate(0.42, 0.14, 1.18, 0.10), trs(0, -0.22, 0)));
+    cradle.push(prep(new THREE.BoxGeometry(0.22, 0.54, 0.08), trs(0, 0.02, -0.56)));
+    cradle.push(prep(new THREE.BoxGeometry(0.22, 0.54, 0.08), trs(0, 0.02, 0.56)));
 
     addNode({
       name: 'Module_Registry',
-      translation: [-1.52, 0.02, 0],
-      primitives: [{ geom: mergeList(mountParts), material: MAT.Titanium_Obsidian }],
-      children: [wheelAIdx, wheelBIdx],
+      translation: [-1.48, 0.02, 0],
+      primitives: [{ geom: mergeList(cradle), material: MAT.Chassis_Slate }],
+      children: [wheelOuterIdx, wheelInnerIdx],
     });
   }
 
-  // 5. Module_Crossbar: Per-Turn MEMS Optical Gimbal & Beam Director (`crates/router`)
+  // 4. Module_Crossbar: Open-frame Directional Rotary Switch (`crates/router`)
   {
-    // Innermost mirror & dichroic beam-director cube (Tilts on Pitch / Z)
-    const coreMetal = [];
-    const coreCrystal = [];
-    const coreGlow = [];
-    coreMetal.push(prep(hollowRing(0.34, 0.27, 0.06, 32), trs(0, 0, 0)));
-    // Octagonal precision beam-splitter prism
-    coreCrystal.push(prep(new THREE.CylinderGeometry(0.23, 0.23, 0.32, 8), trs(0, 0, 0)));
-    coreCrystal.push(prep(new THREE.BoxGeometry(0.30, 0.30, 0.035), trs(0, 0, 0, 0, Math.PI / 4, 0)));
-    coreGlow.push(prep(new THREE.TorusGeometry(0.24, 0.015, 10, 32), trs(0, 0.17, 0, Math.PI / 2, 0, 0)));
-    coreGlow.push(prep(new THREE.TorusGeometry(0.24, 0.015, 10, 32), trs(0, -0.17, 0, Math.PI / 2, 0, 0)));
+    const pitchMetal = [];
+    const pitchLens = [];
+    const pitchPointer = [];
+
+    // Rotary prism block + sleek directional pointer fin pointing downstream (+X)
+    pitchMetal.push(prep(hollowRing(0.29, 0.22, 0.06, 32), trs(0, 0, 0)));
+    pitchLens.push(prep(new THREE.CylinderGeometry(0.20, 0.20, 0.24, 8), trs(0, 0, 0)));
+    pitchPointer.push(prep(new THREE.BoxGeometry(0.34, 0.06, 0.055), trs(0.28, 0, 0)));
+    pitchPointer.push(prep(new THREE.TorusGeometry(0.21, 0.016, 10, 32), trs(0, 0.13, 0, Math.PI / 2, 0, 0)));
 
     const pitchIdx = addNode({
       name: 'Crossbar_Gimbal_Pitch',
       translation: [0, 0, 0],
       primitives: [
-        { geom: mergeList(coreMetal), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(coreCrystal), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(coreGlow), material: MAT.Emitter_Cyan_Primary },
+        { geom: mergeList(pitchMetal), material: MAT.Hardware_Silver },
+        { geom: mergeList(pitchLens), material: MAT.Crystal_Lens },
+        { geom: mergeList(pitchPointer), material: MAT.Indicator_Official },
       ],
     });
 
-    // Outer Yaw Gimbal Ring (Rotates around Y to steer beam between -Z Official, 0 Bridge, +Z Local)
     const yawMetal = [];
-    yawMetal.push(prep(hollowRing(0.48, 0.40, 0.075, 40), trs(0, 0, 0, Math.PI / 2, 0, 0)));
-    yawMetal.push(prep(new THREE.CylinderGeometry(0.03, 0.03, 0.98, 12), trs(0, 0, 0, Math.PI / 2, 0, 0)));
+    yawMetal.push(prep(hollowRing(0.43, 0.35, 0.07, 40), trs(0, 0, 0, Math.PI / 2, 0, 0)));
+    yawMetal.push(prep(new THREE.CylinderGeometry(0.028, 0.028, 0.88, 12), trs(0, 0, 0, Math.PI / 2, 0, 0)));
 
     const yawIdx = addNode({
       name: 'Crossbar_Gimbal_Yaw',
-      translation: [0, 0.12, 0],
-      primitives: [{ geom: mergeList(yawMetal), material: MAT.Titanium_Brushed_Gunmetal }],
+      translation: [0, 0.11, 0],
+      primitives: [{ geom: mergeList(yawMetal), material: MAT.Hardware_Silver }],
       children: [pitchIdx],
     });
 
-    // Crossbar Pedestal & 4 Corner MEMS Coil Actuators
     const baseParts = [];
-    const copperParts = [];
-    baseParts.push(prep(chamferedPlate(1.08, 0.14, 1.18, 0.16), trs(0, -0.26, 0)));
-    baseParts.push(prep(new THREE.CylinderGeometry(0.54, 0.60, 0.10, 32), trs(0, -0.16, 0)));
-    // Overhead bridge arch holding yaw spindle
-    baseParts.push(prep(new THREE.BoxGeometry(0.14, 0.68, 0.12), trs(0, 0.14, -0.54)));
-    baseParts.push(prep(new THREE.BoxGeometry(0.14, 0.68, 0.12), trs(0, 0.14, 0.54)));
-    baseParts.push(prep(new THREE.BoxGeometry(0.16, 0.08, 1.20), trs(0, 0.50, 0)));
+    const copperAccents = [];
+    baseParts.push(prep(chamferedPlate(1.02, 0.14, 1.08, 0.16), trs(0, -0.22, 0)));
+    baseParts.push(prep(new THREE.CylinderGeometry(0.48, 0.54, 0.09, 32), trs(0, -0.13, 0)));
+    // Slim open arch holding rotary spindle
+    baseParts.push(prep(new THREE.BoxGeometry(0.11, 0.58, 0.09), trs(0, 0.12, -0.49)));
+    baseParts.push(prep(new THREE.BoxGeometry(0.11, 0.58, 0.09), trs(0, 0.12, 0.49)));
+    baseParts.push(prep(new THREE.BoxGeometry(0.13, 0.07, 1.06), trs(0, 0.43, 0)));
 
-    for (const [ax, az] of [[-0.40, -0.42], [0.40, -0.42], [-0.40, 0.42], [0.40, 0.42]]) {
-      copperParts.push(prep(new THREE.CylinderGeometry(0.085, 0.085, 0.22, 20), trs(ax, -0.06, az)));
+    for (const [ax, az] of [[-0.36, -0.38], [0.36, -0.38], [-0.36, 0.38], [0.36, 0.38]]) {
+      copperAccents.push(prep(new THREE.CylinderGeometry(0.068, 0.068, 0.14, 20), trs(ax, -0.07, az)));
     }
 
     addNode({
       name: 'Module_Crossbar',
       translation: [-0.36, 0.02, 0],
       primitives: [
-        { geom: mergeList(baseParts), material: MAT.Titanium_Obsidian },
-        { geom: mergeList(copperParts), material: MAT.Copper_Coil_Anodized },
+        { geom: mergeList(baseParts), material: MAT.Chassis_Slate },
+        { geom: mergeList(copperAccents), material: MAT.Hardware_Copper },
       ],
       children: [yawIdx],
     });
   }
 
-  // 6. Channel_Official_Bypass: Zero-Translation Sapphire Vacuum Waveguide (Z = -1.12)
+  // 5. Channel_Official_Bypass: Upper Straight Direct Rail (Z = -1.12)
   {
     const posts = [];
-    const sapphireTube = [];
-    const cyanRings = [];
+    const rail = [];
+    const cyan = [];
 
-    // Runs cleanly from X = -0.05 to X = +2.25 along Z = -1.12
-    sapphireTube.push(
-      prep(new THREE.CylinderGeometry(0.095, 0.095, 2.28, 24), trs(1.10, 0.14, -1.12, 0, 0, Math.PI / 2)),
-    );
-    // Turning mirror relay at (-0.36, 0.14, -1.12) catching the -Z deflected beam from Crossbar!
-    posts.push(prep(new THREE.CylinderGeometry(0.16, 0.19, 0.42, 20), trs(-0.36, -0.08, -1.12)));
-    sapphireTube.push(
-      prep(new THREE.BoxGeometry(0.28, 0.26, 0.045), trs(-0.36, 0.14, -1.12, 0, Math.PI / 4, 0)),
-    );
+    posts.push(prep(new THREE.CylinderGeometry(0.14, 0.17, 0.36, 20), trs(-0.36, -0.06, -1.12)));
+    rail.push(prep(new THREE.CylinderGeometry(0.065, 0.065, 2.38, 20), trs(1.02, 0.12, -1.12, 0, 0, Math.PI / 2)));
 
-    for (const px of [0.25, 1.10, 1.95]) {
-      posts.push(prep(new THREE.BoxGeometry(0.12, 0.36, 0.26), trs(px, -0.12, -1.12)));
-      cyanRings.push(prep(new THREE.TorusGeometry(0.125, 0.018, 10, 24), trs(px, 0.14, -1.12, 0, Math.PI / 2, 0)));
+    for (const px of [0.22, 1.05, 1.88]) {
+      posts.push(prep(new THREE.BoxGeometry(0.10, 0.30, 0.22), trs(px, -0.08, -1.12)));
+      cyan.push(prep(new THREE.TorusGeometry(0.11, 0.018, 10, 24), trs(px, 0.12, -1.12, 0, Math.PI / 2, 0)));
     }
 
     addNode({
       name: 'Channel_Official_Bypass',
       primitives: [
-        { geom: mergeList(posts), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(sapphireTube), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(cyanRings), material: MAT.Emitter_Cyan_Primary },
+        { geom: mergeList(posts), material: MAT.Chassis_Slate },
+        { geom: mergeList(rail), material: MAT.Hardware_Silver },
+        { geom: mergeList(cyan), material: MAT.Indicator_Official },
       ],
     });
   }
 
-  // 7. Module_ProtocolBridge: 3-Element Brewster Dispersion Prism Stack (`crates/protocol-bridge`)
+  // 6. Module_ProtocolBridge: Clean Protocol Translator Bay (X = +1.06, Z = 0)
   {
-    const stageMetal = [];
-    const goldScrews = [];
-    const prisms = [];
-    const bridgeGlow = [];
+    const stageSlate = [];
+    const silverMounts = [];
+    const lenses = [];
+    const plumRings = [];
 
-    stageMetal.push(prep(chamferedPlate(1.68, 0.12, 0.96, 0.14), trs(0, -0.26, 0)));
-
-    // 3 Equilateral triangular Brewster prisms on micro-stages
-    const prismConfigs = [
-      { x: -0.50, z: -0.08, ry: 0.22 },
-      { x: 0.0, z: 0.09, ry: -0.26 + Math.PI },
-      { x: 0.50, z: -0.06, ry: 0.18 },
-    ];
-    for (const p of prismConfigs) {
-      stageMetal.push(prep(new THREE.CylinderGeometry(0.23, 0.26, 0.10, 24), trs(p.x, -0.16, p.z)));
-      goldScrews.push(prep(new THREE.CylinderGeometry(0.032, 0.032, 0.16, 12), trs(p.x, -0.15, p.z + 0.29, Math.PI / 2, 0, 0)));
-      // 3-sided optical dispersion prism
-      prisms.push(prep(new THREE.CylinderGeometry(0.24, 0.24, 0.44, 3), trs(p.x, 0.11, p.z, 0, p.ry, 0)));
-      bridgeGlow.push(prep(new THREE.TorusGeometry(0.22, 0.013, 8, 24), trs(p.x, -0.10, p.z, Math.PI / 2, 0, 0)));
+    stageSlate.push(prep(chamferedPlate(1.56, 0.11, 0.86, 0.14), trs(0, -0.22, 0)));
+    for (const p of [
+      { x: -0.46, ry: 0.28 },
+      { x: 0.0, ry: -0.32 },
+      { x: 0.46, ry: 0.24 },
+    ]) {
+      silverMounts.push(prep(new THREE.CylinderGeometry(0.20, 0.22, 0.09, 24), trs(p.x, -0.14, 0)));
+      // Clean vertical thin translator lens disc framed by metallic ring
+      silverMounts.push(prep(hollowRing(0.20, 0.15, 0.04, 28), trs(p.x, 0.12, 0, 0, Math.PI / 2 + p.ry, 0)));
+      lenses.push(prep(new THREE.CylinderGeometry(0.15, 0.15, 0.032, 24), trs(p.x, 0.12, 0, 0, p.ry, Math.PI / 2)));
+      plumRings.push(prep(new THREE.TorusGeometry(0.20, 0.014, 8, 24), trs(p.x, -0.08, 0, Math.PI / 2, 0, 0)));
     }
-
-    // Waveplate canonicalizer gate at exit of bridge
-    stageMetal.push(prep(hollowRing(0.24, 0.17, 0.05, 28), trs(0.80, 0.12, 0, 0, Math.PI / 2, 0)));
-    prisms.push(prep(new THREE.CylinderGeometry(0.17, 0.17, 0.03, 24), trs(0.80, 0.12, 0, 0, 0, Math.PI / 2)));
 
     addNode({
       name: 'Module_ProtocolBridge',
-      translation: [1.08, 0.02, 0],
+      translation: [1.06, 0.02, 0],
       primitives: [
-        { geom: mergeList(stageMetal), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(goldScrews), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(prisms), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(bridgeGlow), material: MAT.Emitter_Violet_Bridge },
+        { geom: mergeList(stageSlate), material: MAT.Chassis_Slate },
+        { geom: mergeList(silverMounts), material: MAT.Hardware_Silver },
+        { geom: mergeList(lenses), material: MAT.Crystal_Lens },
+        { geom: mergeList(plumRings), material: MAT.Indicator_Bridge },
       ],
     });
   }
 
-  // 8. Module_KeychainVault & Auth_Isolation_Barrier (`crates/credentials`)
+  // 7. Module_KeychainVault + Physical Isolation Divider (`crates/credentials`)
   {
-    // Rotating 6-lug Vault Breach Dial
     const rotorMetal = [];
-    const rotorGlow = [];
-    rotorMetal.push(prep(hollowRing(0.32, 0.12, 0.06, 30), trs(0, 0, 0, Math.PI / 2, 0, 0)));
+    const rotorAccent = [];
+    rotorMetal.push(prep(hollowRing(0.29, 0.11, 0.055, 30), trs(0, 0, 0, Math.PI / 2, 0, 0)));
     for (let i = 0; i < 6; i++) {
       const a = (i / 6) * Math.PI * 2;
       rotorMetal.push(
         prep(
-          new THREE.BoxGeometry(0.065, 0.055, 0.14),
-          trs(Math.cos(a) * 0.24, 0.02, Math.sin(a) * 0.24, 0, -a, 0),
+          new THREE.BoxGeometry(0.055, 0.05, 0.12),
+          trs(Math.cos(a) * 0.21, 0.018, Math.sin(a) * 0.21, 0, -a, 0),
         ),
       );
     }
-    rotorGlow.push(prep(new THREE.TorusGeometry(0.19, 0.016, 10, 28), trs(0, 0.035, 0, Math.PI / 2, 0, 0)));
+    rotorAccent.push(prep(new THREE.TorusGeometry(0.17, 0.016, 10, 28), trs(0, 0.032, 0, Math.PI / 2, 0, 0)));
 
     const vaultRotorIdx = addNode({
       name: 'Vault_LockDial',
-      translation: [-0.36, 0.29, 0],
+      translation: [-0.24, 0.25, 0],
       primitives: [
-        { geom: mergeList(rotorMetal), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(rotorGlow), material: MAT.Emitter_Amber_Vault },
+        { geom: mergeList(rotorMetal), material: MAT.Hardware_Copper },
+        { geom: mergeList(rotorAccent), material: MAT.Indicator_Vault },
       ],
     });
 
-    // Armored Faraday Cryo-Vault Body + Titanium Auth Isolation Bulkhead
     const vaultBody = [];
     const vaultRibs = [];
-    const vaultGlow = [];
+    const vaultAccent = [];
 
-    vaultBody.push(prep(chamferedPlate(1.06, 0.14, 0.78, 0.12), trs(-0.36, -0.26, 0)));
-    vaultBody.push(prep(new THREE.CylinderGeometry(0.38, 0.40, 0.46, 32), trs(-0.36, 0.02, 0)));
-    for (let r = -2; r <= 2; r++) {
-      vaultRibs.push(prep(new THREE.TorusGeometry(0.40, 0.018, 10, 32), trs(-0.36, 0.02 + r * 0.08, 0, Math.PI / 2, 0, 0)));
+    vaultBody.push(prep(chamferedPlate(0.92, 0.12, 0.72, 0.12), trs(-0.24, -0.22, 0)));
+    vaultBody.push(prep(new THREE.CylinderGeometry(0.34, 0.36, 0.40, 32), trs(-0.24, 0.01, 0)));
+    for (let r = -1; r <= 1; r++) {
+      vaultRibs.push(prep(new THREE.TorusGeometry(0.36, 0.016, 10, 32), trs(-0.24, 0.02 + r * 0.09, 0, Math.PI / 2, 0, 0)));
     }
-    // Physical Air-Gap Bulkhead between Official OAuth lane (Z = -1.12) and Third-Party lane (Z = 0)
-    // Placed in world around Z = -0.62 -> relative to Vault (Z = +1.34) is Z = -1.96
-    vaultBody.push(prep(new THREE.BoxGeometry(2.65, 0.46, 0.055), trs(0.48, -0.04, -1.96)));
-    vaultRibs.push(prep(new THREE.BoxGeometry(2.68, 0.04, 0.085), trs(0.48, 0.20, -1.96)));
-    vaultGlow.push(prep(new THREE.BoxGeometry(2.56, 0.018, 0.068), trs(0.48, 0.14, -1.96)));
+    // Crisp physical separation wall between Official Lane (Z = -1.12) and Third-Party Lanes (Z >= 0)
+    vaultBody.push(prep(new THREE.BoxGeometry(2.45, 0.34, 0.055), trs(0.55, -0.06, -1.86)));
+    vaultRibs.push(prep(new THREE.BoxGeometry(2.48, 0.036, 0.08), trs(0.55, 0.12, -1.86)));
+    vaultAccent.push(prep(new THREE.BoxGeometry(2.38, 0.016, 0.065), trs(0.55, 0.07, -1.86)));
 
     addNode({
       name: 'Module_KeychainVault',
-      translation: [0.22, 0.02, 1.34],
+      translation: [0.22, 0.02, 1.24],
       primitives: [
-        { geom: mergeList(vaultBody), material: MAT.Titanium_Obsidian },
-        { geom: mergeList(vaultRibs), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(vaultGlow), material: MAT.Emitter_Amber_Vault },
+        { geom: mergeList(vaultBody), material: MAT.Chassis_Slate },
+        { geom: mergeList(vaultRibs), material: MAT.Hardware_Silver },
+        { geom: mergeList(vaultAccent), material: MAT.Indicator_Vault },
       ],
       children: [vaultRotorIdx],
     });
   }
 
-  // 9. Module_LocalLoop: Toroidal Loopback Resonator (`127.0.0.1` Local Inference)
+  // 8. Module_LocalLoop: Local Offline Loopback Ring (`127.0.0.1`, Lower Lane Z = +1.12)
   {
-    const loopMount = [];
+    const baseSlate = [];
     const copperCoils = [];
-    const emeraldGlow = [];
-    const crystalCore = [];
+    const emeraldRing = [];
 
-    loopMount.push(prep(chamferedPlate(1.08, 0.12, 0.84, 0.14), trs(0, -0.26, 0)));
-    // Toroidal waveguide ring
-    crystalCore.push(prep(new THREE.TorusGeometry(0.32, 0.068, 18, 40), trs(0, 0.08, 0, Math.PI / 2, 0, 0)));
-    // 12 copper toroidal windings around the resonator
-    for (let i = 0; i < 12; i++) {
-      const a = (i / 12) * Math.PI * 2;
+    baseSlate.push(prep(chamferedPlate(0.96, 0.11, 0.78, 0.14), trs(0, -0.22, 0)));
+    baseSlate.push(prep(new THREE.TorusGeometry(0.28, 0.058, 16, 38), trs(0, 0.07, 0, Math.PI / 2, 0, 0)));
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2;
       copperCoils.push(
         prep(
-          new THREE.TorusGeometry(0.082, 0.016, 8, 18),
-          trs(Math.cos(a) * 0.32, 0.08, Math.sin(a) * 0.32, 0, -a, 0),
+          new THREE.TorusGeometry(0.074, 0.015, 8, 18),
+          trs(Math.cos(a) * 0.28, 0.07, Math.sin(a) * 0.28, 0, -a, 0),
         ),
       );
     }
-    emeraldGlow.push(prep(new THREE.TorusGeometry(0.32, 0.020, 10, 40), trs(0, 0.15, 0, Math.PI / 2, 0, 0)));
-
-    // Relay mirror at Crossbar Z = +1.12 lane
-    loopMount.push(prep(new THREE.CylinderGeometry(0.15, 0.18, 0.38, 18), trs(-1.82, -0.09, -0.14)));
-    crystalCore.push(prep(new THREE.BoxGeometry(0.26, 0.24, 0.04), trs(-1.82, 0.12, -0.14, 0, -Math.PI / 4, 0)));
+    emeraldRing.push(prep(new THREE.TorusGeometry(0.28, 0.018, 10, 38), trs(0, 0.135, 0, Math.PI / 2, 0, 0)));
+    baseSlate.push(prep(new THREE.CylinderGeometry(0.14, 0.16, 0.34, 18), trs(-1.82, -0.06, -0.06)));
 
     addNode({
       name: 'Module_LocalLoop',
-      translation: [1.46, 0.02, 1.26],
+      translation: [1.46, 0.02, 1.18],
       primitives: [
-        { geom: mergeList(loopMount), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(copperCoils), material: MAT.Copper_Coil_Anodized },
-        { geom: mergeList(crystalCore), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(emeraldGlow), material: MAT.Emitter_Emerald_Local },
+        { geom: mergeList(baseSlate), material: MAT.Chassis_Slate },
+        { geom: mergeList(copperCoils), material: MAT.Hardware_Copper },
+        { geom: mergeList(emeraldRing), material: MAT.Indicator_Local },
       ],
     });
   }
 
-  // 10. Manifold_Egress: Tri-Channel Output Optical Terminators (X = +2.66)
+  // 9. Manifold_Egress: Clean 3-Port Output Collector (X = +2.55)
   {
-    const body = [];
-    const hardware = [];
-    const lenses = [];
-    const portOfficialGlow = [];
-    const portBridgeGlow = [];
-    const portLocalGlow = [];
+    const slate = [];
+    const silver = [];
+    const glowOfficial = [];
+    const glowBridge = [];
+    const glowLocal = [];
 
-    // Manifold spine
-    body.push(prep(new THREE.BoxGeometry(0.38, 0.64, 3.06), trs(-0.12, -0.04, 0)));
+    slate.push(prep(chamferedPlate(0.42, 0.44, 2.90, 0.12), trs(-0.08, -0.04, 0)));
 
     const ports = [
-      { z: -1.12, glowArr: portOfficialGlow },
-      { z: 0.0, glowArr: portBridgeGlow },
-      { z: 1.12, glowArr: portLocalGlow },
+      { z: -1.12, arr: glowOfficial },
+      { z: 0.0, arr: glowBridge },
+      { z: 1.12, arr: glowLocal },
     ];
     for (const p of ports) {
-      body.push(prep(new THREE.CylinderGeometry(0.26, 0.30, 0.44, 28), trs(0.14, 0.12, p.z, 0, 0, Math.PI / 2)));
-      hardware.push(prep(new THREE.CylinderGeometry(0.21, 0.23, 0.22, 28), trs(0.42, 0.12, p.z, 0, 0, Math.PI / 2)));
-      lenses.push(prep(new THREE.CylinderGeometry(0.16, 0.16, 0.06, 24), trs(0.52, 0.12, p.z, 0, 0, Math.PI / 2)));
-      p.glowArr.push(prep(new THREE.TorusGeometry(0.19, 0.020, 12, 28), trs(0.53, 0.12, p.z, 0, Math.PI / 2, 0)));
+      silver.push(prep(new THREE.CylinderGeometry(0.22, 0.25, 0.38, 28), trs(0.12, 0.09, p.z, 0, 0, Math.PI / 2)));
+      p.arr.push(prep(new THREE.TorusGeometry(0.18, 0.022, 12, 28), trs(0.32, 0.09, p.z, 0, Math.PI / 2, 0)));
     }
 
     addNode({
       name: 'Manifold_Egress',
-      translation: [2.64, 0.02, 0],
+      translation: [2.52, 0.02, 0],
       primitives: [
-        { geom: mergeList(body), material: MAT.Titanium_Brushed_Gunmetal },
-        { geom: mergeList(hardware), material: MAT.Titanium_Champagne_Hardware },
-        { geom: mergeList(lenses), material: MAT.Dichroic_Prism_Crystal },
-        { geom: mergeList(portOfficialGlow), material: MAT.Emitter_Cyan_Primary },
-        { geom: mergeList(portBridgeGlow), material: MAT.Emitter_Violet_Bridge },
-        { geom: mergeList(portLocalGlow), material: MAT.Emitter_Emerald_Local },
+        { geom: mergeList(slate), material: MAT.Chassis_Slate },
+        { geom: mergeList(silver), material: MAT.Hardware_Silver },
+        { geom: mergeList(glowOfficial), material: MAT.Indicator_Official },
+        { geom: mergeList(glowBridge), material: MAT.Indicator_Bridge },
+        { geom: mergeList(glowLocal), material: MAT.Indicator_Local },
       ],
     });
   }
 
-  // Root node collecting top-level assemblies (those not already referenced as children)
   const childSet = new Set();
   for (const n of nodes) {
     for (const c of n.children) childSet.add(c);
@@ -666,16 +527,12 @@ function buildPhotonicMatrixHierarchy() {
   }
 
   const rootIdx = addNode({
-    name: 'OmniBridge_Photonic_Matrix_MkIV',
+    name: 'OmniBridge_Router_Stage',
     children: topChildren,
   });
 
   return { nodes, rootIdx };
 }
-
-/* -------------------------------------------------------------------------- */
-/*  Spec-Compliant Binary glTF 2.0 (.glb) Writer                              */
-/* -------------------------------------------------------------------------- */
 
 function exportToGLB({ nodes, rootIdx }) {
   const bufferViews = [];
@@ -744,20 +601,20 @@ function exportToGLB({ nodes, rootIdx }) {
           if (py > max[1]) max[1] = py;
           if (pz > max[2]) max[2] = pz;
 
-          let nx = normAttr.getX(i);
-          let ny = normAttr.getY(i);
-          let nz = normAttr.getZ(i);
+          const nx = normAttr.getX(i);
+          const ny = normAttr.getY(i);
+          const nz = normAttr.getZ(i);
           const len = Math.hypot(nx, ny, nz) || 1;
           normArr[i * 3] = nx / len;
           normArr[i * 3 + 1] = ny / len;
           normArr[i * 3 + 2] = nz / len;
         }
 
-        const posView = pushChunk(posArr, 34962); // ARRAY_BUFFER
+        const posView = pushChunk(posArr, 34962);
         const posAcc = accessors.length;
         accessors.push({
           bufferView: posView,
-          componentType: 5126, // FLOAT
+          componentType: 5126,
           count,
           type: 'VEC3',
           min,
@@ -780,11 +637,11 @@ function exportToGLB({ nodes, rootIdx }) {
           for (let i = 0; i < indexCount; i++) {
             idxArr[i] = idxAttr.getX(i);
           }
-          const idxView = pushChunk(idxArr, 34963); // ELEMENT_ARRAY_BUFFER
+          const idxView = pushChunk(idxArr, 34963);
           indicesAcc = accessors.length;
           accessors.push({
             bufferView: idxView,
-            componentType: useU32 ? 5125 : 5123, // UNSIGNED_INT : UNSIGNED_SHORT
+            componentType: useU32 ? 5125 : 5123,
             count: indexCount,
             type: 'SCALAR',
           });
@@ -797,7 +654,7 @@ function exportToGLB({ nodes, rootIdx }) {
           },
           ...(indicesAcc !== undefined ? { indices: indicesAcc } : {}),
           material: prim.material,
-          mode: 4, // TRIANGLES
+          mode: 4,
         });
       }
 
@@ -832,13 +689,13 @@ function exportToGLB({ nodes, rootIdx }) {
   const gltfJson = {
     asset: {
       version: '2.0',
-      generator: 'Codex OmniBridge Parametric CAD GLB Synthesizer',
+      generator: 'Codex OmniBridge Router Stage GLB Synthesizer',
       copyright: 'MIT License - Codex OmniBridge',
     },
     scene: 0,
     scenes: [
       {
-        name: 'PhotonicSwitchingMatrixScene',
+        name: 'OmniBridgeRouterStageScene',
         nodes: [rootIdx],
       },
     ],
@@ -857,28 +714,28 @@ function exportToGLB({ nodes, rootIdx }) {
   let jsonBytes = Buffer.from(JSON.stringify(gltfJson), 'utf8');
   const jsonPad = (4 - (jsonBytes.length % 4)) % 4;
   if (jsonPad > 0) {
-    jsonBytes = Buffer.concat([jsonBytes, Buffer.alloc(jsonPad, 0x20)]); // pad JSON with spaces
+    jsonBytes = Buffer.concat([jsonBytes, Buffer.alloc(jsonPad, 0x20)]);
   }
 
   const totalLength = 12 + 8 + jsonBytes.length + 8 + binBuffer.length;
   const header = Buffer.alloc(12);
-  header.writeUInt32LE(0x46546c67, 0); // 'glTF'
-  header.writeUInt32LE(2, 4); // version 2
+  header.writeUInt32LE(0x46546c67, 0);
+  header.writeUInt32LE(2, 4);
   header.writeUInt32LE(totalLength, 8);
 
   const jsonChunkHeader = Buffer.alloc(8);
   jsonChunkHeader.writeUInt32LE(jsonBytes.length, 0);
-  jsonChunkHeader.writeUInt32LE(0x4e4f534a, 4); // 'JSON'
+  jsonChunkHeader.writeUInt32LE(0x4e4f534a, 4);
 
   const binChunkHeader = Buffer.alloc(8);
   binChunkHeader.writeUInt32LE(binBuffer.length, 0);
-  binChunkHeader.writeUInt32LE(0x004e4942, 4); // 'BIN\0'
+  binChunkHeader.writeUInt32LE(0x004e4942, 4);
 
   const glb = Buffer.concat([header, jsonChunkHeader, jsonBytes, binChunkHeader, binBuffer]);
   return { glb, totalVertices, totalTriangles, nodeCount: gltfNodes.length, meshCount: meshes.length };
 }
 
-const hierarchy = buildPhotonicMatrixHierarchy();
+const hierarchy = buildRouterStageHierarchy();
 const { glb, totalVertices, totalTriangles, nodeCount, meshCount } = exportToGLB(hierarchy);
 
 fs.mkdirSync(path.dirname(OUT_PATH), { recursive: true });

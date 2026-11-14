@@ -1,6 +1,7 @@
 /* ==========================================================================
-   Codex OmniBridge Official Website — Optical Lab + M3 Expressive Tokens
-   Self-hosted variable fonts (zero external CDN requests) + CIELAB HCT roles
+   Codex OmniBridge Official Website — M3 Expressive Design Tokens
+   1:1 aligned with `apps/panel/tokens.css` (#00A6B8 CIELAB seed palette).
+   Self-hosted variable fonts only (zero external CDN requests).
    ========================================================================== */
 
 @font-face {
@@ -107,46 +108,84 @@
 .m3-i-visibility::before { content: "\e417"; }
 .m3-i-visibility-off::before { content: "\e8f5"; }
 
-:root {
-  /* Typography stacks */
+/* ==========================================================================
+   Default Light Scheme (matches Codex OmniBridge software baseline)
+   ========================================================================== */
+:root,
+:root[data-site-theme="light"] {
   --omni-font-sans: "Roboto Flex", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
     "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --omni-font-mono: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Monaco,
     Consolas, "Liberation Mono", "Noto Sans SC", monospace;
 
-  /* Precision Photonic Bench Atmosphere (Dark Optical Vacuum) */
-  --omni-bg-void: #030a0c;
-  --omni-bg-bench: #071215;
-  --omni-surface-glass: rgba(8, 20, 23, 0.76);
-  --omni-surface-glass-strong: rgba(10, 24, 28, 0.90);
-  --omni-surface-elevated: rgba(16, 34, 39, 0.86);
-  --omni-surface-card: rgba(9, 22, 26, 0.82);
+  /* M3 Surfaces (#00A6B8 CIELAB Tonal Palette) */
+  --md-sys-color-background: #f6feff;
+  --md-sys-color-surface: #f0fbfd;
+  --md-sys-color-surface-container-lowest: #ffffff;
+  --md-sys-color-surface-container-low: #eaf6f8;
+  --md-sys-color-surface-container: #e5f0f2;
+  --md-sys-color-surface-container-high: #dfeaec;
+  --md-sys-color-surface-container-highest: #d9e4e6;
+  --md-sys-color-on-surface: #151d1e;
+  --md-sys-color-on-surface-variant: #374a4d;
+  --md-sys-color-on-surface-subtle: #506467;
+  --md-sys-color-outline: #667b7e;
+  --md-sys-color-outline-variant: #b4cace;
 
-  /* Text hierarchy — WCAG AA+ contrast verified against #071215 */
-  --omni-text-primary: #ebf7f9;
-  --omni-text-secondary: #b3ccd1;
-  --omni-text-muted: #7f9ba1;
+  /* M3 Primary / Secondary / Tertiary / Status */
+  --md-sys-color-primary: #006874;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #96f0ff;
+  --md-sys-color-on-primary-container: #001f24;
+  --md-sys-color-secondary: #38656c;
+  --md-sys-color-secondary-container: #bcebf3;
+  --md-sys-color-on-secondary-container: #001f24;
+  --md-sys-color-tertiary: #485f85;
+  --md-sys-color-tertiary-container: #d6e3ff;
+  --md-sys-color-on-tertiary-container: #001c38;
+  --md-sys-color-warning: #835500;
+  --md-sys-color-warning-container: #ffddb6;
+  --md-sys-color-on-warning-container: #271900;
+  --md-sys-color-error: #a33b3d;
+  --md-sys-color-error-container: #ffdad7;
+  --md-sys-color-on-error-container: #410001;
+  --md-sys-color-inverse-surface: #293233;
+  --md-sys-color-inverse-on-surface: #e8f3f5;
 
-  /* Optical Spectral Wavelength Accents */
-  --omni-cyan: #00daf2;
-  --omni-cyan-soft: #96f0ff;
-  --omni-cyan-deep: #004f58;
-  --omni-violet: #d97bff;
-  --omni-amber: #feb958;
-  --omni-emerald: #4ef09c;
-  --omni-blue: #5cb3ff;
-  --omni-coral: #ffb3ae;
+  /* Semantic 3-Lane Routing Accents (Contrast-verified on Light surfaces) */
+  --route-official-fg: #006874;
+  --route-official-bg: #ccf6ff;
+  --route-official-on-bg: #001f24;
+  --route-official-dot: #008291;
 
-  /* Active dynamic route wavelength (updated via JS on model switch) */
-  --omni-active-accent: #00daf2;
-  --omni-active-secondary: #96f0ff;
+  --route-bridge-fg: #7b4384;
+  --route-bridge-bg: #f9dcff;
+  --route-bridge-on-bg: #310039;
+  --route-bridge-dot: #8e4f97;
 
-  /* Hairlines & specular borders */
-  --omni-border-subtle: rgba(150, 240, 255, 0.13);
-  --omni-border-strong: rgba(0, 218, 242, 0.36);
-  --omni-shadow-instrument:
-    0 24px 64px rgba(0, 0, 0, 0.62),
-    0 1px 0 rgba(188, 235, 243, 0.10) inset;
+  --route-local-fg: #2b6832;
+  --route-local-bg: #c8f2c8;
+  --route-local-on-bg: #07210c;
+  --route-local-dot: #357b3d;
+
+  /* Dynamic active route indicator (updated via JS) */
+  --omni-active-accent: #006874;
+  --omni-active-container: #ccf6ff;
+  --omni-active-on-container: #001f24;
+
+  /* Code / terminal surface (kept subtly tonal in light mode, clean high contrast) */
+  --omni-code-bg: #102024;
+  --omni-code-head: #172b30;
+  --omni-code-border: #2b4449;
+  --omni-code-text: #e2f5f8;
+  --omni-code-muted: #98b9bf;
+
+  /* Soft M3 Tonal Elevation */
+  --omni-shadow-sm: 0 1px 3px rgba(0, 42, 48, 0.07), 0 4px 12px rgba(0, 42, 48, 0.04);
+  --omni-shadow-md: 0 6px 22px rgba(0, 42, 48, 0.08), 0 2px 6px rgba(0, 42, 48, 0.04);
+  --omni-header-glass: rgba(246, 254, 255, 0.88);
+  --omni-stage-bg: #eaf6f8;
+  --omni-pin-bg: rgba(255, 255, 255, 0.92);
 
   /* Authentic M3 Expressive Damped-Harmonic Spring Curves */
   --md-sys-motion-spring-fast-spatial: linear(0, 0.0368, 0.1298, 0.2563, 0.3975, 0.5394, 0.6719, 0.7885, 0.8858, 0.9626, 1.0196, 1.0586, 1.0821, 1.093, 1.0943, 1.0886, 1.0785, 1.0658, 1.0523, 1.039, 1.027, 1.0165, 1.008, 1.0014, 0.9966, 0.9935, 0.9917, 0.991, 0.9912, 0.9919, 0.993, 0.9942, 0.9955, 0.9967, 0.9978, 0.9987, 0.9995, 1, 1.0004, 1.0007, 1);
@@ -156,9 +195,78 @@
   --md-sys-motion-spring-fast-effects: linear(0, 0.0133, 0.0475, 0.0957, 0.1526, 0.2142, 0.2775, 0.3406, 0.4018, 0.4602, 0.5151, 0.5661, 0.6132, 0.6563, 0.6954, 0.7308, 0.7626, 0.7911, 0.8165, 0.8391, 0.8592, 0.8769, 0.8926, 0.9063, 0.9185, 0.9291, 0.9384, 0.9465, 0.9536, 0.9598, 0.9652, 0.9699, 0.974, 0.9776, 0.9806, 0.9833, 0.9856, 0.9876, 0.9893, 0.9908, 1);
   --md-sys-motion-spring-fast-effects-duration: 140ms;
 
-  /* Layout measurements */
-  --omni-max-width: 1380px;
+  --omni-max-width: 1320px;
   --omni-header-h: 68px;
+
+  color-scheme: light;
+}
+
+/* ==========================================================================
+   Dark Scheme (consistent #00A6B8 CIELAB dark tones)
+   ========================================================================== */
+:root[data-site-theme="dark"] {
+  --md-sys-color-background: #0b1516;
+  --md-sys-color-surface: #0b1516;
+  --md-sys-color-surface-container-lowest: #061012;
+  --md-sys-color-surface-container-low: #131d1f;
+  --md-sys-color-surface-container: #182325;
+  --md-sys-color-surface-container-high: #222d2f;
+  --md-sys-color-surface-container-highest: #2c383a;
+  --md-sys-color-on-surface: #d9e4e6;
+  --md-sys-color-on-surface-variant: #b4cace;
+  --md-sys-color-on-surface-subtle: #8ba3a7;
+  --md-sys-color-outline: #7f9498;
+  --md-sys-color-outline-variant: #324649;
+
+  --md-sys-color-primary: #00daf2;
+  --md-sys-color-on-primary: #00363d;
+  --md-sys-color-primary-container: #004f58;
+  --md-sys-color-on-primary-container: #96f0ff;
+  --md-sys-color-secondary: #a0ced6;
+  --md-sys-color-secondary-container: #1f4d54;
+  --md-sys-color-on-secondary-container: #bcebf3;
+  --md-sys-color-tertiary: #b2c7f3;
+  --md-sys-color-tertiary-container: #2f476c;
+  --md-sys-color-on-tertiary-container: #d6e3ff;
+  --md-sys-color-warning: #feb958;
+  --md-sys-color-warning-container: #633f00;
+  --md-sys-color-on-warning-container: #ffddb6;
+  --md-sys-color-error: #ffb3ae;
+  --md-sys-color-error-container: #852127;
+  --md-sys-color-on-error-container: #ffdad7;
+  --md-sys-color-inverse-surface: #d9e4e6;
+  --md-sys-color-inverse-on-surface: #293233;
+
+  --route-official-fg: #36d9ef;
+  --route-official-bg: #004f58;
+  --route-official-on-bg: #96f0ff;
+  --route-official-dot: #36d9ef;
+
+  --route-bridge-fg: #eab0f3;
+  --route-bridge-bg: #5c2863;
+  --route-bridge-on-bg: #fdd6ff;
+  --route-bridge-dot: #eab0f3;
+
+  --route-local-fg: #8cd891;
+  --route-local-bg: #1f4d25;
+  --route-local-on-bg: #c2efb1;
+  --route-local-dot: #8cd891;
+
+  --omni-active-accent: #36d9ef;
+  --omni-active-container: #004f58;
+  --omni-active-on-container: #96f0ff;
+
+  --omni-code-bg: #050d0f;
+  --omni-code-head: #0e1c1f;
+  --omni-code-border: #25383c;
+  --omni-code-text: #d7eef2;
+  --omni-code-muted: #8da9ae;
+
+  --omni-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.28);
+  --omni-shadow-md: 0 10px 30px rgba(0, 0, 0, 0.42);
+  --omni-header-glass: rgba(11, 21, 22, 0.86);
+  --omni-stage-bg: #111c1e;
+  --omni-pin-bg: rgba(18, 31, 34, 0.90);
 
   color-scheme: dark;
 }
