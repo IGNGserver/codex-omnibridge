@@ -1,0 +1,22 @@
+# Cloudflare Pages 响应头策略
+# Vite 输出的 /assets/* 带有内容哈希，内容改变即换文件名，一年期 immutable 缓存；
+# 自托管可变字体与图标字体同为固定版本子集资产，启用长效缓存；
+# HTML、3D 模型与元数据文件保持 Pages 默认回源校验（max-age=0, must-revalidate），发布即刻生效。
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/
+  Link: </fonts/roboto-flex-latin.woff2>; rel=preload; as=font; type=font/woff2; crossorigin
+  Link: </fonts/material-symbols-outlined.woff2>; rel=preload; as=font; type=font/woff2; crossorigin
+
+# 全站零外部脚本、零内嵌 iframe、零敏感设备权限调用
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+  Cross-Origin-Opener-Policy: same-origin
