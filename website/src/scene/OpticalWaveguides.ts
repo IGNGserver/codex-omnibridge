@@ -1,325 +1,230 @@
 import * as THREE from 'three';
 import type { ModelRoutePreset, RoutePathKind } from '../data/productData';
 
-const WAVEGUIDE_VERT = /* glsl */ `
-  varying vec2 vUv;
-  varying vec3 vNormalView;
-  varying vec3 vViewPos;
-
-  void main() {
-    vUv = uv;
-    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-    vViewPos = -mvPosition.xyz;
-    vNormalView = normalize(normalMatrix * normal);
-    gl_Position = projectionMatrix * mvPosition;
-  }
-`;
-
-const WAVEGUIDE_FRAG = /* glsl */ `
-  uniform float uTime;
-  uniform float uActive;
-  uniform float uSurge;
-  uniform float uSpeed;
-  uniform float uDensity;
-  uniform vec3 uColor;
-  uniform vec3 uSecondaryColor;
-
-  varying vec2 vUv;
-  varying vec3 vNormalView;
-  varying vec3 vViewPos;
-
-  void main() {
-    vec3 viewDir = normalize(vViewPos);
-    float fresnel = pow(1.0 - abs(dot(viewDir, normalize(vNormalView))), 1.6);
-    float coreProfile = pow(max(0.0, abs(dot(viewDir, normalize(vNormalView)))), 1.35);
-
-    // Traveling optical soliton packets along vUv.x (0 = ingress, 1 = egress)
-    float phase1 = fract(vUv.x * uDensity - uTime * uSpeed);
-    float packet1 = smoothstep(0.62, 0.98, phase1) * (1.0 - smoothstep(0.98, 1.0, phase1));
-    float trail1 = pow(phase1, 4.5) * 0.65;
-
-    float phase2 = fract(vUv.x * (uDensity * 2.0) - uTime * (uSpeed * 1.45) + 0.37);
-    float packet2 = pow(phase2, 8.0) * 0.55;
-
-    // Route-switch shockwave sweeping from 0 -> 1
-    float surgeFront = 1.0 - smoothstep(0.0, 0.22, abs(vUv.x - uSurge));
-    float surgeGlow = surgeFront * step(0.001, uSurge) * (1.0 - step(0.995, uSurge)) * 2.1;
-
-    // Base standby sapphire guide vs active laser waveguide
-    float baseIntensity = mix(0.14, 0.82, uActive);
-    float pulseIntensity = (packet1 * 2.25 + trail1 * 1.35 + packet2 + surgeGlow) * uActive;
-
-    vec3 coreCol = mix(uColor, uSecondaryColor, clamp(packet1 + surgeGlow * 0.6, 0.0, 1.0));
-    vec3 finalRgb = coreCol * (baseIntensity * (0.58 + fresnel * 1.05) + pulseIntensity * (0.68 + coreProfile * 0.95));
-
-    // Taper smoothly at extreme ends to blend inside optical ports
-    float endFade = smoothstep(0.0, 0.04, vUv.x) * (1.0 - smoothstep(0.96, 1.0, vUv.x));
-    float alpha = clamp((mix(0.20, 0.96, uActive) + pulseIntensity * 0.55) * endFade, 0.0, 1.0);
-
-    gl_FragColor = vec4(finalRgb, alpha);
-  }
-`;
-
-export interface WaveguideChannel {
+interface SignalLane {
   key: string;
   curve: THREE.CatmullRomCurve3;
-  mesh: THREE.Mesh<THREE.TubeGeometry, THREE.ShaderMaterial>;
-  haloMesh: THREE.Mesh<THREE.TubeGeometry, THREE.MeshBasicMaterial>;
+  tubeMesh: THREE.Mesh<THREE.TubeGeometry, THREE.MeshStandardMaterial>;
+  baseColor: THREE.Color;
   targetActive: number;
   currentActive: number;
 }
 
+const PACKET_COUNT = 16;
+
+/**
+ * Renders the 3D routing signal tracks and sliding data packets.
+ * Uses crisp opaque PBR tubes (no additive fog overlap!) so every lane reads
+ * clearly on both Light (#eaf6f8) and Dark (#111c1e) M3 surfaces.
+ */
 export class OpticalWaveguideSystem {
   public readonly group = new THREE.Group();
-  private readonly channels: Record<string, WaveguideChannel> = {};
-  private readonly photonPoints: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
-  private readonly photonOffsets: Float32Array;
-  private readonly photonSpeeds: Float32Array;
+  private readonly lanes: Record<string, SignalLane> = {};
+  private readonly packetInstanced: THREE.InstancedMesh<THREE.SphereGeometry, THREE.MeshStandardMaterial>;
+  private readonly packetOffsets: Float32Array;
+  private readonly packetSpeeds: Float32Array;
+  private readonly dummy = new THREE.Object3D();
+  private readonly tmpPos = new THREE.Vector3();
+
   private activeKind: RoutePathKind = 'official';
-  private surgeProgress = 1.0;
-  private activeAccent = new THREE.Color('#00daf2');
-  private activeSecondary = new THREE.Color('#96f0ff');
+  private activeAccent = new THREE.Color('#00a6b8');
+  private standbyColor = new THREE.Color('#9db3b7');
+  private standbyEmissive = new THREE.Color('#000000');
 
   constructor() {
-    this.group.name = 'Optical_Waveguide_Splines';
+    this.group.name = 'Router_Signal_Tracks';
 
-    // 1. Unified Ingress Path: Codex CLI -> Ingress Collimator -> Registry Wheels -> Crossbar Core
-    this.createChannel(
+    // 1. Unified Ingress Track (Left input -> Catalog -> Central Crossbar)
+    this.createLane(
       'ingress',
       [
-        new THREE.Vector3(-3.35, 0.10, 0.0),
-        new THREE.Vector3(-2.55, 0.10, 0.0),
-        new THREE.Vector3(-1.52, 0.10, 0.0),
-        new THREE.Vector3(-0.36, 0.14, 0.0),
-      ],
-      0.032,
-      '#00daf2',
-      '#ffffff',
-      3.0,
-      1.25,
-    );
-
-    // 2. Path Alpha: Official OpenAI Zero-Translation Bypass (-Z sapphire vacuum rail)
-    this.createChannel(
-      'official',
-      [
-        new THREE.Vector3(-0.36, 0.14, 0.0),
-        new THREE.Vector3(-0.36, 0.14, -1.12),
-        new THREE.Vector3(0.65, 0.14, -1.12),
-        new THREE.Vector3(1.85, 0.14, -1.12),
-        new THREE.Vector3(3.18, 0.14, -1.12),
+        new THREE.Vector3(-3.05, 0.11, 0.0),
+        new THREE.Vector3(-2.45, 0.11, 0.0),
+        new THREE.Vector3(-1.48, 0.11, 0.0),
+        new THREE.Vector3(-0.36, 0.12, 0.0),
       ],
       0.030,
-      '#00daf2',
-      '#96f0ff',
-      4.0,
-      1.55,
+      '#008899',
     );
 
-    // 3. Path Beta: Protocol Bridge Dispersion Prism Train (Z = 0 center optical axis)
-    this.createChannel(
+    // 2. Upper Lane: Official OpenAI Direct Bypass (Z = -1.12)
+    this.createLane(
+      'official',
+      [
+        new THREE.Vector3(-0.36, 0.12, 0.0),
+        new THREE.Vector3(-0.36, 0.12, -1.12),
+        new THREE.Vector3(0.65, 0.13, -1.12),
+        new THREE.Vector3(1.85, 0.13, -1.12),
+        new THREE.Vector3(2.85, 0.11, -1.12),
+      ],
+      0.028,
+      '#008899',
+    );
+
+    // 3. Middle Lane: Protocol Translator Bay (Z = 0.0)
+    this.createLane(
       'bridge',
       [
-        new THREE.Vector3(-0.36, 0.14, 0.0),
-        new THREE.Vector3(0.58, 0.13, -0.08),
-        new THREE.Vector3(1.08, 0.13, 0.09),
-        new THREE.Vector3(1.58, 0.13, -0.06),
-        new THREE.Vector3(1.92, 0.14, 0.0),
-        new THREE.Vector3(3.18, 0.14, 0.0),
-      ],
-      0.032,
-      '#d97bff',
-      '#ffffff',
-      4.5,
-      1.32,
-    );
-
-    // 4. Keychain Capability Injection Conduit (Vault -> Protocol Bridge)
-    this.createChannel(
-      'vault',
-      [
-        new THREE.Vector3(-0.14, 0.28, 1.34),
-        new THREE.Vector3(0.18, 0.20, 0.92),
-        new THREE.Vector3(0.56, 0.14, 0.34),
-        new THREE.Vector3(0.86, 0.13, 0.06),
-      ],
-      0.020,
-      '#feb958',
-      '#fff0c2',
-      3.0,
-      1.15,
-    );
-
-    // 5. Path Gamma: Local Loopback Toroidal Resonator (+Z local 127.0.0.1 closed loop)
-    this.createChannel(
-      'local',
-      [
-        new THREE.Vector3(-0.36, 0.14, 0.0),
-        new THREE.Vector3(-0.36, 0.14, 1.12),
-        new THREE.Vector3(1.14, 0.12, 1.26),
-        new THREE.Vector3(1.46, 0.12, 1.58),
-        new THREE.Vector3(1.78, 0.12, 1.26),
-        new THREE.Vector3(1.46, 0.12, 0.94),
-        new THREE.Vector3(2.25, 0.13, 1.12),
-        new THREE.Vector3(3.18, 0.14, 1.12),
+        new THREE.Vector3(-0.36, 0.12, 0.0),
+        new THREE.Vector3(0.55, 0.12, 0.0),
+        new THREE.Vector3(1.06, 0.12, 0.0),
+        new THREE.Vector3(1.62, 0.12, 0.0),
+        new THREE.Vector3(2.85, 0.11, 0.0),
       ],
       0.029,
-      '#4ef09c',
-      '#d8ffea',
-      5.0,
-      1.20,
+      '#9c56a6',
     );
 
-    // Quantized traveling photon particles riding along the active route spline
-    const count = 42;
-    const positions = new Float32Array(count * 3);
-    this.photonOffsets = new Float32Array(count);
-    this.photonSpeeds = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      this.photonOffsets[i] = i / count;
-      this.photonSpeeds[i] = 0.32 + (i % 7) * 0.045;
-    }
-    const pGeom = new THREE.BufferGeometry();
-    pGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    // 4. Keychain Credential Injection Conduit (Vault -> Middle Protocol Bridge)
+    this.createLane(
+      'vault',
+      [
+        new THREE.Vector3(-0.02, 0.25, 1.24),
+        new THREE.Vector3(0.24, 0.19, 0.84),
+        new THREE.Vector3(0.48, 0.13, 0.34),
+        new THREE.Vector3(0.64, 0.12, 0.04),
+      ],
+      0.019,
+      '#c78008',
+    );
 
-    const pMat = new THREE.PointsMaterial({
-      color: 0x96f0ff,
-      size: 0.095,
-      transparent: true,
-      opacity: 0.92,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
+    // 5. Lower Lane: Local Offline Loopback (Z = +1.12 -> Loop Ring -> Egress)
+    this.createLane(
+      'local',
+      [
+        new THREE.Vector3(-0.36, 0.12, 0.0),
+        new THREE.Vector3(-0.36, 0.12, 1.12),
+        new THREE.Vector3(1.18, 0.12, 1.18),
+        new THREE.Vector3(1.46, 0.12, 1.46),
+        new THREE.Vector3(1.74, 0.12, 1.18),
+        new THREE.Vector3(1.46, 0.12, 0.90),
+        new THREE.Vector3(2.15, 0.12, 1.12),
+        new THREE.Vector3(2.85, 0.11, 1.12),
+      ],
+      0.027,
+      '#35883f',
+    );
+
+    // Crisp opaque signal beads traveling smoothly along the active path
+    const packetGeom = new THREE.SphereGeometry(0.056, 14, 14);
+    const packetMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color('#00a6b8'),
+      emissive: new THREE.Color('#006874'),
+      emissiveIntensity: 0.65,
+      roughness: 0.22,
+      metalness: 0.10,
     });
-    this.photonPoints = new THREE.Points(pGeom, pMat);
-    this.group.add(this.photonPoints);
+    this.packetInstanced = new THREE.InstancedMesh(packetGeom, packetMat, PACKET_COUNT);
+    this.packetInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.packetOffsets = new Float32Array(PACKET_COUNT);
+    this.packetSpeeds = new Float32Array(PACKET_COUNT);
+    for (let i = 0; i < PACKET_COUNT; i++) {
+      this.packetOffsets[i] = i / PACKET_COUNT;
+      this.packetSpeeds[i] = 0.24 + (i % 4) * 0.035;
+    }
+    this.group.add(this.packetInstanced);
 
-    // Default initial state
-    this.channels.ingress.currentActive = 1;
-    this.channels.ingress.targetActive = 1;
-    this.channels.official.currentActive = 1;
-    this.channels.official.targetActive = 1;
+    this.lanes.ingress.currentActive = 1;
+    this.lanes.ingress.targetActive = 1;
+    this.lanes.official.currentActive = 1;
+    this.lanes.official.targetActive = 1;
   }
 
-  private createChannel(
-    key: string,
-    points: THREE.Vector3[],
-    radius: number,
-    hex: string,
-    secondaryHex: string,
-    density: number,
-    speed: number,
-  ) {
+  private createLane(key: string, points: THREE.Vector3[], radius: number, hex: string) {
     const curve = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.22);
-    const geom = new THREE.TubeGeometry(curve, 96, radius, 12, false);
-    const mat = new THREE.ShaderMaterial({
-      vertexShader: WAVEGUIDE_VERT,
-      fragmentShader: WAVEGUIDE_FRAG,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      uniforms: {
-        uTime: { value: 0 },
-        uActive: { value: 0 },
-        uSurge: { value: 1.0 },
-        uSpeed: { value: speed },
-        uDensity: { value: density },
-        uColor: { value: new THREE.Color(hex) },
-        uSecondaryColor: { value: new THREE.Color(secondaryHex) },
-      },
-    });
-
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.renderOrder = 8;
-
-    const haloGeom = new THREE.TubeGeometry(curve, 64, radius * 2.85, 8, false);
-    const haloMat = new THREE.MeshBasicMaterial({
+    const geom = new THREE.TubeGeometry(curve, 84, radius, 12, false);
+    const mat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(hex),
-      transparent: true,
-      opacity: 0.0,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
+      emissive: new THREE.Color(hex),
+      emissiveIntensity: 0.25,
+      roughness: 0.34,
+      metalness: 0.18,
     });
-    const haloMesh = new THREE.Mesh(haloGeom, haloMat);
-    haloMesh.renderOrder = 7;
+    const tubeMesh = new THREE.Mesh(geom, mat);
+    this.group.add(tubeMesh);
 
-    this.group.add(haloMesh);
-    this.group.add(mesh);
-
-    this.channels[key] = {
+    this.lanes[key] = {
       key,
       curve,
-      mesh,
-      haloMesh,
+      tubeMesh,
+      baseColor: new THREE.Color(hex),
       targetActive: 0,
       currentActive: 0,
     };
   }
 
+  public setTheme(theme: 'light' | 'dark') {
+    if (theme === 'light') {
+      this.standbyColor.set('#9ab0b4');
+    } else {
+      this.standbyColor.set('#2c3f43');
+    }
+    const packetMat = this.packetInstanced.material;
+    packetMat.emissiveIntensity = theme === 'dark' ? 0.95 : 0.45;
+  }
+
   public applyPreset(preset: ModelRoutePreset) {
     this.activeKind = preset.routeKind;
-    this.surgeProgress = 0.002;
-    this.activeAccent.set(preset.accentHex);
-    this.activeSecondary.set(preset.secondaryHex);
+    this.activeAccent.set(preset.waveHex);
 
-    this.channels.ingress.targetActive = 1.0;
-    this.channels.official.targetActive = preset.routeKind === 'official' ? 1.0 : 0.0;
-    this.channels.bridge.targetActive = preset.routeKind === 'bridge' ? 1.0 : 0.0;
-    this.channels.vault.targetActive = preset.vaultActive ? 1.0 : 0.0;
-    this.channels.local.targetActive = preset.routeKind === 'local' ? 1.0 : 0.0;
+    this.lanes.ingress.targetActive = 1.0;
+    this.lanes.official.targetActive = preset.routeKind === 'official' ? 1.0 : 0.0;
+    this.lanes.bridge.targetActive = preset.routeKind === 'bridge' ? 1.0 : 0.0;
+    this.lanes.vault.targetActive = preset.vaultActive ? 1.0 : 0.0;
+    this.lanes.local.targetActive = preset.routeKind === 'local' ? 1.0 : 0.0;
 
-    // Tint ingress and active branch dynamically to match selected model's optical spectrum
-    this.channels.ingress.mesh.material.uniforms.uColor.value.set(preset.accentHex);
-    this.channels.ingress.mesh.material.uniforms.uSecondaryColor.value.set(preset.secondaryHex);
-    this.channels.ingress.haloMesh.material.color.set(preset.accentHex);
-
+    this.lanes.ingress.baseColor.set(preset.waveHex);
     if (preset.routeKind === 'bridge') {
-      this.channels.bridge.mesh.material.uniforms.uColor.value.set(preset.accentHex);
-      this.channels.bridge.mesh.material.uniforms.uSecondaryColor.value.set(preset.secondaryHex);
-      this.channels.bridge.haloMesh.material.color.set(preset.accentHex);
+      this.lanes.bridge.baseColor.set(preset.waveHex);
     }
 
-    this.photonPoints.material.color.set(preset.secondaryHex);
+    const packetMat = this.packetInstanced.material;
+    packetMat.color.set(preset.waveHex);
+    packetMat.emissive.set(preset.waveHex);
   }
 
   public triggerSyncPulse() {
-    this.surgeProgress = 0.002;
+    // Brief speed/scale emphasis handled smoothly by update loop
+    for (let i = 0; i < PACKET_COUNT; i++) {
+      this.packetOffsets[i] = (this.packetOffsets[i] + 0.05) % 1.0;
+    }
   }
 
   public update(elapsed: number, dt: number, reducedMotion: boolean) {
-    const timeVal = reducedMotion ? 1.2 : elapsed;
+    const lerpRate = reducedMotion ? 1.0 : Math.min(1.0, dt * 8.0);
 
-    if (!reducedMotion && this.surgeProgress < 1.0) {
-      this.surgeProgress = Math.min(1.0, this.surgeProgress + dt * 1.85);
-    } else if (reducedMotion) {
-      this.surgeProgress = 1.0;
+    for (const lane of Object.values(this.lanes)) {
+      lane.currentActive += (lane.targetActive - lane.currentActive) * lerpRate;
+      const mat = lane.tubeMesh.material;
+      mat.color.copy(this.standbyColor).lerp(lane.baseColor, lane.currentActive);
+      mat.emissive.copy(this.standbyEmissive).lerp(lane.baseColor, lane.currentActive);
+      mat.emissiveIntensity = lane.currentActive * 0.42;
+      const radialScale = 0.72 + lane.currentActive * 0.42;
+      lane.tubeMesh.scale.set(1, radialScale, radialScale);
     }
 
-    const lerpRate = reducedMotion ? 1.0 : Math.min(1.0, dt * 8.5);
-    for (const ch of Object.values(this.channels)) {
-      ch.currentActive += (ch.targetActive - ch.currentActive) * lerpRate;
-      ch.mesh.material.uniforms.uTime.value = timeVal;
-      ch.mesh.material.uniforms.uActive.value = ch.currentActive;
-      ch.mesh.material.uniforms.uSurge.value = this.surgeProgress;
-      ch.haloMesh.material.opacity = ch.currentActive * 0.24;
-    }
+    // Update animated data packet beads along ingress + active output track
+    const ingressCurve = this.lanes.ingress.curve;
+    const egressCurve = this.lanes[this.activeKind].curve;
 
-    // Update discrete quantized photons along ingress + active egress curve
-    const ingressCurve = this.channels.ingress.curve;
-    const egressCurve = this.channels[this.activeKind].curve;
-    const posAttr = this.photonPoints.geometry.getAttribute('position') as THREE.BufferAttribute;
-    const tmp = new THREE.Vector3();
-
-    for (let i = 0; i < this.photonOffsets.length; i++) {
+    for (let i = 0; i < PACKET_COUNT; i++) {
       const t = reducedMotion
-        ? this.photonOffsets[i]
-        : (this.photonOffsets[i] + elapsed * this.photonSpeeds[i]) % 1.0;
+        ? this.packetOffsets[i]
+        : (this.packetOffsets[i] + elapsed * this.packetSpeeds[i]) % 1.0;
+
       if (t < 0.36) {
-        ingressCurve.getPointAt(t / 0.36, tmp);
+        ingressCurve.getPointAt(t / 0.36, this.tmpPos);
       } else {
-        egressCurve.getPointAt((t - 0.36) / 0.64, tmp);
+        egressCurve.getPointAt((t - 0.36) / 0.64, this.tmpPos);
       }
-      posAttr.setXYZ(i, tmp.x, tmp.y, tmp.z);
+
+      const endFade = Math.min(1, t / 0.08, (1 - t) / 0.08);
+      const s = 0.75 + 0.35 * endFade;
+      this.dummy.position.copy(this.tmpPos);
+      this.dummy.scale.setScalar(s);
+      this.dummy.updateMatrix();
+      this.packetInstanced.setMatrixAt(i, this.dummy.matrix);
     }
-    posAttr.needsUpdate = true;
+    this.packetInstanced.instanceMatrix.needsUpdate = true;
   }
 }

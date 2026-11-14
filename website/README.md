@@ -1,29 +1,25 @@
-# Codex OmniBridge Official Website (`website/`)
+# Codex OmniBridge 官网展示前端
 
-> 正式线上站点：<https://omnibridge.igng.net/> · 托管与回滚规范见 [docs/HOSTING.md](./docs/HOSTING.md)。
+`website/` 目录承载 Codex OmniBridge 的独立静态官网（托管域名 `https://omnibridge.igng.net/`）。
 
-Codex OmniBridge 官方网站源码。采用 **Precision Photonics Laboratory × Material 3 Expressive Instrument** 视觉与交互体系构建，100% 自托管可变字体与 3D 光学硬件资产，零外部 CDN 运行时请求。
+## 设计与技术要点
 
-## 核心特性
+- **Material 3 Expressive 浅色默认 + 深色切换**：配色、间距、圆角、阴影与交互组件对齐应用本体控制面板（主色 `#00A6B8` / `#006874`），支持随系统偏好自动切换或手动一键切换。
+- **交互式 3D 分流模型（`three` + 离线生成的 `.glb`）**：开放式三路路由器模型展示“官方直连 / 协议转换+钥匙串 / 本机模型”分流轨迹，禁用易起雾的后处理泛光并限制透明外壳防发白；WebGL 不可用时自动降级到主题化矢量视图。
+- **控制面板沙盒 & 多轮混用演练**：无需安装即可试用服务商 HTTPS 校验、一键同步 `/model` 列表及同一条会话切换 GPT / Claude / DeepSeek / Ollama 时的凭据隔离过程。
+- **真实发版直链与零外链字体**：提供 `v0.1.2` 全平台 GitHub Releases 下载与 `SHA256SUMS` 链接，自托管 Noto Sans SC / Roboto Flex / Material Symbols 字体，不发起第三方 CDN 请求。
 
-- **参数化精密 3D 光学交换矩阵 (`public/models/omnibridge-photonic-matrix.glb`)**：由 `scripts/build-photonic-glb.mjs` 生成的 17 节点、32,884 三角面二进制 glTF 2.0 硬件资产，包含可开合高硼硅石英防尘罩（`MeshPhysicalMaterial` 折射透射）、目录合成双编码轮、双轴 MEMS 振镜分流十字架、三联布儒斯特协议色散棱镜、法拉第系统钥匙箱与铜绕本机回环谐振腔。
-- **自定义 GLSL 光孤子波导着色器 (`src/scene/OpticalWaveguides.ts`)**：当用户在 GPT（官方直通 Channel α）、Claude / Qwen / DeepSeek / Gemini（协议棱镜桥接 Channel β）与 Ollama（本机零外发回环 Channel γ）间切换时，3D 振镜实时执行阻尼弹簧偏转并重连脉冲光路。
-- **滚动驱动内部光机巡检 (`#inside-matrix`)**：随滚动自动掀开石英机盖并推进镜头，逐级展示 `crates/catalog`、`crates/router`、`crates/protocol-bridge` 与 `crates/credentials` 的真实架构细节。
-- **同会话四轮热切换推演台 (`src/ui/ThreadSimulator.ts`)**：直观演示同一 `thread_id` 内连续执行 `/model` 切换时的请求头白名单放行、跨源凭据剥离与 `CodexChatHistoryStore` 历史水合。
-- **可交互 M3 Expressive 控制中心 (`src/ui/PanelSandbox.ts`)**：忠实复刻 `#00A6B8` CIELAB 色调调色板、CSS `linear()` 阻尼弹簧曲线、浅色/深色与高对比度切换、服务商自动发现、非环回强制 HTTPS 校验与 `models.json` 实时同步预览。
+## 开发与验证
 
-## 本地开发与验证（遵循 `BUILD_SCRATCH_ROOT` 规范）
+注意：按照仓库规范，依赖安装（`node_modules`）与构建输出（`dist`）应放在本机盘 `$BUILD_SCRATCH_ROOT` 下运行，不要将临时构建产物留在源码目录。
 
-为避免在项目目录产生 `node_modules/` 或 `dist/`，建议将源码同步至本机盘构建区（`${BUILD_SCRATCH_ROOT:-$HOME/.build}`）执行构建与验证：
+```sh
+# 1. 重新生成交互式 3D 模型（写入 public/models/omnibridge-photonic-matrix.glb）
+pnpm run generate:glb
 
-```bash
-SCRATCH="${BUILD_SCRATCH_ROOT:-$HOME/.build}/codex模型切换器/website-build"
-mkdir -p "$SCRATCH"
-rsync -a --delete --exclude node_modules --exclude dist ./ "$SCRATCH/"
+# 2. 类型检查并打包（支持通过 SITE_URL 指定规范域名）
+SITE_URL=https://omnibridge.igng.net/ pnpm run build
 
-cd "$SCRATCH"
-pnpm install
-pnpm run generate:glb   # 可选：重新生成 public/models/omnibridge-photonic-matrix.glb
-pnpm run build          # tsc --noEmit && vite build
-pnpm run verify         # 启动本地静态服务并执行 Playwright 桌面+移动端全链路与 WebGL 校验
+# 3. 无头浏览器全链路验证（3D 渲染、交互沙盒、下载链接、多端零横向溢出、无外链请求）
+pnpm run verify
 ```

@@ -99,7 +99,7 @@ const QUICK_PROVIDER_TEMPLATES: Array<{
 export class PanelSandbox {
   private readonly root: HTMLElement;
   private activeTab: 'overview' | 'accounts' | 'providers' | 'settings' = 'overview';
-  private panelTheme: 'dark' | 'light' = 'dark';
+  private panelTheme: 'dark' | 'light' = 'light';
   private panelContrast: 'standard' | 'high' = 'standard';
   private panelMotion: 'full' | 'reduced' = 'full';
   private filterQuery = '';
@@ -238,6 +238,13 @@ export class PanelSandbox {
     this.onRoutePreview = callbacks.onRoutePreview;
     this.onSyncCatalog = callbacks.onSyncCatalog;
     this.render();
+  }
+
+  public setTheme(theme: 'light' | 'dark') {
+    if (this.panelTheme !== theme) {
+      this.panelTheme = theme;
+      this.render();
+    }
   }
 
   private notify(msg: string) {
@@ -396,7 +403,7 @@ export class PanelSandbox {
 
               <div class="m3s-nav-foot">
                 <span>Core gen #${this.generation}</span>
-                <span>无头多模型桥接路由器</span>
+                <span>多模型路由与凭据中心</span>
               </div>
             </nav>
 
@@ -417,17 +424,17 @@ export class PanelSandbox {
         <!-- Live Synced Codex /model Picker Sidecar -->
         <aside class="codex-picker-sidecar" aria-label="同步后的 Codex /model 模型选择器实时预览">
           <div class="picker-sidecar-head">
-            <span class="omni-kicker-mono">LIVE CODEX CLI · /model PICKER</span>
+            <span class="omni-kicker-mono">Codex /model 实时预览</span>
             <span class="picker-gen-tag">models.json · gen #${this.generation}</span>
           </div>
           <p class="picker-sidecar-desc">
-            在左侧面板开关任意模型或添加服务商，点击「应用到 Codex」即可实时刷新下方选择器；点击任一模型将联动上方 3D 光学矩阵切换光路：
+            在左侧面板开关任意模型或添加服务商，点击「应用到 Codex」即可实时刷新下方列表；点击任意模型可在顶部 3D 演示台切换路线：
           </p>
 
           <div class="picker-list" role="list">
             <div class="picker-group-label">官方内置模型（OAuth 原生透传）</div>
             <button type="button" class="picker-model-row" data-preview-preset="gpt-official">
-              <span class="picker-dot" style="background:#00daf2"></span>
+              <span class="picker-dot" style="background:var(--route-official-dot)"></span>
               <span class="picker-slug">gpt-5.4</span>
               <span class="picker-meta">Official · 400K · Tools + Image</span>
             </button>
@@ -439,7 +446,7 @@ export class PanelSandbox {
                   MODEL_ROUTE_PRESETS.find((p) => p.id === m.presetId) || MODEL_ROUTE_PRESETS[1];
                 return `
                   <button type="button" class="picker-model-row" data-preview-preset="${m.presetId}">
-                    <span class="picker-dot" style="background:${preset.accentHex}"></span>
+                    <span class="picker-dot" style="background:var(--route-${preset.routeKind}-dot)"></span>
                     <span class="picker-slug">${escapeHtml(m.logicalId)}</span>
                     <span class="picker-meta">${escapeHtml(m.contextWindow)}</span>
                   </button>
@@ -515,7 +522,7 @@ requires_openai_auth = true</code></pre>
               <span class="m3s-step-badge ${this.catalogPending ? '' : 'is-done'}">${this.catalogPending ? '3' : '✓'}</span>
               <div class="m3s-step-text">
                 <strong>3. 应用到 Codex</strong>
-                <span>合成 Schema 兼容的 <code>models.json</code> 并热重载本地 Router 凭据代际缓存。</span>
+                <span>生成兼容官方格式的 <code>models.json</code> 并自动刷新本机路由。</span>
               </div>
               <button type="button" class="m3s-btn m3s-btn--filled m3s-btn--xs" data-trigger-sync>立即应用</button>
             </li>
@@ -526,7 +533,7 @@ requires_openai_auth = true</code></pre>
           <div class="m3s-metric m3s-metric--primary">
             <span class="m3s-metric-label">后台路由状态</span>
             <strong class="m3s-metric-val">运行中 · :8787</strong>
-            <small>Loopback 常量时间鉴权正常</small>
+            <small>仅限本机访问 · 令牌校验正常</small>
           </div>
           <div class="m3s-metric m3s-metric--primary">
             <span class="m3s-metric-label">当前生效账号</span>
@@ -540,7 +547,7 @@ requires_openai_auth = true</code></pre>
           </div>
           <div class="m3s-metric">
             <span class="m3s-metric-label">集成模式</span>
-            <strong class="m3s-metric-val">Stock 原厂</strong>
+            <strong class="m3s-metric-val">官方原版</strong>
             <small>未修改官方 codex 可执行文件</small>
           </div>
         </div>
@@ -774,9 +781,9 @@ requires_openai_auth = true</code></pre>
                             type="button"
                             class="m3s-btn m3s-btn--tonal m3s-btn--xs"
                             data-preview-preset="${m.presetId}"
-                            title="在 3D 光学交换矩阵中预览此模型的光路连接"
+                            title="在顶部 3D 路由演示台预览该模型的分流路径"
                           >
-                            3D 光路预览
+                            在演示台预览
                           </button>
                           <label class="m3s-switch" aria-label="启用 ${escapeHtml(m.displayName)}">
                             <input
@@ -807,7 +814,7 @@ requires_openai_auth = true</code></pre>
         <div class="m3s-view-head">
           <div>
             <h3>设置与安全偏好</h3>
-            <p>真实复刻面板的独立无障碍三轴控制（主题 / 对比度 / 弹簧动效）与局域网访问密码门禁。</p>
+            <p>复刻本机自带网页控制台，可实时切换主题、对比度和弹簧动效，并演示局域网访问密码保护。</p>
           </div>
         </div>
 
@@ -842,7 +849,7 @@ requires_openai_auth = true</code></pre>
         <div class="m3s-card m3s-card--outlined">
           <div class="m3s-card-row">
             <div>
-              <h4>浏览器与局域网远程访问门禁</h4>
+              <h4>网页端与局域网远程访问门禁</h4>
               <p class="m3s-muted">未配置 Argon2id 访问密码前，后端硬性拒绝绑定 <code>0.0.0.0:31828</code>；跨公网建议使用 <code>ssh -L 31828:127.0.0.1:31828</code> 隧道。</p>
             </div>
             <span class="m3s-chip ${this.remoteAccessEnabled ? 'm3s-chip--warn' : 'm3s-chip--ok'}">
@@ -1029,7 +1036,7 @@ requires_openai_auth = true</code></pre>
         const preset = MODEL_ROUTE_PRESETS.find((p) => p.id === pid);
         if (preset) {
           this.onRoutePreview(preset);
-          this.notify(`⚡ 3D 光学矩阵已切换至：${preset.logicalModelId} (${preset.routeBadge})`);
+          this.notify(`模型路由演示已切换至：${preset.logicalModelId}（${preset.routeBadge}）`);
         }
       });
     });

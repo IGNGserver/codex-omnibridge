@@ -1,15 +1,15 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-site-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Codex OmniBridge — 让官方 OpenAI Codex 在同一会话内无缝切换 GPT、Claude、Qwen、DeepSeek、Gemini 与本机 Ollama/vLLM 模型的高精度本机回环光学路由器与 M3 Expressive 控制中心。"
+      content="Codex OmniBridge — 让官方 Codex 在同一条对话里随时切换 GPT、Claude、Qwen、DeepSeek、Gemini 与本机 Ollama/vLLM 模型，不改官网安装包、不污染 auth.json。"
     />
-    <meta name="theme-color" content="#030a0c" />
+    <meta name="theme-color" content="#f6feff" />
     <meta name="msvalidate.01" content="B411826ACAE5C5CD20EA5574C3F8A6E4" />
-    <title>Codex OmniBridge — 多模型光学交换路由矩阵 &amp; M3 Expressive 控制中心</title>
+    <title>Codex OmniBridge — 在官方 Codex 里自由切换多模型</title>
 
     <link rel="canonical" href="https://omnibridge.igng.net/" />
     <meta property="og:type" content="website" />
@@ -17,25 +17,25 @@
     <meta property="og:locale" content="zh_CN" />
     <meta
       property="og:title"
-      content="Codex OmniBridge — 多模型光学交换路由矩阵 &amp; M3 Expressive 控制中心"
+      content="Codex OmniBridge — 在官方 Codex 里自由切换多模型"
     />
     <meta
       property="og:description"
-      content="无需修改官方 codex 二进制、绝不污染 ~/.codex/auth.json，在同一条 Codex 会话内无缝热切换官方 GPT、Claude、Qwen、DeepSeek、Gemini 与本机 Ollama / vLLM。"
+      content="不改动官方 codex 客户端、不修改日常 auth.json，在原生 /model 菜单中同一会话随时切换 GPT、Claude、Qwen、DeepSeek、Gemini 与本机模型。"
     />
     <meta property="og:url" content="https://omnibridge.igng.net/" />
     <meta property="og:image" content="https://omnibridge.igng.net/og/og.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="Codex OmniBridge 3D 光学交换路由矩阵与 M3 Expressive 控制中心" />
+    <meta property="og:image:alt" content="Codex OmniBridge 官网界面与多模型分流控制中心预览" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta
       name="twitter:title"
-      content="Codex OmniBridge — 多模型光学交换路由矩阵 &amp; M3 Expressive 控制中心"
+      content="Codex OmniBridge — 在官方 Codex 里自由切换多模型"
     />
     <meta
       name="twitter:description"
-      content="本机 127.0.0.1:8787 回环路由器 + 双向协议色散棱镜 + 系统钥匙串凭据隔离，让官方 OpenAI Codex 原生支持全球多模型同会话热切换。"
+      content="本机轻量转接网关 + 双向协议转换 + 系统钥匙串凭据隔离，让官方 OpenAI Codex 原生支持多种模型协同开发。"
     />
     <meta name="twitter:image" content="https://omnibridge.igng.net/og/og.png" />
 
@@ -55,623 +55,456 @@
       type="font/woff2"
       crossorigin
     />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('omnibridge-site-theme');
+          var theme =
+            saved === 'light' || saved === 'dark'
+              ? saved
+              : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light';
+          document.documentElement.dataset.siteTheme = theme;
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b1516' : '#f6feff');
+        } catch (e) {}
+      })();
+    </script>
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "Codex OmniBridge",
-        "operatingSystem": "macOS, Linux, Windows",
+        "operatingSystem": "macOS, Windows, Linux",
         "applicationCategory": "DeveloperApplication",
         "url": "https://omnibridge.igng.net/",
-        "downloadUrl": "https://github.com/IGNGserver/codex-omnibridge/releases",
+        "downloadUrl": "https://github.com/IGNGserver/codex-omnibridge/releases/tag/v0.1.2",
         "codeRepository": "https://github.com/IGNGserver/codex-omnibridge",
         "softwareVersion": "0.1.2",
-        "description": "让官方 OpenAI Codex 在同一会话内无缝切换 GPT、Claude、Qwen、DeepSeek、Gemini 与本机 Ollama/vLLM 模型的高精度本机回环光学路由器与 M3 Expressive 控制中心。"
+        "description": "不改动官方 codex 客户端、不修改日常 auth.json，在同一条对话中自由切换 GPT、Claude、Qwen、DeepSeek、Gemini 与本机模型。"
       }
     </script>
   </head>
   <body>
     <a href="#main-content" class="skip-link">跳至主内容</a>
 
-    <!-- Persistent 3D Photonic Hardware Viewport -->
-    <div class="photonic-viewport" id="photonic-viewport">
-      <div
-        class="photonic-stage-canvas-host"
-        id="photonic-stage"
-        data-glb-loaded="loading"
-      ></div>
-      <div class="photonic-vignette" aria-hidden="true"></div>
-      <div class="photonic-pins-layer" id="photonic-pins-layer" aria-label="3D 光学交换矩阵模块坐标针"></div>
-    </div>
-
-    <div class="lab-frame-ticks" aria-hidden="true"></div>
-
-    <!-- Floating HUD shown during 3D Free Orbit Inspection -->
-    <div class="free-inspect-hud" id="free-inspect-hud" role="region" aria-label="3D 自由检视控制栏">
-      <span>拖拽旋转光学矩阵 · 滚轮缩放 · 点击模块跳转解析 · 按 ESC 退出</span>
-      <button type="button" class="omni-pill-btn omni-pill-btn--primary" id="btn-exit-free-inspect">
-        退出自由检视
-      </button>
-    </div>
-
-    <!-- Top Precision Instrument Header -->
-    <header class="omni-header">
-      <div class="omni-header__inner">
-        <a href="#hero-matrix" class="omni-brand">
-          <img src="./app-icon.png" alt="Codex OmniBridge 徽标" width="32" height="32" />
-          <span class="omni-brand__titles">
-            <span class="omni-brand__name">Codex OmniBridge</span>
-            <span class="omni-brand__tag">PHOTONIC LOOPBACK ROUTER · v0.1.2</span>
+    <!-- Sticky M3 Top App Bar -->
+    <header class="site-header">
+      <div class="omni-container header-inner">
+        <a href="#hero-section" class="brand-lockup" aria-label="Codex OmniBridge 回到顶部">
+          <span class="brand-mark">
+            <img src="./app-icon.png" alt="" width="24" height="24" style="border-radius: 6px" />
+          </span>
+          <span class="brand-text">
+            <span class="brand-name">Codex OmniBridge</span>
+            <span class="brand-version">v0.1.2</span>
           </span>
         </a>
 
-        <nav class="omni-nav" aria-label="主导航">
-          <a href="#hero-matrix" data-nav-sec="hero-matrix" class="is-active">光学矩阵</a>
-          <a href="#inside-matrix" data-nav-sec="inside-matrix">深入内部</a>
-          <a href="#thread-lab" data-nav-sec="thread-lab">同会话热切</a>
-          <a href="#panel-showcase" data-nav-sec="panel-showcase">M3 控制中心</a>
-          <a href="#architecture-matrix" data-nav-sec="architecture-matrix">十模块架构</a>
-          <a href="#quickstart" data-nav-sec="quickstart">快速接入</a>
+        <nav class="site-nav" aria-label="页面导航">
+          <a href="#hero-section" data-nav-target="hero-section">路由演示</a>
+          <a href="#panel-showcase" data-nav-target="panel-showcase">控制面板</a>
+          <a href="#thread-lab" data-nav-target="thread-lab">多轮混用</a>
+          <a href="#how-it-works" data-nav-target="how-it-works">工作原理</a>
+          <a href="#quickstart" data-nav-target="quickstart">下载与配置</a>
         </nav>
 
-        <div class="omni-header__actions">
+        <div class="header-actions">
           <button
             type="button"
-            class="omni-pill-btn"
-            id="btn-toggle-canopy"
-            aria-pressed="false"
-            title="掀开或闭合高硼硅石英防尘罩，观察内部光机组件"
+            class="m3-btn m3-btn--outlined m3-btn--sm"
+            id="btn-site-theme"
+            aria-label="切换浅色或深色主题"
           >
-            <span class="material-symbols-outlined m3-i-visibility" aria-hidden="true"></span>
-            <span class="hide-mobile-label" id="label-toggle-canopy">掀开石英机盖</span>
+            <span id="site-theme-icon" aria-hidden="true"></span>
+            <span id="site-theme-label" class="btn-label-desktop">深色模式</span>
           </button>
 
-          <button
-            type="button"
-            class="omni-pill-btn"
-            id="btn-free-inspect"
-            aria-pressed="false"
-            title="解锁 3D 镜头自由旋转与缩放检视"
+          <a
+            class="m3-btn m3-btn--outlined m3-btn--sm"
+            href="https://github.com/IGNGserver/codex-omnibridge"
+            target="_blank"
+            rel="noopener"
+            aria-label="GitHub 开源仓库"
           >
-            <span class="material-symbols-outlined m3-i-travel-explore" aria-hidden="true"></span>
-            <span class="hide-mobile-label">3D 自由检视</span>
-          </button>
+            <svg class="omni-svg-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.55v-2.16c-3.2.7-3.88-1.37-3.88-1.37a3.05 3.05 0 0 0-1.28-1.69c-1.05-.72.08-.7.08-.7a2.42 2.42 0 0 1 1.77 1.19 2.45 2.45 0 0 0 3.35.95 2.45 2.45 0 0 1 .73-1.54c-2.56-.29-5.25-1.28-5.25-5.7a4.46 4.46 0 0 1 1.19-3.09 4.14 4.14 0 0 1 .11-3.05s.97-.31 3.18 1.18a10.95 10.95 0 0 1 5.78 0c2.21-1.49 3.18-1.18 3.18-1.18a4.14 4.14 0 0 1 .11 3.05 4.46 4.46 0 0 1 1.19 3.09c0 4.43-2.7 5.4-5.27 5.69a2.74 2.74 0 0 1 .78 2.13v3.16c0 .31.21.67.8.55A11.5 11.5 0 0 0 12 .5Z"
+              />
+            </svg>
+            <span class="btn-label-desktop">GitHub</span>
+          </a>
 
-          <a href="#quickstart" class="omni-pill-btn omni-pill-btn--primary">
-            <span>立即接入</span>
+          <a class="m3-btn m3-btn--primary m3-btn--sm" href="#quickstart">
+            <svg class="omni-svg-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 16l-5-5 1.4-1.45 2.6 2.6V4h2v8.15l2.6-2.6L17 11l-5 5Zm-7 4v-3h2v1h10v-1h2v3H5Z"
+              />
+            </svg>
+            <span>立即下载</span>
           </a>
         </div>
       </div>
     </header>
 
-    <main class="site-main" id="main-content">
+    <main id="main-content">
       <!-- ================================================================
-           ACT I: HERO & 3D OPTICAL SWITCHING MATRIX CONSOLE
+           Section 1: Hero + Clean Interactive 3D Routing Card
            ================================================================ -->
-      <section class="hero-section omni-container" id="hero-matrix">
-        <div class="hero-upper-grid">
+      <section class="hero-section" id="hero-section">
+        <div class="omni-container hero-layout">
           <div class="hero-copy">
             <div class="hero-eyebrow">
-              <span class="hero-eyebrow__pulse" aria-hidden="true"></span>
-              <span>127.0.0.1:8787 · 默认零二进制补丁 · 纯 Rust 单文件引擎</span>
+              <span class="eyebrow-dot" aria-hidden="true"></span>
+              <span>开源免费 · 本机运行 · 不改官方客户端</span>
             </div>
 
             <h1 class="hero-title">
-              在同一条 Codex 会话内<br />
-              <span class="spectral-text">精密调度全球模型光路</span>
+              在官方 Codex 里，一条对话<span class="hero-title-accent">随时换着用各种模型</span>
             </h1>
 
-            <p class="hero-subtitle">
-              <strong>Codex OmniBridge</strong> 将本机回环路由器、双向协议色散棱镜与系统级钥匙串保险箱融为一体。无需改动官方
-              <code>codex</code> 二进制、绝不污染 <code>~/.codex/auth.json</code>，即可在原生
-              <code>/model</code> 菜单中实时切换官方 GPT、Claude、Qwen、DeepSeek、Gemini 与本机 Ollama / vLLM。
+            <p class="hero-lead">
+              Codex OmniBridge 在你的电脑本机（<code>127.0.0.1:8787</code>）充当轻量转接网关：不修改官方
+              <code>codex</code> 客户端、日常绝不改写 <code>~/.codex/auth.json</code>，就能在原生的
+              <code>/model</code> 菜单里随时选用 ChatGPT 官方模型、Claude、Qwen、DeepSeek、Gemini 和本机
+              Ollama。
             </p>
 
-            <div class="hero-cta-row">
-              <a href="#panel-showcase" class="omni-pill-btn omni-pill-btn--primary">
-                <span class="material-symbols-outlined m3-i-dashboard" aria-hidden="true"></span>
-                <span>交互体验 M3 控制中心</span>
+            <div class="hero-actions">
+              <a class="m3-btn m3-btn--primary" id="hero-download-btn" href="#quickstart" rel="noopener">
+                <svg class="omni-svg-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M12 16l-5-5 1.4-1.45 2.6 2.6V4h2v8.15l2.6-2.6L17 11l-5 5Zm-7 4v-3h2v1h10v-1h2v3H5Z"
+                  />
+                </svg>
+                <span id="hero-download-label">下载 v0.1.2 客户端</span>
               </a>
-              <a href="#inside-matrix" class="omni-pill-btn omni-pill-btn--accent">
-                <span class="material-symbols-outlined m3-i-hub" aria-hidden="true"></span>
-                <span>深入交换矩阵内部</span>
-              </a>
-              <a href="#quickstart" class="omni-pill-btn">
-                <span>CLI 三步安装</span>
-              </a>
+
+              <a class="m3-btn m3-btn--tonal" href="#panel-showcase">体验控制面板</a>
+              <a class="m3-btn m3-btn--outlined" href="#quickstart">全部 4 大平台安装包</a>
             </div>
 
-            <div class="hero-telemetry-strip" aria-label="核心工程指标">
-              <div class="telemetry-stat">
-                <strong class="m3-numeric">127.0.0.1:8787</strong>
-                <span>常量时间环回数据面</span>
+            <div class="hero-highlights">
+              <div class="highlight-card">
+                <strong>不改官网客户端</strong>
+                <span>读取真实内建目录并追加模型，带备份事务，随时一键还原。</span>
               </div>
-              <div class="telemetry-stat">
-                <strong class="m3-numeric">:31828 SPA</strong>
-                <span>RustEmbed 内嵌 M3 面板</span>
+              <div class="highlight-card">
+                <strong>按每句话智能分流</strong>
+                <span>同会话上句问 GPT、下句切 Claude 或本地模型，对话上下文不断片。</span>
               </div>
-              <div class="telemetry-stat">
-                <strong class="m3-numeric">10 Crates</strong>
-                <span>零 WebKit 依赖单二进制</span>
-              </div>
-              <div class="telemetry-stat">
-                <strong class="m3-numeric">0 改写</strong>
-                <span>官方 auth.json 原封不动</span>
+              <div class="highlight-card">
+                <strong>密钥进系统钥匙串</strong>
+                <span>API Key 存入系统原生凭据库，配置文件不存明文、不向外泄露。</span>
               </div>
             </div>
           </div>
 
-          <div class="hero-stage-window">
-            <div class="hero-bench-caption">
-              <strong id="hero-bench-kicker">OPTICAL BENCH // CHANNEL α LOCKED</strong>
-              <span id="hero-bench-desc">
-                点击下方任意模型预设，实时观察 3D MEMS 双轴振镜偏转、钥匙箱锁盘啮合与脉冲光孤子重连。
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Interactive 6-Model Optical Route Switcher Console -->
-        <div class="route-console-dock" role="region" aria-label="实时模型光路切换控制台">
-          <div class="route-console-head">
-            <span class="omni-kicker-mono">
-              <span class="material-symbols-outlined m3-i-swap-horiz" aria-hidden="true"></span>
-              <span>INTERACTIVE OPTICAL CROSSBAR // 选择目标模型重构 3D 数据光路</span>
-            </span>
-
-            <div class="route-console-legend" aria-hidden="true">
-              <span class="legend-item">
-                <span class="legend-dot" style="background: #00daf2"></span>
-                <span>Channel α · 官方 OAuth 直通</span>
-              </span>
-              <span class="legend-item">
-                <span class="legend-dot" style="background: #d97bff"></span>
-                <span>Channel β · 协议棱镜桥接 + 钥匙串注入</span>
-              </span>
-              <span class="legend-item">
-                <span class="legend-dot" style="background: #4ef09c"></span>
-                <span>Channel γ · 127.0.0.1 本机零外发回环</span>
-              </span>
-            </div>
-          </div>
-
-          <div
-            class="route-selector-grid"
-            id="hero-route-grid"
-            role="tablist"
-            aria-label="演示模型切换选项"
-          ></div>
-
-          <div class="route-readout" id="hero-route-readout" aria-live="polite">
-            <div class="route-readout__main">
-              <div class="route-readout__badges">
-                <span class="route-badge-pill" id="ro-badge"></span>
-                <span class="route-protocol-pill" id="ro-protocol"></span>
+          <!-- Right: Interactive 3D Router Stage Card -->
+          <div class="hero-stage-card" id="router-stage-card">
+            <div class="stage-toolbar">
+              <div class="stage-legend" aria-label="分流路线图例">
+                <span class="legend-item"><span class="legend-dot legend-dot--official"></span>官方直连</span>
+                <span class="legend-item"><span class="legend-dot legend-dot--bridge"></span>协议转换 + 钥匙串</span>
+                <span class="legend-item"><span class="legend-dot legend-dot--local"></span>本机模型</span>
               </div>
-              <p class="route-summary-text" id="ro-summary"></p>
-              <div class="route-cap-chips" id="ro-caps"></div>
+
+              <div class="stage-controls">
+                <button
+                  type="button"
+                  class="m3-btn m3-btn--outlined m3-btn--sm"
+                  id="btn-free-inspect"
+                  aria-pressed="false"
+                >
+                  3D 自由旋转
+                </button>
+                <button
+                  type="button"
+                  class="m3-btn m3-btn--outlined m3-btn--sm"
+                  id="btn-reset-view"
+                >
+                  重置视角
+                </button>
+              </div>
             </div>
 
-            <div class="route-readout__specs">
-              <div class="wire-kv">
-                <span class="wire-kv__k">Codex 逻辑模型 ➔ 上游模型</span>
-                <span class="wire-kv__v" id="ro-models"></span>
+            <div class="stage-viewport">
+              <div
+                id="photonic-stage"
+                data-glb-loaded="loading"
+                aria-label="Codex OmniBridge 三路分流交互式 3D 模型"
+              ></div>
+              <div class="stage-pins-layer" id="stage-pins-layer" aria-label="结构标注点"></div>
+            </div>
+
+            <div
+              class="route-presets-grid"
+              id="route-presets-grid"
+              role="tablist"
+              aria-label="选择不同模型查看分流路径"
+            ></div>
+
+            <div class="route-readout" id="route-readout" aria-live="polite">
+              <div class="route-readout-head">
+                <span class="route-readout-badge" id="readout-badge" data-route-kind="official">
+                  OpenAI 官方直连
+                </span>
+                <span class="route-protocol-text" id="readout-protocol"></span>
               </div>
-              <div class="wire-kv">
-                <span class="wire-kv__k">凭据与请求头边界动作</span>
-                <span class="wire-kv__v" id="ro-auth"></span>
+
+              <p class="route-readout-summary" id="readout-summary"></p>
+
+              <div class="route-mini-grid">
+                <div class="route-mini-cell">
+                  <span class="route-mini-label">你在 /model 里选择</span>
+                  <span class="route-mini-val" id="readout-logical"></span>
+                </div>
+                <div class="route-mini-cell">
+                  <span class="route-mini-label">实际发往接口</span>
+                  <span class="route-mini-val" id="readout-egress"></span>
+                </div>
+                <div class="route-mini-cell">
+                  <span class="route-mini-label">钥匙串与请求头处理</span>
+                  <span class="route-mini-val" id="readout-auth"></span>
+                </div>
               </div>
-              <div class="wire-kv">
-                <span class="wire-kv__k">入站环回 ➔ 实际出站端点</span>
-                <span class="wire-kv__v" id="ro-endpoints"></span>
-              </div>
-              <div class="wire-kv">
-                <span class="wire-kv__k">数据面桥接管线 · 上下文</span>
-                <span class="wire-kv__v" id="ro-pipeline"></span>
-              </div>
+
+              <div class="route-caps-row" id="readout-caps"></div>
             </div>
           </div>
         </div>
       </section>
 
       <!-- ================================================================
-           ACT II: SCROLL-CHOREOGRAPHED INTERIOR FLY-THROUGH
+           Section 2: Interactive Control Panel Sandbox
            ================================================================ -->
-      <section class="inside-section omni-container" id="inside-matrix">
-        <div class="omni-section-header">
-          <span class="omni-kicker-mono">INSIDE THE PHOTONIC MATRIX // 内部四级精密光机解构</span>
-          <h2 class="omni-section-title">高硼硅石英机盖自动开启，逐级审视每一次请求的光路蜕变</h2>
-          <p class="omni-section-lead">
-            向下滚动页面，镜头将沿光轴依次深入目录合成编码轮、双轴 MEMS 逐轮分流镜、三联布儒斯特协议色散棱镜与法拉第系统钥匙箱，每一座光学模组皆精确对应主仓库中的核心 Rust Crate。
-          </p>
+      <section class="omni-section omni-section--tonal" id="panel-showcase">
+        <div class="omni-container">
+          <div class="section-head">
+            <span class="section-kicker">控制面板沙盒</span>
+            <h2 class="section-title">网页面板实时演示：添加模型后自动同步到 Codex 菜单</h2>
+            <p class="section-lead">
+              直接点击下方体验软件内置控制面板：支持管理服务商与模型开关、测试非本机地址必须使用 HTTPS、切换浅色/深色与高对比度，点击「应用到 Codex」还能在右侧立刻看到同步后的 <code>/model</code> 列表。
+            </p>
+          </div>
+
+          <div id="panel-sandbox-root"></div>
         </div>
+      </section>
 
-        <div class="inside-layout">
-          <div class="inside-stations" id="inside-stations-mount"></div>
+      <!-- ================================================================
+           Section 3: Single-Thread Multi-Model Hot-Switch Simulator
+           ================================================================ -->
+      <section class="omni-section" id="thread-lab">
+        <div class="omni-container">
+          <div class="section-head">
+            <span class="section-kicker">多轮混用演练</span>
+            <h2 class="section-title">同一个任务里先用 GPT、再切 Claude 或 DeepSeek，不丢记忆</h2>
+            <p class="section-lead">
+              不用每个模型单独开新窗口。点击下方四个对话轮次（或点击「自动演示」），可以直观看到：每次切换模型后，本机网关如何分别处理授权令牌、拦截多余头部，并把前面聊过的记录接力传给下一个模型。
+            </p>
+          </div>
 
-          <aside class="inside-sticky-hud" aria-label="内部模块快速定位器">
-            <div class="inside-hud-card">
-              <span class="omni-kicker-mono" id="inside-hud-index">MODULE 01 // CATALOG SYNTHESIS</span>
-              <p style="margin: 8px 0 0; font-size: 13px; color: var(--omni-text-secondary)" id="inside-hud-title">
-                石英防尘罩已随滚动自动掀开，右侧 3D 视口正聚焦当前核心模组：
+          <div id="thread-simulator-root"></div>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           Section 4: Plain-Chinese Architecture & Security Guarantees
+           ================================================================ -->
+      <section class="omni-section omni-section--tonal" id="how-it-works">
+        <div class="omni-container">
+          <div class="section-head">
+            <span class="section-kicker">工作原理与安全边界</span>
+            <h2 class="section-title">四个步骤说清楚：如何做到既不改客户端，又保住账号和密钥</h2>
+            <p class="section-lead">
+              所有转发与翻译都在你自己的设备本机完成，没有中间云端服务器经手你的代码和秘钥。
+            </p>
+          </div>
+
+          <div class="how-grid" id="how-steps-grid"></div>
+
+          <div class="security-strip">
+            <article class="security-tile">
+              <div class="security-tile-top">
+                <span class="material-symbols-outlined m3-i m3-i-verified-user" aria-hidden="true"></span>
+                <span>不改动日常 auth.json</span>
+              </div>
+              <p>
+                安装、使用转发、换模型和卸载过程中都不会重写你的官方登录文件；如果主动切换官方账号，切换前会先留好受限权限备份快照。
               </p>
-              <div class="inside-hud-nav" id="inside-hud-nav"></div>
-            </div>
-          </aside>
-        </div>
-      </section>
+            </article>
 
-      <!-- ================================================================
-           ACT III: SAME-THREAD MULTI-MODEL HOT SWITCHING LAB
-           ================================================================ -->
-      <section class="thread-section omni-container" id="thread-lab">
-        <div class="omni-section-header">
-          <span class="omni-kicker-mono">PER-TURN ROUTING &amp; CREDENTIAL BULKHEAD // 同会话热切推演</span>
-          <h2 class="omni-section-title">一条会话连续切换四类模型，上下文不断裂、凭据零串味</h2>
-          <p class="omni-section-lead">
-            原厂 Codex 默认将会话绑死在启动时的单一 Provider 上。OmniBridge 通过统一 Responses 环回入口与
-            <code>CodexChatHistoryStore</code> 可移植记忆水合账本，让你在同一条
-            <code>thread_id</code> 中自由穿插官方订阅模型、第三方网关与离线本地模型。
-          </p>
-        </div>
-
-        <div id="thread-simulator-mount"></div>
-      </section>
-
-      <!-- ================================================================
-           ACT IV: AUTHENTIC M3 EXPRESSIVE CONTROL CENTER SANDBOX
-           ================================================================ -->
-      <section class="panel-section omni-container" id="panel-showcase">
-        <div class="omni-section-header">
-          <span class="omni-kicker-mono">MATERIAL 3 EXPRESSIVE INSTRUMENT // 真实内嵌面板演练场</span>
-          <h2 class="omni-section-title">源自 #00A6B8 CIELAB 色调体系与阻尼弹簧曲线的控制中心</h2>
-          <p class="omni-section-lead">
-            下方交互沙盒 1:1 还原 <code>codex-mp web start --open</code>（<code>127.0.0.1:31828</code>）内嵌控制面板：亲自尝试切换浅色/深色与高对比度主题、添加 OneAPI 或本地 vLLM 服务商、体验非环回强制 HTTPS 校验、切换官方账号快照，并实时同步右侧 Codex <code>/model</code> 列表。
-          </p>
-        </div>
-
-        <div id="panel-sandbox-mount"></div>
-      </section>
-
-      <!-- ================================================================
-           ACT V: INTEGRATION MODES & 10-CRATE RUST ARCHITECTURE
-           ================================================================ -->
-      <section class="arch-section omni-container" id="architecture-matrix">
-        <div class="omni-section-header">
-          <span class="omni-kicker-mono">SYSTEM ARCHITECTURE &amp; SECURITY BOUNDARIES // 工程底座</span>
-          <h2 class="omni-section-title">双模无损集成，构建于 10 个各司其职的纯 Rust 安全模块之上</h2>
-          <p class="omni-section-lead">
-            不搞黑盒魔改、不绑架系统配置：默认模式对官方可执行文件零触碰，且每一处文件写入均具备两阶段 SHA-256 指纹守护与原子回滚能力。
-          </p>
-        </div>
-
-        <div class="mode-compare-grid">
-          <article class="mode-card mode-card--recommended">
-            <div class="mode-card__top">
-              <span class="mode-tag mode-tag--default">DEFAULT · 默认生产推荐</span>
-              <code style="font-size: 12px; color: var(--omni-cyan-soft)">codex-mp setup / launch</code>
-            </div>
-            <h3>Stock 原厂模式（零二进制补丁）</h3>
-            <p>
-              直接使用你机器上现有的官方 <code>codex</code> CLI 与桌面端，通过受管配置将请求引入本机
-              <code>127.0.0.1:8787</code> 光学交换矩阵。
-            </p>
-            <ul class="mode-list">
-              <li>
-                <code>toml_edit</code> 保注释编辑 <code>~/.codex/config.toml</code>，记录安装前哈希至
-                <code>integration.json</code>；若用户手动改过受管项则拒绝盲目覆盖。
-              </li>
-              <li>
-                官方模型原样转发白名单头至 <code>chatgpt.com/backend-api/codex</code>，完整保留原生订阅额度、Hosted Search 与图像生成。
-              </li>
-              <li>
-                既有历史会话可通过 <code>codex-mp resume --through-omnibridge &lt;SESSION_ID&gt;</code> 一键迁移至多模型热切换通道。
-              </li>
-            </ul>
-          </article>
-
-          <article class="mode-card">
-            <div class="mode-card__top">
-              <span class="mode-tag mode-tag--exp">EXPERIMENTAL · 可选进阶模式</span>
-              <code style="font-size: 12px; color: #f4ccff">codex-mp desktop install</code>
-            </div>
-            <h3>Patched Per-Turn / Desktop 独立运行时</h3>
-            <p>
-              面向需要官方模型保留直连 WebSocket 通道的进阶场景，固定配套上游提交
-              <code>73a1148c</code> 的最小逐轮路由补丁与独立桌面适配器。
-            </p>
-            <ul class="mode-list">
-              <li>
-                官方模型完全不经过本地 Router，直接保持原厂 WebSocket 连接；仅带
-                <code>&lt;provider&gt;/&lt;slug&gt;</code> 命名空间的模型在单轮粒度动态转向 <code>router-endpoint.json</code>。
-              </li>
-              <li>
-                独立启动器通过 <code>CODEX_CLI_PATH</code> 注入运行时，绝不篡改系统全局安装的官方程序包。
-              </li>
-              <li>
-                内置 SHA-256 漂移检测，随时执行 <code>codex-mp desktop restore</code> 一键恢复原厂桌面入口。
-              </li>
-            </ul>
-          </article>
-        </div>
-
-        <div class="crates-header-bar">
-          <h3>Cargo Workspace 十模块职责矩阵</h3>
-          <span class="omni-kicker-mono">RUST 2021 · AXUM · REQWEST · KEYRING · TOML_EDIT · RUST_EMBED</span>
-        </div>
-
-        <div class="crates-grid" id="crates-grid-mount"></div>
-
-        <div class="security-strip">
-          <div class="security-tile">
-            <h4>
-              <span class="material-symbols-outlined m3-i-security" aria-hidden="true"></span>
-              <span>零重定向与 SSRF 链路封锁</span>
-            </h4>
-            <p>
-              上游客户端强制 <code>redirect::Policy::none()</code>，彻底阻断恶意中转站借 307/308 窃取 Bearer 头；同时拒绝非环回明文 HTTP 与 <code>169.254.0.0/16</code> 云元数据段。
-            </p>
-          </div>
-          <div class="security-tile">
-            <h4>
-              <span class="material-symbols-outlined m3-i-verified-user" aria-hidden="true"></span>
-              <span>系统钥匙串 + 跨平台权限围栏</span>
-            </h4>
-            <p>
-              密钥只存 macOS Keychain、Windows CredMan 与 Linux Secret Service；Unix 敏感配置强制 <code>0600</code>，Windows 超长令牌自动落入当前用户 SID DACL 专属保护文件。
-            </p>
-          </div>
-          <div class="security-tile">
-            <h4>
-              <span class="material-symbols-outlined m3-i-router" aria-hidden="true"></span>
-              <span>Argon2id 门禁与双端一致 CSP</span>
-            </h4>
-            <p>
-              Web 控制面默认仅绑 <code>127.0.0.1:31828</code>；开启局域网访问前强制校验 Argon2id 密码并启用失败限流，HTTP 响应头与离线构建共用严格零外链 CSP。
-            </p>
-          </div>
-        </div>
-      </section>
-
-      <!-- ================================================================
-           ACT VI: CLI QUICKSTART & CROSS-PLATFORM RELEASE MATRIX
-           ================================================================ -->
-      <section class="quickstart-section omni-container" id="quickstart">
-        <div class="omni-section-header">
-          <span class="omni-kicker-mono">ZERO-TRACE CLI &amp; RELEASE ARTIFACTS // 快速接入</span>
-          <h2 class="omni-section-title">管道安全传钥，三步开启多模型 Codex 工作流</h2>
-          <p class="omni-section-lead">
-            提供跨平台单文件原生可执行程序 <code>codex-mp</code>（内嵌 Web 控制中心与系统托盘能力），零 Node / Python / WebKit 运行时依赖。
-          </p>
-        </div>
-
-        <div class="cli-workbench">
-          <div class="cli-tabs" role="tablist" aria-label="命令行使用场景">
-            <button
-              type="button"
-              role="tab"
-              class="cli-tab-btn is-active"
-              aria-selected="true"
-              data-cli-tab="mac-linux"
-            >
-              macOS / Linux 三步接入
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class="cli-tab-btn"
-              aria-selected="false"
-              data-cli-tab="windows"
-            >
-              Windows PowerShell
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class="cli-tab-btn"
-              aria-selected="false"
-              data-cli-tab="web-remote"
-            >
-              M3 网页控制中心 &amp; SSH 隧道
-            </button>
-            <button
-              type="button"
-              role="tab"
-              class="cli-tab-btn"
-              aria-selected="false"
-              data-cli-tab="doctor-uninstall"
-            >
-              健康巡检 · 会话迁移 · 无痕卸载
-            </button>
-          </div>
-
-          <div class="cli-pane is-active" data-cli-pane="mac-linux" role="tabpanel">
-            <div class="cli-code-wrap">
-              <div class="cli-code-head">
-                <span>zsh / bash · 标准 stdin 传钥防 Shell 历史留痕</span>
-                <button type="button" class="copy-cmd-btn" data-copy-target="cmd-mac">复制命令</button>
+            <article class="security-tile">
+              <div class="security-tile-top">
+                <span class="material-symbols-outlined m3-i m3-i-security" aria-hidden="true"></span>
+                <span>外网强制加密与防跳转</span>
               </div>
-              <pre><code id="cmd-mac"># 1. 添加兼容网关（密钥经 stdin 写入系统钥匙串，不留命令历史）
-printf '%s\n' "$OPENROUTER_API_KEY" | codex-mp provider add \
-  --name openrouter \
-  --base-url https://openrouter.ai/api/v1 \
-  --protocol chat_completions \
-  --api-key-stdin --discover
+              <p>
+                发往公网的服务商地址强制要求 <code>https://</code>，拒绝未加密外网地址与本机内网元数据地址，同时禁用 307/308 重定向防秘钥泄露。
+              </p>
+            </article>
 
-# 2. 可选接入本机离线 Ollama（环回地址自动免密 AuthStrategy::None）
-codex-mp provider add --name ollama \
-  --base-url http://127.0.0.1:11434/v1 \
-  --auth-strategy none --discover
+            <article class="security-tile">
+              <div class="security-tile-top">
+                <span class="material-symbols-outlined m3-i m3-i-lan" aria-hidden="true"></span>
+                <span>远程访问必须先设密码</span>
+              </div>
+              <p>
+                默认只在 <code>127.0.0.1:31828</code> 本机可打开；只有设置 Argon2id 访问口令后，才允许局域网手机或平板连入控制面板。
+              </p>
+            </article>
+          </div>
 
-# 3. 合成兼容目录并启动官方 Codex（会话内直接输入 /model 热切换）
+          <details class="crates-drawer">
+            <summary>查看项目内部 10 个模块分工（开发者可选阅读）</summary>
+            <div class="crates-list" id="crates-list"></div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ================================================================
+           Section 5: Real v0.1.2 Downloads & Verified CLI Quickstart
+           ================================================================ -->
+      <section class="omni-section" id="quickstart">
+        <div class="omni-container">
+          <div class="section-head">
+            <span class="section-kicker">下载与三步上手</span>
+            <h2 class="section-title">下载桌面版双击即用，也提供命令行极速配置</h2>
+            <p class="section-lead">
+              从 GitHub Releases 直接获取适用于 macOS、Windows 与 Linux 的 v0.1.2 原生安装包，安装后可直接在控制面板添加服务商。
+            </p>
+          </div>
+
+          <div class="download-grid" id="download-grid"></div>
+
+          <div class="download-meta-bar">
+            <span>当前稳定版本：<strong>v0.1.2</strong> · 开源协议 MIT OR Apache-2.0</span>
+            <div class="download-meta-links">
+              <a
+                href="https://github.com/IGNGserver/codex-omnibridge/releases/download/v0.1.2/SHA256SUMS"
+                target="_blank"
+                rel="noopener"
+              >
+                SHA256SUMS 校验文件
+              </a>
+              <a
+                href="https://github.com/IGNGserver/codex-omnibridge/releases/tag/v0.1.2"
+                target="_blank"
+                rel="noopener"
+              >
+                v0.1.2 发行说明
+              </a>
+              <a
+                href="https://github.com/IGNGserver/codex-omnibridge"
+                target="_blank"
+                rel="noopener"
+              >
+                GitHub 源码仓库
+              </a>
+            </div>
+          </div>
+
+          <div class="cli-workbench" id="cli-workbench">
+            <div class="cli-head">
+              <div class="cli-tabs" role="tablist" aria-label="命令行常见用法">
+                <button
+                  type="button"
+                  class="cli-tab is-active"
+                  role="tab"
+                  aria-selected="true"
+                  data-cli-tab="web"
+                >
+                  打开网页控制面板
+                </button>
+                <button
+                  type="button"
+                  class="cli-tab"
+                  role="tab"
+                  aria-selected="false"
+                  data-cli-tab="cli"
+                >
+                  命令行添加服务商
+                </button>
+                <button
+                  type="button"
+                  class="cli-tab"
+                  role="tab"
+                  aria-selected="false"
+                  data-cli-tab="remote"
+                >
+                  局域网设备共用
+                </button>
+                <button
+                  type="button"
+                  class="cli-tab"
+                  role="tab"
+                  aria-selected="false"
+                  data-cli-tab="maintain"
+                >
+                  续接会话与完整卸载
+                </button>
+              </div>
+              <button type="button" class="cli-copy-btn" id="cli-copy-btn">复制命令</button>
+            </div>
+
+            <pre class="cli-panel is-active" data-cli-panel="web"><code># 1. 查看最简上手引导（或直接启动控制面板并自动打开网页端）
 codex-mp setup
-codex-mp launch</code></pre>
-            </div>
-            <div class="cli-notes">
-              <h4>设计细节</h4>
-              <ul>
-                <li>
-                  <code>--api-key-stdin</code> 确保 API Key 既不会暴露在 <code>ps aux</code> 进程参数中，也不会写入 <code>~/.zsh_history</code>。
-                </li>
-                <li>
-                  <code>--discover</code> 自动请求上游 <code>GET /models</code> 并将模型启用注册至本地目录。
-                </li>
-                <li>
-                  <code>codex-mp launch</code> 会自动确保后台 <code>127.0.0.1:8787</code> 路由守护就绪后再拉起官方 <code>codex</code>。
-                </li>
-              </ul>
-            </div>
-          </div>
-
-          <div class="cli-pane" data-cli-pane="windows" role="tabpanel">
-            <div class="cli-code-wrap">
-              <div class="cli-code-head">
-                <span>PowerShell 7 / Windows Terminal</span>
-                <button type="button" class="copy-cmd-btn" data-copy-target="cmd-win">复制命令</button>
-              </div>
-              <pre><code id="cmd-win"># 使用 NSIS 安装器或解压便携版 zip 后，直接拉起图形化控制中心：
 codex-mp web start --open
 
-# 或通过 PowerShell 管道将密钥存入 Windows 凭据管理器（CredMan）：
-$env:NEWAPI_KEY | codex-mp provider add `
-  --name newapi `
-  --base-url https://api.newapi.example/v1 `
-  --protocol chat_completions `
-  --api-key-stdin --discover
+# 2. 通过本地网关启动你已经安装的官方 Codex CLI
+codex-mp launch --codex-binary "$(command -v codex)"</code></pre>
 
+            <pre class="cli-panel" data-cli-panel="cli"><code># 1. 添加第三方服务商（以 OpenRouter 为例，Key 通过标准输入加密写入系统钥匙串）
+printf '%s\n' "$OPENROUTER_API_KEY" | codex-mp provider add openrouter https://openrouter.ai/api/v1 --protocol chat-completions --api-key-stdin
+
+# 2. 从接口拉取全部可用模型并写进 Codex /model 菜单
+codex-mp provider fetch-models openrouter --all
 codex-mp sync
-codex-mp launch</code></pre>
-            </div>
-            <div class="cli-notes">
-              <h4>Windows 原生适配</h4>
-              <ul>
-                <li>
-                  安装包内置完整中文向导并自动配置用户级 <code>PATH</code> 与卸载入口，支持系统托盘常驻。
-                </li>
-                <li>
-                  针对超过 Windows CredMan <code>2560</code> UTF-16 字符上限的超长 OAuth 令牌，自动回退至仅当前登录 SID 可读写的 <code>icacls</code> 受控目录。
-                </li>
-              </ul>
-            </div>
-          </div>
 
-          <div class="cli-pane" data-cli-pane="web-remote" role="tabpanel">
-            <div class="cli-code-wrap">
-              <div class="cli-code-head">
-                <span>本地与远端开发机 Web 面板管理</span>
-                <button type="button" class="copy-cmd-btn" data-copy-target="cmd-web">复制命令</button>
-              </div>
-              <pre><code id="cmd-web"># 本机启动 M3 Expressive 控制中心（默认仅监听 127.0.0.1:31828）
-codex-mp web start --open
+# 3. 体检环境与路由状态
+codex-mp doctor</code></pre>
 
-# 在无桌面云主机/开发机上，推荐通过 SSH 本地端口转发安全访问：
-ssh -L 31828:127.0.0.1:31828 dev@remote-workstation
+            <pre class="cli-panel" data-cli-panel="remote"><code># 1. 先配置网页访问口令（未设置口令前，软件会拒绝 0.0.0.0 外部绑定）
+printf '%s\n' "$PANEL_PASSWORD" | codex-mp web password --stdin
 
-# 若需在可信局域网开放绑定，须先设定 Argon2id 访问密码：
-codex-mp web set-password --password-stdin
-codex-mp web start --bind 0.0.0.0 --port 31828</code></pre>
-            </div>
-            <div class="cli-notes">
-              <h4>零前端构建依赖</h4>
-              <ul>
-                <li>
-                  整个 M3 Expressive 面板及可变字体均经 <code>RustEmbed</code> 编译进单一二进制，离线内网环境同样拥有完整图标与动效。
-                </li>
-                <li>
-                  未设置密码时尝试绑定非环回地址将直接返回 <code>RemoteNotAllowedWithoutPassword</code> 错误。
-                </li>
-              </ul>
-            </div>
-          </div>
+# 2. 开启局域网访问权限并监听 31828 端口
+codex-mp web remote --enable
+codex-mp web start --allow-remote --port 31828</code></pre>
 
-          <div class="cli-pane" data-cli-pane="doctor-uninstall" role="tabpanel">
-            <div class="cli-code-wrap">
-              <div class="cli-code-head">
-                <span>自检 · 旧会话热迁移 · 干净还原</span>
-                <button type="button" class="copy-cmd-btn" data-copy-target="cmd-doc">复制命令</button>
-              </div>
-              <pre><code id="cmd-doc"># 全面检查 Codex 版本、目录 Schema 指纹、钥匙串连通性与 Router 健康状态
-codex-mp doctor
+            <pre class="cli-panel" data-cli-panel="maintain"><code># 1. 继续之前中断的多模型会话（自动指定 OmniBridge 网关）
+codex-mp resume --through-omnibridge &lt;SESSION_ID&gt;
 
-# 将原本直连官方创建的旧会话无缝迁移到 OmniBridge 多模型通道
-codex-mp resume --through-omnibridge 019a8c7e-4410-7b21-9c00-e8b2d3f1a904
-
-# 仅恢复 ~/.codex/config.toml 原貌（校验 SHA-256 指纹）或彻底卸载：
+# 2. 还原改写前的官方 Codex 配置（不删除本地应用数据）
 codex-mp restore
-codex-mp-uninstall</code></pre>
-            </div>
-            <div class="cli-notes">
-              <h4>来去无痕保证</h4>
-              <ul>
-                <li>
-                  <code>codex-mp doctor</code> 会对比当前 Codex 内建模型指纹，一旦官方 CLI 升级新增模型或字段，自动提示同步刷新。
-                </li>
-                <li>
-                  <code>codex-mp-uninstall</code> 自动停止守护进程、恢复原始配置并清空本工具创建的钥匙串项，不影响你的官方登录态。
-                </li>
-              </ul>
-            </div>
-          </div>
-        </div>
 
-        <!-- Cross-Platform Release Matrix -->
-        <div class="release-grid" aria-label="跨平台发行产物矩阵">
-          <div class="release-card">
-            <span class="release-card__os">MACOS · APPLE SILICON</span>
-            <h4>macOS aarch64</h4>
-            <div class="release-formats">
-              <code>.dmg</code>
-              <code>.tar.gz</code>
-            </div>
-            <p>原生支持 M1–M4 芯片与 macOS Keychain 钥匙串，含桌面端启动与菜单栏控制。</p>
-          </div>
-
-          <div class="release-card">
-            <span class="release-card__os">MACOS · INTEL</span>
-            <h4>macOS x86_64</h4>
-            <div class="release-formats">
-              <code>.dmg</code>
-              <code>.tar.gz</code>
-            </div>
-            <p>独立编译原生 x86_64 归档与磁盘映像，无需 Rosetta 转译即可全速运行。</p>
-          </div>
-
-          <div class="release-card">
-            <span class="release-card__os">WINDOWS · X64</span>
-            <h4>Windows x86_64</h4>
-            <div class="release-formats">
-              <code>setup.exe (NSIS)</code>
-              <code>.zip</code>
-            </div>
-            <p>集成 Windows Credential Manager、SID 级超长令牌保护与中文安装/卸载向导。</p>
-          </div>
-
-          <div class="release-card">
-            <span class="release-card__os">LINUX · X64</span>
-            <h4>Linux x86_64</h4>
-            <div class="release-formats">
-              <code>.deb</code>
-              <code>.AppImage</code>
-              <code>.tar.gz</code>
-            </div>
-            <p>对接 Secret Service / D-Bus 凭据后端，所有归档附带完整 <code>SHA256SUMS</code> 校验清单。</p>
+# 3. 彻底卸载本地服务、注册配置与本软件写入的钥匙串条目
+codex-mp uninstall</code></pre>
           </div>
         </div>
       </section>
     </main>
 
-    <footer class="omni-footer">
-      <div class="omni-container omni-footer__inner">
-        <div>
-          <strong>Codex OmniBridge v0.1.2</strong> · MIT License · 本地优先、零遥测上报 ·
-          <code>crates/protocol-bridge</code> 协议转换核心致敬并硬化自 CC Switch v3.20.3
+    <footer class="site-footer">
+      <div class="omni-container footer-inner">
+        <div class="footer-brand">
+          <strong>Codex OmniBridge · v0.1.2</strong>
+          <span>独立开源工具，与 OpenAI 官方无隶属关系 · MIT OR Apache-2.0</span>
         </div>
-        <div class="omni-footer__links">
-          <a href="#hero-matrix">光学交换矩阵</a>
-          <a href="#inside-matrix">内部模组解构</a>
-          <a href="#panel-showcase">M3 控制中心</a>
-          <a href="#architecture-matrix">十模块架构</a>
-          <a href="#quickstart">CLI 快速开始</a>
+
+        <div class="footer-links">
+          <a href="#quickstart">下载安装</a>
+          <a href="#panel-showcase">控制面板演示</a>
+          <a href="https://github.com/IGNGserver/codex-omnibridge/releases" target="_blank" rel="noopener">
+            GitHub Releases
+          </a>
+          <a href="https://github.com/IGNGserver/codex-omnibridge" target="_blank" rel="noopener">
+            源码与 Issues
+          </a>
         </div>
       </div>
     </footer>

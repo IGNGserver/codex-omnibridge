@@ -8,16 +8,16 @@ export interface ModelRoutePreset {
   upstreamModelId: string;
   routeKind: RoutePathKind;
   routeBadge: string;
-  accentHex: string;
-  accentRgb: [number, number, number];
-  secondaryHex: string;
+  /** Accessible foreground accent in Light site theme */
+  accentLight: string;
+  /** Accessible foreground accent in Dark site theme */
+  accentDark: string;
+  /** Distinct vibrant color for 3D waveguides & indicator dots */
+  waveHex: string;
   protocolLabel: string;
   authAction: string;
   authDetail: string;
-  inboundEndpoint: string;
   egressEndpoint: string;
-  bridgePipeline: string;
-  contextWindow: string;
   capabilities: string[];
   gimbalYawRad: number;
   gimbalPitchRad: number;
@@ -28,268 +28,199 @@ export interface ModelRoutePreset {
 export const MODEL_ROUTE_PRESETS: ModelRoutePreset[] = [
   {
     id: 'gpt-official',
-    shortLabel: 'GPT-5.4 Official',
-    vendorBadge: 'OFFICIAL · OAUTH',
+    shortLabel: 'GPT-5.4 官方',
+    vendorBadge: 'OpenAI 官方',
     logicalModelId: 'gpt-5.4',
     upstreamModelId: 'gpt-5.4',
     routeKind: 'official',
-    routeBadge: 'PATH α · 官方零转换直通',
-    accentHex: '#00daf2',
-    accentRgb: [0.0, 0.855, 0.949],
-    secondaryHex: '#96f0ff',
-    protocolLabel: 'Native Responses SSE (Zero Translation)',
-    authAction: 'PASS ChatGPT OAuth · 剥离本地 Capability',
-    authDetail: '保留 Authorization / ChatGPT-Account-Id / session-id / x-codex-* 白名单头；绝不改写 auth.json',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'https://chatgpt.com/backend-api/codex/responses',
-    bridgePipeline: 'Bypass ProtocolBridge → 原生保留 Hosted Search / 生图 / V8 Code Mode / Compact',
-    contextWindow: '400K',
-    capabilities: ['原生订阅额度', 'Hosted Tools', '图像生成', 'Reasoning xhigh', 'SSE 原样透传'],
-    gimbalYawRad: -0.44,
-    gimbalPitchRad: 0.08,
+    routeBadge: '上路 · 直连 OpenAI 官方',
+    accentLight: '#006874',
+    accentDark: '#36d9ef',
+    waveHex: '#00a6b8',
+    protocolLabel: '原生 Responses 接口（不经格式转换）',
+    authAction: '使用你的 ChatGPT 账号直连',
+    authDetail: '只发往 OpenAI 官方，日常从不改动 auth.json',
+    egressEndpoint: 'chatgpt.com/backend-api/codex/responses',
+    capabilities: ['原订阅额度', '官方联网搜索', '官方生图', '多档思考', '原速流式响应'],
+    gimbalYawRad: -0.42,
+    gimbalPitchRad: 0.06,
     vaultActive: false,
     summary:
-      '命中ProviderRegistry官方模型表，光束偏转入蓝宝石真空直通轨（Channel α），不经任何第三方协议转换层，完整保留官方登录态与专属特权。',
+      '选中官方模型时，本机路由直接把请求送往 OpenAI 上游（走上方直通轨道），完整保留 ChatGPT 登录状态、订阅额度、联网搜索和图像生成。',
   },
   {
     id: 'claude-openrouter',
     shortLabel: 'Claude Opus 4.6',
-    vendorBadge: 'OPENROUTER · BRIDGE',
+    vendorBadge: 'OpenRouter',
     logicalModelId: 'openrouter/claude-opus-4.6',
     upstreamModelId: 'anthropic/claude-opus-4.6',
     routeKind: 'bridge',
-    routeBadge: 'PATH β · 协议棱镜桥接',
-    accentHex: '#d97bff',
-    accentRgb: [0.851, 0.482, 1.0],
-    secondaryHex: '#fdd6ff',
-    protocolLabel: 'Responses API ⇄ Chat Completions SSE',
-    authAction: 'STRIP 官方 OAuth · 注入 Keyring Bearer',
-    authDetail: '彻底剥离 ChatGPT Authorization 与 Account-Id；从系统钥匙串读取 dev.codex-multiprovider 凭据',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    bridgePipeline: 'portable_request 净化 → CodexToolContext 可逆工具编码 → reasoning.effort 映射 → SSE 重组',
-    contextWindow: '200K',
-    capabilities: ['可逆 apply_patch', 'MCP 命名空间工具', '多模态截图提取', 'OpenRouter 思考映射'],
+    routeBadge: '中路 · 云端接口转换',
+    accentLight: '#7b4384',
+    accentDark: '#eab0f3',
+    waveHex: '#9c56a6',
+    protocolLabel: 'Codex 指令 ⇄ Chat Completions 实时互译',
+    authAction: '自动剥离 ChatGPT 令牌 · 换用钥匙串 API Key',
+    authDetail: '仅从系统钥匙串读取 OpenRouter 密钥，绝不外泄官方登录信息',
+    egressEndpoint: 'openrouter.ai/api/v1/chat/completions',
+    capabilities: ['自动改写 apply_patch', '支持 MCP 工具', '图片截图识别', '思考强度映射'],
     gimbalYawRad: 0.0,
     gimbalPitchRad: 0.0,
     vaultActive: true,
     summary:
-      '光束直射三联布儒斯特棱镜组（Protocol Bridge），实时将 Codex 专属 Responses 请求与自定义语法工具编码为标准 Chat Completions 流，并由钥匙箱注入独立密钥。',
+      '中间的转向台会把请求交给协议转换模块，把 Codex 专用指令与文件补丁工具译成标准 Chat 接口，同时从系统钥匙串单独读取该服务商的密钥。',
   },
   {
     id: 'qwen-newapi',
     shortLabel: 'Qwen4 Max',
-    vendorBadge: 'NEWAPI · BRIDGE',
+    vendorBadge: 'NewAPI 聚合',
     logicalModelId: 'newapi/qwen4-max',
     upstreamModelId: 'qwen4-max',
     routeKind: 'bridge',
-    routeBadge: 'PATH β · 协议棱镜桥接',
-    accentHex: '#feb958',
-    accentRgb: [0.996, 0.725, 0.345],
-    secondaryHex: '#ffddb6',
-    protocolLabel: 'Responses API ⇄ Chat Completions SSE',
-    authAction: 'STRIP 官方 OAuth · 注入 Keyring Bearer',
-    authDetail: '跨进程代际缓存（registry.generation）零延迟取钥；禁止 302/307/308 重定向防凭据外泄',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'https://api.newapi.internal/v1/chat/completions',
-    bridgePipeline: 'UTF-8 跨包边界安全流解析 → thinking/reasoning_effort 双栈适配 → 逻辑模型名还原',
-    contextWindow: '128K',
-    capabilities: ['中文跨帧防截断', 'Flat Tools 展平', '思考摘要流', '流式/非流式自适应'],
-    gimbalYawRad: 0.04,
-    gimbalPitchRad: -0.05,
+    routeBadge: '中路 · 云端接口转换',
+    accentLight: '#835500',
+    accentDark: '#feb958',
+    waveHex: '#c48100',
+    protocolLabel: 'Codex 指令 ⇄ 聚合网关兼容流',
+    authAction: '自动剥离 ChatGPT 令牌 · 换用钥匙串 API Key',
+    authDetail: '禁用重定向上游盗密钥风险；中文流式分包自动拼齐不断字',
+    egressEndpoint: 'api.newapi.internal/v1/chat/completions',
+    capabilities: ['中文不断字拼接', '工具兼容展平', '思考摘要流', '流式/整包自适应'],
+    gimbalYawRad: 0.02,
+    gimbalPitchRad: -0.04,
     vaultActive: true,
     summary:
-      '针对 NewAPI / OneAPI 聚合网关深度硬化：即使上游忽略 stream:true 返回整包 JSON，或将中文多字节字符切分在 TCP 帧边界，桥接器亦能无损还原为 Codex 标准事件流。',
+      '针对 NewAPI / OneAPI 等团队或个人中转站做了专门适配：就算上游把中文切在数据包边缘或返回非流式整包，也能稳定还原给 Codex。',
   },
   {
     id: 'deepseek-oneapi',
     shortLabel: 'DeepSeek V4.1',
-    vendorBadge: 'ONEAPI · REASONER',
+    vendorBadge: 'OneAPI',
     logicalModelId: 'oneapi/deepseek-v4.1',
     upstreamModelId: 'deepseek-v4.1',
     routeKind: 'bridge',
-    routeBadge: 'PATH β · 深度思考桥接',
-    accentHex: '#5cb3ff',
-    accentRgb: [0.361, 0.702, 1.0],
-    secondaryHex: '#d6e3ff',
-    protocolLabel: 'Responses API ⇄ DeepSeek Reasoner SSE',
-    authAction: 'STRIP 官方 OAuth · 注入 Keyring X-API-Key / Bearer',
-    authDetail: '清除 encrypted_content 与 prompt_cache_key，将可读思考摘要转化为可移植上下文',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'https://oneapi.team.example/v1/chat/completions',
-    bridgePipeline: 'build_reasoning_config(deepseek) → reasoning_content 增量转 reasoning_summary_text.delta',
-    contextWindow: '128K',
-    capabilities: ['DeepSeek 思考链提取', '600s 逐块读超时', '工具参数流式拼接', '跨模型历史注水'],
-    gimbalYawRad: -0.04,
-    gimbalPitchRad: 0.05,
+    routeBadge: '中路 · 深度思考转换',
+    accentLight: '#365e91',
+    accentDark: '#9ec5ff',
+    waveHex: '#4876b5',
+    protocolLabel: 'Responses ⇄ DeepSeek 思考流互译',
+    authAction: '自动剥离 ChatGPT 令牌 · 换用钥匙串 API Key',
+    authDetail: '清理不可跨模型复用的不透明字段，只传递可读对话记录',
+    egressEndpoint: 'oneapi.team.example/v1/chat/completions',
+    capabilities: ['实时展示思考过程', '长推理不断流', '工具参数流式拼装', '跨模型接力记忆'],
+    gimbalYawRad: -0.02,
+    gimbalPitchRad: 0.04,
     vaultActive: true,
     summary:
-      '自动识别 DeepSeek 推理特征，把上游 reasoning_content 增量流实时映射为 Codex 原生思考摘要事件，且采用 600 秒逐块读超时机制，长时深度推理绝不中途断流。',
+      '自动识别 DeepSeek 的推理输出字段，转成 Codex 原生思考摘要进度条；并针对长耗时推理保持稳健超时期限，深思考中途不断线。',
   },
   {
     id: 'gemini-newapi',
     shortLabel: 'Gemini 3.8 Flash',
-    vendorBadge: 'NEWAPI · MULTIMODAL',
+    vendorBadge: 'NewAPI 多模态',
     logicalModelId: 'newapi/gemini-3.8-flash',
     upstreamModelId: 'gemini-3.8-flash',
     routeKind: 'bridge',
-    routeBadge: 'PATH β · 多模态工具桥接',
-    accentHex: '#2ee8bb',
-    accentRgb: [0.18, 0.91, 0.733],
-    secondaryHex: '#b8fff0',
-    protocolLabel: 'Responses API ⇄ Multimodal Chat SSE',
-    authAction: 'STRIP 官方 OAuth · 注入 Keyring Bearer',
-    authDetail: 'tool_media 模块自动剥离工具输出中的图片/PDF，合成紧随其后的多模态 user 消息',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'https://api.newapi.internal/v1/chat/completions',
-    bridgePipeline: 'extract_tool_media 多模态提升 → 1M Context 目录声明 → Responses 生命周期闭合',
-    contextWindow: '1,048K',
-    capabilities: ['1M 超长上下文', '工具返回图片可见', 'PDF/音频附件桥接', '极速首字响应'],
-    gimbalYawRad: 0.02,
-    gimbalPitchRad: 0.03,
+    routeBadge: '中路 · 多模态图文转换',
+    accentLight: '#006a5c',
+    accentDark: '#6ee0cc',
+    waveHex: '#188f7e',
+    protocolLabel: 'Responses ⇄ 多模态图文兼容流',
+    authAction: '自动剥离 ChatGPT 令牌 · 换用钥匙串 API Key',
+    authDetail: '工具返回的终端截图与文档图像会自动整理并附上，不丢画面',
+    egressEndpoint: 'api.newapi.internal/v1/chat/completions',
+    capabilities: ['百万长上下文', '读懂工具截图', '文档图片理解', '低延迟首字响应'],
+    gimbalYawRad: 0.01,
+    gimbalPitchRad: 0.02,
     vaultActive: true,
     summary:
-      '解决标准 Chat Completions 中 tool 角色无法携带图像的协议死穴：tool_media 引擎自动将工具截图与文档提取为紧邻的多模态消息，让百万上下文视觉模型真正看懂终端截图。',
+      '很多第三方接口不支持在工具回执里直接带图。OmniBridge 会自动把截图和附件提升为紧随其后的多模态消息，让视觉模型看懂命令输出和页面截图。',
   },
   {
     id: 'ollama-local',
     shortLabel: 'Ollama · Qwen3 Coder',
-    vendorBadge: '127.0.0.1 · LOCAL',
+    vendorBadge: '本机离线',
     logicalModelId: 'ollama/qwen3-coder',
     upstreamModelId: 'qwen3-coder:30b',
     routeKind: 'local',
-    routeBadge: 'PATH γ · 本机回环零外发',
-    accentHex: '#4ef09c',
-    accentRgb: [0.306, 0.941, 0.612],
-    secondaryHex: '#c2efb1',
-    protocolLabel: 'Loopback HTTP Responses ⇄ Local Chat SSE',
-    authAction: 'STRIP 官方 OAuth · AuthStrategy::None',
-    authDetail: 'normalize_base_url 仅对 loopback 豁免 HTTPS 强制要求，零外部 DNS 解析、零云端流量',
-    inboundEndpoint: 'POST http://127.0.0.1:8787/v1/responses',
-    egressEndpoint: 'http://127.0.0.1:11434/v1/chat/completions',
-    bridgePipeline: 'Loopback 闭环谐振腔 → 禁用 V8 code_mode_only 改发标准 Flat Tools → 本地推理流回传',
-    contextWindow: '128K',
-    capabilities: ['100% 离线不出网', 'AuthStrategy::None', 'Ollama / vLLM / LM Studio', '零订阅消耗'],
-    gimbalYawRad: 0.46,
-    gimbalPitchRad: -0.06,
+    routeBadge: '下路 · 本机 127.0.0.1 离线运行',
+    accentLight: '#2b6832',
+    accentDark: '#8cd891',
+    waveHex: '#35883f',
+    protocolLabel: '本机直连 Responses ⇄ Ollama Chat 接口',
+    authAction: '无认证免密发送 · 绝不联网',
+    authDetail: '仅 127.0.0.1 本机地址允许免 HTTPS；不携带任何凭据或账号头',
+    egressEndpoint: '127.0.0.1:11434/v1/chat/completions',
+    capabilities: ['100% 离线不出网', '免密钥直连', '兼容 Ollama/vLLM/LM Studio', '零云端费用'],
+    gimbalYawRad: 0.44,
+    gimbalPitchRad: -0.05,
     vaultActive: false,
     summary:
-      '光束偏转入铜绕环形本机谐振腔（Channel γ），请求全程停留在本机 127.0.0.1 回环网络内直连 Ollama / vLLM / LM Studio，兼顾敏感代码离线审计与官方会话无缝衔接。',
+      '选到本机模型时，请求走向下方绿色闭环轨道，全程留在本机 127.0.0.1 网卡里，适合内网保密代码审查、离线开发或低成本批量任务。',
   },
 ];
 
-export interface InternalModuleStage {
+export interface HowItWorksStep {
   id: string;
-  indexLabel: string;
-  crateName: string;
-  nodeName: string;
+  stepTag: string;
+  crateTag: string;
+  iconClass: string;
   title: string;
-  subtitle: string;
-  accentHex: string;
-  focusWorld: [number, number, number];
-  cameraPos: [number, number, number];
-  cameraLookAt: [number, number, number];
-  canopyOpenFactor: number;
-  telemetryCode: string;
-  specs: Array<{ label: string; value: string }>;
-  bullets: string[];
+  lead: string;
+  points: string[];
 }
 
-export const INTERNAL_MODULE_STAGES: InternalModuleStage[] = [
+export const HOW_IT_WORKS_STEPS: HowItWorksStep[] = [
   {
-    id: 'stage-catalog',
-    indexLabel: 'MODULE 01 // CATALOG SYNTHESIS',
-    crateName: 'crates/catalog · crates/integration',
-    nodeName: 'Module_Registry',
-    title: '模型注册与无损目录合成',
-    subtitle: '从本机 Codex 二进制提取权威 Schema，将自定义模型注入原生 /model 选择器',
-    accentHex: '#00daf2',
-    focusWorld: [-1.52, 0.16, 0.0],
-    cameraPos: [-2.35, 1.42, 2.55],
-    cameraLookAt: [-1.35, 0.05, 0.0],
-    canopyOpenFactor: 0.85,
-    telemetryCode: 'codex debug models --bundled → SHA-256 schema_fingerprint',
-    specs: [
-      { label: '配置编辑引擎', value: 'toml_edit 保注释两阶段提交' },
-      { label: '工具模式净化', value: '关闭 V8 code_mode_only → 标准 Flat Tools' },
-      { label: '身份提示词脱敏', value: '中性化 OpenAI 专属自称，保留工具规范' },
-    ],
-    bullets: [
-      '自动执行 `codex debug models --bundled` 读取当前安装版本的真实内建目录，未知上游字段原样保留，绝不因 Codex 升级丢字段。',
-      '通过字段相似度打分挑选通用官方模板克隆自定义模型，剥离第三方无法执行的 `web_search` 与 V8 沙箱模式，让 `exec_command` 与 `apply_patch` 稳定工作。',
-      '`integration.json` 记录安装前 SHA-256 指纹；若检测到用户手工改动受管配置，`restore` 拒绝盲目覆盖（Fail-Closed）。',
+    id: 'step-catalog',
+    stepTag: '第一步 · 合进原生菜单',
+    crateTag: 'codex-mp-catalog',
+    iconClass: 'm3-i-hub',
+    title: '不改动官方客户端，模型直接出现在 /model 里',
+    lead: '从你安装的官方 codex 读取真实内建模型目录，把你开启的第三方和本机模型无损合进去。',
+    points: [
+      '保留官方模型所有原生开关，不因为 Codex 升级而丢失新字段。',
+      '自动关闭第三方模型不支持的沙箱特性，改用标准文件编辑与命令工具。',
+      '改写配置时采用带注释的备份事务，任何时候都能一键恢复修改前的原始状态。',
     ],
   },
   {
-    id: 'stage-router',
-    indexLabel: 'MODULE 02 // PER-TURN OPTICAL CROSSBAR',
-    crateName: 'crates/router · crates/manager',
-    nodeName: 'Module_Crossbar',
-    title: '逐轮精确光路分流器',
-    subtitle: '突破 Stock Codex 会话级 Provider 锁死，同一 Thread 内每轮动态路由',
-    accentHex: '#96f0ff',
-    focusWorld: [-0.36, 0.22, 0.0],
-    cameraPos: [-0.45, 1.65, 2.35],
-    cameraLookAt: [-0.25, 0.06, 0.0],
-    canopyOpenFactor: 1.0,
-    telemetryCode: '127.0.0.1:8787 · x-codex-omnibridge-token · Constant-Time Verify',
-    specs: [
-      { label: '监听边界', value: '严格 Loopback (拒绝 0.0.0.0)' },
-      { label: '路由判定依据', value: 'ProviderRegistry 精确表查（非斜杠猜测）' },
-      { label: '并发流控护栏', value: 'zstd 解压 16MiB 上限 + Semaphore 背压' },
-    ],
-    bullets: [
-      'Stock Codex 仅需绑定单一 `omnibridge` Responses 入口；Router 在每一轮请求体中精确匹配 `official_models` 与 `<provider>/<slug>`。',
-      '官方模型直通 `chatgpt.com/backend-api/codex`，精确放行 `originator`、`user-agent`、`x-openai-internal-codex-responses-lite` 等实测头。',
-      '内置 2 秒周期 `RouterSupervisor` 健康巡检：发现 `registry_generation` 落后时优先热重载 `/admin/reload`，异常崩溃时指数退避自愈。',
+    id: 'step-router',
+    stepTag: '第二步 · 按轮次智能分流',
+    crateTag: 'codex-mp-router',
+    iconClass: 'm3-i-router',
+    title: '每发一句都重新判别去向，一条会话不用绑定死',
+    lead: '在你的电脑本机（127.0.0.1:8787）开启轻量转发，仅在当前设备内可访问，外部设备连不到。',
+    points: [
+      '按你当前选的模型精准查表，选回 GPT 就原样走 OpenAI 官方，其他模型转走对应网关。',
+      '官方请求放行原装授权头与白名单头，订阅额度、官方联网和生图能力完全不受影响。',
+      '控制面板更新配置后后台路由热重载，写代码途中不必重开终端或重启桌面客户端。',
     ],
   },
   {
-    id: 'stage-bridge',
-    indexLabel: 'MODULE 03 // BREWSTER PROTOCOL PRISM',
-    crateName: 'crates/protocol-bridge',
-    nodeName: 'Module_ProtocolBridge',
-    title: '双向协议棱镜与跨模型记忆水合',
-    subtitle: '实时互译 Responses API 与 Chat Completions，无损衔接多轮工具与思考流',
-    accentHex: '#d97bff',
-    focusWorld: [1.08, 0.20, 0.0],
-    cameraPos: [1.18, 1.48, 2.32],
-    cameraLookAt: [0.95, 0.06, 0.0],
-    canopyOpenFactor: 1.0,
-    telemetryCode: 'CodexToolContext ⇄ chat_sse_to_responses_stream ⇄ CodexChatHistoryStore',
-    specs: [
-      { label: '工具形态可逆编码', value: 'function / custom(语法) / namespace / search' },
-      { label: '跨边界状态净化', value: 'portable_request 剥离 encrypted_content' },
-      { label: '多模态工具输出', value: 'tool_media 自动提升图片/PDF/音频消息' },
-    ],
-    bullets: [
-      '`CodexToolContext` 将 `apply_patch` 等自由语法工具与 MCP 命名空间工具无损降维为标准 function，并在模型响应时精确还原原始调用类型与 `call_id`。',
-      '`CodexChatHistoryStore` 在内存中维护有界会话账本：当同一对话从官方模型切向第三方模型时自动水合上下文，消除无状态接口断片。',
-      '`append_utf8_safe_bounded` 逐字节守护 TCP 分块边界，彻底根除高并发 SSE 流下中文与 Emoji 被切碎导致的解码错误。',
+    id: 'step-bridge',
+    stepTag: '第三步 · 接口与工具自动翻译',
+    crateTag: 'codex-mp-protocol-bridge',
+    iconClass: 'm3-i-swap-horiz',
+    title: '让只支持 OpenAI 标准接口的模型也能动手写代码',
+    lead: '把 Codex 专用的 Responses 协议与自由语法工具，实时译成通用的 Chat Completions 流式请求。',
+    points: [
+      '完整转换 apply_patch 等修改文件工具与 MCP 插件工具，返回后再精确还原给 Codex。',
+      '内置轻量化跨模型会话记录，半路切模型时自动补齐前面聊过的内容，防止断片。',
+      '逐字节守护中文与符号边界、自动提取工具返回的截图图像，兼容 DeepSeek 与多模态模型。',
     ],
   },
   {
-    id: 'stage-vault',
-    indexLabel: 'MODULE 04 // FARADAY KEYCHAIN VAULT',
-    crateName: 'crates/credentials · crates/web',
-    nodeName: 'Module_KeychainVault',
-    title: '系统钥匙箱与物理级凭据隔离',
-    subtitle: 'API Key 永不落明文配置，官方 OAuth 永不越界，307/308 重定向硬阻断',
-    accentHex: '#feb958',
-    focusWorld: [-0.10, 0.24, 1.25],
-    cameraPos: [0.65, 1.56, 2.85],
-    cameraLookAt: [0.05, 0.08, 0.72],
-    canopyOpenFactor: 0.92,
-    telemetryCode: 'OS Keyring (dev.codex-multiprovider) · redirect::Policy::none()',
-    specs: [
-      { label: '原生凭据后端', value: 'macOS Keychain / Win CredMan / Secret Service' },
-      { label: '防泄漏 HTTP 策略', value: '全局禁用重定向 + 阻断 169.254.0.0/16' },
-      { label: '面板远程安全', value: 'Argon2id 哈希 + 登录限流 + 严格 CSP' },
-    ],
-    bullets: [
-      '`providers.json` 与 `accounts.json` 仅保存不透明引用指针；Windows 超长 OAuth 令牌（>=2560 UTF-16）自动回退至当前用户 SID DACL 保护的私有存储。',
-      '上游 HTTP 客户端强制关闭重定向（`Policy::none()`）：杜绝恶意或被劫持中转站通过 `307/308` 诱导客户端把 Bearer 密钥与对话正文重发至第三方主机。',
-      '可选「官方账号保险箱」在每次切换 ChatGPT Plus/Pro/Team 账号前自动生成 `0600` 权限 `auth.bak-switch-*` 快照，随时一键无损回退。',
+    id: 'step-security',
+    stepTag: '第四步 · 密钥隔离与随时还原',
+    crateTag: 'codex-mp-credentials',
+    iconClass: 'm3-i-verified-user',
+    title: '钥匙串加密存放，日常绝不动你的官方 auth.json',
+    lead: '所有第三方 API Key 存入系统原生凭据管理器，配置文件中不出现明文密钥。',
+    points: [
+      '日常安装、同步、转发对话和卸载从不改写 ~/.codex/auth.json，也绝不把官方令牌发往第三方。',
+      '使用可选的“切换官方账号”功能时，切换前会自动备份 0600 权限历史快照，方便随时退回。',
+      '非本机回环地址强制要求 HTTPS、禁用上游 307/308 跳转防窃取；远程面板未设口令拒绝公网监听。',
     ],
   },
 ];
@@ -311,78 +242,76 @@ export interface ThreadTurnStep {
 export const THREAD_SIMULATION_STEPS: ThreadTurnStep[] = [
   {
     turnIndex: 1,
-    commandOrPrompt: '请结合最新仓库结构，定位 crates/router 的鉴权入口并搜索相关 RFC 规范。',
+    commandOrPrompt: '先帮我看下这个仓库的鉴权模块结构，顺便上网查下最新规范要求。',
     modelId: 'gpt-5.4',
     presetId: 'gpt-official',
-    badge: 'TURN 01 · OFFICIAL OAUTH',
-    routeSummary: '命中 official_models → 直通 chatgpt.com/backend-api/codex（保留 Hosted Web Search 与原生订阅态）',
+    badge: '第 1 轮 · OpenAI 官方直连',
+    routeSummary: '命中官方模型列表：直接发往 OpenAI 官方，保留官方联网搜索与订阅额度。',
     headersSent: [
-      'Authorization: Bearer <ChatGPT_Plus_OAuth>',
+      'Authorization: <你的 ChatGPT 登录令牌>',
       'ChatGPT-Account-Id: acc_8f92...d1',
-      'x-openai-internal-codex-responses-lite: true',
-      'thread-id: thr_019a8c...4e',
+      '对话标识: thr_019a8c...4e',
     ],
-    headersStripped: ['x-codex-omnibridge-token (本地环回鉴权头已剥离)'],
+    headersStripped: ['已去除本地转发内部令牌，不透露本机额外头信息'],
     assistantPreview:
-      '已通过官方 Hosted Search 核对规范，并定位 `crates/router/src/lib.rs`：所有请求均经 `CAPABILITY_HEADER` 常量时间校验后按注册表精确分流……',
-    latencyTag: 'TTFT 310ms · Native SSE',
+      '已通过官方联网核对规范，并定位了鉴权入口与路由分流代码，核心结构一共分三层……',
+    latencyTag: '官方直连 · 原生响应',
   },
   {
     turnIndex: 2,
     slashSwitch: '/model openrouter/claude-opus-4.6',
-    commandOrPrompt: '很好，直接在当前会话为该模块补齐边界单元测试并用 apply_patch 写入。',
+    commandOrPrompt: '不错，就在刚才的上下文里，直接帮我把边界单元测试用补丁写进去。',
     modelId: 'openrouter/claude-opus-4.6',
     presetId: 'claude-openrouter',
-    badge: 'TURN 02 · SAME-THREAD SWITCH → CLAUDE',
-    routeSummary: '同 Thread 切换！CodexChatHistoryStore 自动水合第 1 轮上下文 → 剥离 OAuth → 协议棱镜转译 apply_patch',
+    badge: '第 2 轮 · 同对话换 Claude',
+    routeSummary: '保持同一会话！自动带入第 1 轮对话内容，同时彻底清掉 ChatGPT 登录令牌并注入 OpenRouter 密钥。',
     headersSent: [
-      'Authorization: Bearer <Keyring:dev.codex-multiprovider/openrouter>',
+      'Authorization: <钥匙串读取 OpenRouter API Key>',
       'Content-Type: application/json',
     ],
     headersStripped: [
-      'Authorization: Bearer <ChatGPT_Plus_OAuth> (物理阻断)',
-      'ChatGPT-Account-Id (物理阻断)',
-      'previous_response_id / encrypted_content (跨源净化)',
+      'ChatGPT 登录令牌（已拦截，绝不发给第三方）',
+      'ChatGPT-Account-Id（已拦截）',
+      '不可跨平台使用的官方内部缓存字段（已清理）',
     ],
     assistantPreview:
-      '⚡ [CodexToolContext 已将 custom 语法工具 `apply_patch` 编码并还原] 已在 `crates/router/src/lib.rs` 新增 3 组常量时间鉴权与非环回拒绝断言。',
-    latencyTag: 'TTFT 480ms · Bridged SSE',
+      '已根据刚才的分析写出 3 组边界测试用例，并通过 apply_patch 工具直接写入文件。',
+    latencyTag: '云端转换 · 工具兼容',
   },
   {
     turnIndex: 3,
     slashSwitch: '/model ollama/qwen3-coder',
-    commandOrPrompt: '在不联网的前提下审查刚才这段测试是否包含任何真实密钥或内网地址。',
+    commandOrPrompt: '离线检查一下刚才这段测试代码里有没有写死任何真实密钥或内网地址。',
     modelId: 'ollama/qwen3-coder',
     presetId: 'ollama-local',
-    badge: 'TURN 03 · LOCAL LOOPBACK AUDIT',
-    routeSummary: '切换至本机 127.0.0.1:11434 Ollama 闭环谐振腔，零外部网络请求、零认证头发送',
-    headersSent: ['Content-Type: application/json (AuthStrategy::None)'],
+    badge: '第 3 轮 · 本机离线运行',
+    routeSummary: '切换为本机 127.0.0.1:11434 运行 Ollama，数据不出本机，不带任何授权头。',
+    headersSent: ['Content-Type: application/json（免密钥直连本机）'],
     headersStripped: [
-      'Authorization (全部剥离)',
-      'ChatGPT-Account-Id (全部剥离)',
-      'x-codex-* (全部剥离)',
+      '所有账号或第三方 API 密钥头（已清除）',
+      '零外网 DNS 与云端上传请求',
     ],
     assistantPreview:
-      '🔒 [本机离线完成] 静态扫描完毕：测试夹具仅使用 `MemoryCredentialStore` 与 `127.0.0.1` 环回地址，无任何凭据字面量泄漏。',
-    latencyTag: 'Local 127.0.0.1 · 0 Bytes Egress',
+      '已在本机离线检查完毕：测试代码只使用了模拟测试数据与 127.0.0.1 演示地址，没有任何真实凭据。',
+    latencyTag: '本机 127.0.0.1 · 0 流量外发',
   },
   {
     turnIndex: 4,
     slashSwitch: '/model gpt-5.4',
-    commandOrPrompt: '切回官方模型，总结本轮变更并生成一张架构示意草图。',
+    commandOrPrompt: '切回官方模型，帮我汇总今天这几轮改了什么，再画一张示意草图。',
     modelId: 'gpt-5.4',
     presetId: 'gpt-official',
-    badge: 'TURN 04 · SEAMLESS RETURN TO OFFICIAL',
-    routeSummary: '零重启切回官方通道！ChatGPT 登录态完好无损，原生 `/v1/images/generations` 与订阅额度继续生效',
+    badge: '第 4 轮 · 无缝回到官方',
+    routeSummary: '无需重启或重新登录，立刻切回 OpenAI 官方，前 3 轮记忆完整衔接，直接可用官方生图与额度。',
     headersSent: [
-      'Authorization: Bearer <ChatGPT_Plus_OAuth>',
+      'Authorization: <你的 ChatGPT 登录令牌>',
       'ChatGPT-Account-Id: acc_8f92...d1',
-      'thread-id: thr_019a8c...4e',
+      '对话标识: thr_019a8c...4e',
     ],
-    headersStripped: ['第三方 Provider API Key 绝不混入官方请求'],
+    headersStripped: ['第三方服务商 API Key 绝不会发往 OpenAI 官方'],
     assistantPreview:
-      '✨ 已无缝回到同一官方 Thread：全部 4 轮上下文连贯保留，官方生图与代码解释器特权随时可用，无需重登或重开窗口。',
-    latencyTag: 'TTFT 295ms · Official Restored',
+      '已无缝回到同一对话：前面 4 轮的来龙去脉全部在线，改动总结和架构草图已生成，随时可以继续。',
+    latencyTag: '官方直连 · 状态完好',
   },
 ];
 
@@ -396,62 +325,168 @@ export interface CrateSpecItem {
 export const WORKSPACE_CRATES: CrateSpecItem[] = [
   {
     crate: 'codex-mp-core',
-    layer: 'Domain & Security',
-    responsibility: '注册表模型、代际计数、HTTPS/Loopback URL 校验、跨进程文件锁与 0600/SID 原子写',
-    highlight: '阻断 169.254.0.0/16 SSRF 与明文非环回 HTTP',
+    layer: '核心规则',
+    responsibility: '服务商数据结构、HTTPS 地址强制校验、文件锁与受限权限写入',
+    highlight: '拦截内网元数据地址与明文外网 HTTP',
   },
   {
     crate: 'codex-mp-catalog',
-    layer: 'Schema Merger',
-    responsibility: '调用 codex debug models --bundled 提取真实目录，模板克隆并中性化 V8 专属工具标志',
-    highlight: 'SHA-256 Schema 指纹守护，未知字段零丢失',
+    layer: '菜单合并',
+    responsibility: '读取官方自带模型定义，合理克隆模板生成新模型并兼容新字段',
+    highlight: '官方 Codex 升级时不丢失未知属性',
   },
   {
     crate: 'codex-mp-credentials',
-    layer: 'Secret Vault',
-    responsibility: '统一封装 macOS Keychain、Windows Credential Manager 与 Linux Secret Service',
-    highlight: '8 槽异步隔离池 + Windows 超长凭据自动 0600 溢出回退',
+    layer: '钥匙串',
+    responsibility: '统一调用 macOS 钥匙串、Windows 凭据管理器与 Linux Secret Service',
+    highlight: '兼容 Windows 超长 OAuth 令牌安全回退',
   },
   {
     crate: 'codex-mp-protocol-bridge',
-    layer: 'Wire Translator',
-    responsibility: 'Responses ⇄ Chat Completions 请求/SSE 双向转换、可逆工具编码、多模态提取与历史账本',
-    highlight: '移植自 CC Switch v3.20.3 并深度硬化 UTF-8 与跨源净化',
+    layer: '协议翻译',
+    responsibility: 'Responses 与 Chat Completions 互译、工具编码、图片提取与历史补全',
+    highlight: '流式传输中文不断字，支持推理展示',
   },
   {
     crate: 'codex-mp-router',
-    layer: 'Loopback Data Plane',
-    responsibility: '127.0.0.1:8787 高安全反向代理，逐轮表驱动分流、zstd 解压、零重定向与代际密钥缓存',
-    highlight: '常量时间 Capability 校验 + 600s 逐块流式读超时',
+    layer: '本机分流',
+    responsibility: '在 127.0.0.1:8787 按轮次精准分流、禁止重定向、密钥代际热更新',
+    highlight: '防 307/308 跳转窃取密钥，长思考不断流',
   },
   {
     crate: 'codex-mp-integration',
-    layer: 'Config Transaction',
-    responsibility: '基于 toml_edit 无损更新 ~/.codex/config.toml，维护 integration.json 两阶段事务清单',
-    highlight: '检测到人工修改受管字段时 Fail-Closed 拒绝覆盖',
+    layer: '安全配置',
+    responsibility: '按保留注释的方式更新 ~/.codex/config.toml 并核对修改指纹',
+    highlight: '发现用户手改冲突时不盲目覆盖，保障安全',
   },
   {
     crate: 'codex-mp-manager',
-    layer: 'Supervisor & Accounts',
-    responsibility: 'Provider 自动发现、Router 进程守护自愈、官方账号快照切换与 5h/7d/Reserve 额度查询',
-    highlight: '每次切号自动留存 auth.bak-switch-* 可恢复备份',
+    layer: '进程守护',
+    responsibility: '服务商模型自动拉取、本地路由守护与官方多账号安全切换备份',
+    highlight: '切换账号前自动保留历史快照供随时退回',
   },
   {
     crate: 'codex-mp-web',
-    layer: 'Control Plane SPA',
-    responsibility: 'RustEmbed 内嵌 M3 Expressive 面板（默认 127.0.0.1:31828），Argon2id 鉴权与登录限流',
-    highlight: '未设密码硬性拒绝 0.0.0.0 局域网绑定 + 严格双端一致 CSP',
+    layer: '网页控制端',
+    responsibility: '单文件内置 Web 界面（默认仅本机 :31828）、口令哈希与限流',
+    highlight: '未设访问口令时禁止对外开放局域网监听',
   },
   {
     crate: 'codex-mp-desktop',
-    layer: 'Experimental Adapter',
-    responsibility: '可选独立 Desktop 运行时启动器（CODEX_CLI_PATH / POSIX 包装器）与哈希漂移检测',
-    highlight: '一键 codex-mp desktop restore 恢复官方原厂入口',
+    layer: '可选桌面启动',
+    responsibility: '面向特殊场景提供独立的桌面启动包装与文件指纹检查',
+    highlight: '支持一键恢复官方原始桌面程序入口',
   },
   {
     crate: 'codex-mp-cli',
-    layer: 'Unified Binary',
-    responsibility: '单一原生可执行文件 codex-mp，涵盖 setup / sync / launch / resume / doctor / web / tray',
-    highlight: '零 GTK/WebKit 系统依赖，管道传入密钥历史零留痕',
+    layer: '统一命令行',
+    responsibility: '提供 setup / sync / launch / resume / doctor / web / tray 子命令',
+    highlight: '纯原生单一可执行文件，无外部运行环境依赖',
+  },
+];
+
+export interface ReleaseAssetLink {
+  label: string;
+  fileName: string;
+  url: string;
+  primary?: boolean;
+}
+
+export interface ReleasePlatformCard {
+  id: string;
+  osTag: string;
+  title: string;
+  desc: string;
+  links: ReleaseAssetLink[];
+}
+
+const RELEASE_BASE = 'https://github.com/IGNGserver/codex-omnibridge/releases/download/v0.1.2';
+
+export const GITHUB_REPO_URL = 'https://github.com/IGNGserver/codex-omnibridge';
+export const GITHUB_RELEASES_URL = 'https://github.com/IGNGserver/codex-omnibridge/releases';
+export const RELEASE_TAG_URL = 'https://github.com/IGNGserver/codex-omnibridge/releases/tag/v0.1.2';
+export const RELEASE_SHA256_URL = `${RELEASE_BASE}/SHA256SUMS`;
+
+export const RELEASE_PLATFORMS: ReleasePlatformCard[] = [
+  {
+    id: 'macos-arm',
+    osTag: 'macOS · Apple Silicon',
+    title: 'macOS (M1–M4)',
+    desc: '原生支持苹果芯片与系统钥匙串，包含桌面应用与菜单栏常驻控制。',
+    links: [
+      {
+        label: '下载 .dmg 安装包',
+        fileName: 'codex-omnibridge-macos-aarch64-0.1.2.dmg',
+        url: `${RELEASE_BASE}/codex-omnibridge-macos-aarch64-0.1.2.dmg`,
+        primary: true,
+      },
+      {
+        label: '.tar.gz 压缩包',
+        fileName: 'codex-omnibridge-macos-aarch64-0.1.2.tar.gz',
+        url: `${RELEASE_BASE}/codex-omnibridge-macos-aarch64-0.1.2.tar.gz`,
+      },
+    ],
+  },
+  {
+    id: 'macos-x64',
+    osTag: 'macOS · Intel x64',
+    title: 'macOS (Intel)',
+    desc: '原生 x86_64 芯片安装包，免转译全速运行，同样集成钥匙串与命令行。',
+    links: [
+      {
+        label: '下载 .dmg 安装包',
+        fileName: 'codex-omnibridge-macos-x86_64-0.1.2.dmg',
+        url: `${RELEASE_BASE}/codex-omnibridge-macos-x86_64-0.1.2.dmg`,
+        primary: true,
+      },
+      {
+        label: '.tar.gz 压缩包',
+        fileName: 'codex-omnibridge-macos-x86_64-0.1.2.tar.gz',
+        url: `${RELEASE_BASE}/codex-omnibridge-macos-x86_64-0.1.2.tar.gz`,
+      },
+    ],
+  },
+  {
+    id: 'windows-x64',
+    osTag: 'Windows · 64 位',
+    title: 'Windows x64',
+    desc: '带完整中文安装与卸载向导，对接 Windows 凭据管理器并支持系统托盘。',
+    links: [
+      {
+        label: '下载 Setup.exe 安装程序',
+        fileName: 'codex-omnibridge-windows-x86_64-0.1.2-setup.exe',
+        url: `${RELEASE_BASE}/codex-omnibridge-windows-x86_64-0.1.2-setup.exe`,
+        primary: true,
+      },
+      {
+        label: '.zip 免安装版',
+        fileName: 'codex-omnibridge-windows-x86_64-0.1.2.zip',
+        url: `${RELEASE_BASE}/codex-omnibridge-windows-x86_64-0.1.2.zip`,
+      },
+    ],
+  },
+  {
+    id: 'linux-x64',
+    osTag: 'Linux · 64 位',
+    title: 'Linux x64',
+    desc: '支持 Debian/Ubuntu 安装包、通用单文件 AppImage 及纯命令行压缩包。',
+    links: [
+      {
+        label: '下载 .deb 软件包',
+        fileName: 'codex-omnibridge_0.1.2_amd64.deb',
+        url: `${RELEASE_BASE}/codex-omnibridge_0.1.2_amd64.deb`,
+        primary: true,
+      },
+      {
+        label: 'AppImage 单文件',
+        fileName: 'Codex.OmniBridge-0.1.2.AppImage',
+        url: `${RELEASE_BASE}/Codex.OmniBridge-0.1.2.AppImage`,
+      },
+      {
+        label: '.tar.gz 压缩包',
+        fileName: 'codex-omnibridge-linux-x86_64-0.1.2.tar.gz',
+        url: `${RELEASE_BASE}/codex-omnibridge-linux-x86_64-0.1.2.tar.gz`,
+      },
+    ],
   },
 ];
