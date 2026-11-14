@@ -4,6 +4,7 @@
   "version": "0.1.2",
   "description": "Official Website for Codex OmniBridge — Precision Photonic Multi-Model Router & M3 Expressive Control Center",
   "type": "module",
+  "packageManager": "pnpm@10.33.0",
   "scripts": {
     "generate:glb": "node scripts/build-photonic-glb.mjs",
     "dev": "vite",

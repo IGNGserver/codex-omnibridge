@@ -1,5 +1,7 @@
 # Codex OmniBridge Official Website (`website/`)
 
+> 正式线上站点：<https://omnibridge.igng.net/> · 托管与回滚规范见 [docs/HOSTING.md](./docs/HOSTING.md)。
+
 Codex OmniBridge 官方网站源码。采用 **Precision Photonics Laboratory × Material 3 Expressive Instrument** 视觉与交互体系构建，100% 自托管可变字体与 3D 光学硬件资产，零外部 CDN 运行时请求。
 
 ## 核心特性

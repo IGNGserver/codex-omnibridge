@@ -127,6 +127,17 @@ function assert(condition, message) {
 
 async function run() {
   assert(fs.existsSync(path.join(DIST_DIR, 'index.html')), `Missing built dist at ${DIST_DIR}`);
+  for (const requiredStatic of ['_headers', 'robots.txt', 'sitemap.xml', '404.html', 'og/og.png']) {
+    assert(
+      fs.existsSync(path.join(DIST_DIR, requiredStatic)),
+      `Missing production hosting asset in dist/: ${requiredStatic}`,
+    );
+  }
+  const headersRaw = fs.readFileSync(path.join(DIST_DIR, '_headers'), 'utf8');
+  assert(
+    headersRaw.includes('/assets/*') && headersRaw.includes('immutable') && headersRaw.includes('X-Content-Type-Options: nosniff'),
+    'dist/_headers is missing immutable asset cache or security headers',
+  );
   if (SCREENSHOT_DIR) {
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
   }
@@ -186,6 +197,30 @@ async function run() {
     });
 
     await page.goto(baseUrl, { waitUntil: 'networkidle' });
+
+    // Verify canonical, OpenGraph, and Bing Webmaster metadata
+    const seoMeta = await page.evaluate(() => ({
+      canonical: document.querySelector('link[rel="canonical"]')?.getAttribute('href'),
+      ogUrl: document.querySelector('meta[property="og:url"]')?.getAttribute('content'),
+      ogImage: document.querySelector('meta[property="og:image"]')?.getAttribute('content'),
+      bingVerify: document.querySelector('meta[name="msvalidate.01"]')?.getAttribute('content'),
+    }));
+    assert(
+      seoMeta.canonical === 'https://omnibridge.igng.net/',
+      `Unexpected canonical URL: ${seoMeta.canonical}`,
+    );
+    assert(
+      seoMeta.ogUrl === 'https://omnibridge.igng.net/',
+      `Unexpected og:url: ${seoMeta.ogUrl}`,
+    );
+    assert(
+      seoMeta.ogImage === 'https://omnibridge.igng.net/og/og.png',
+      `Unexpected og:image: ${seoMeta.ogImage}`,
+    );
+    assert(
+      Boolean(seoMeta.bingVerify),
+      'Missing Bing Webmaster verification meta tag (msvalidate.01)',
+    );
 
     // Wait for 3D GLB model load (or clean fallback)
     await page.waitForFunction(() => {
